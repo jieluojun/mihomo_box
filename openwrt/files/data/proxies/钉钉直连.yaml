@@ -1,0 +1,14 @@
+addons: &addons {type: http, port: 443, headers: {With-At: "gw.alicdn.com", Host: "153.3.236.22:443", X-T5-Auth: "683556433", Connection: "Keep-Alive"}}
+proxies:
+  - {name: 南京电信①, server: 180.101.50.208, <<: *addons}
+  - {name: 南京电信②, server: 180.101.50.249, <<: *addons}
+  - {name: 北京电信①, server: 220.181.7.1, <<: *addons}
+  - {name: 北京电信②, server: 220.181.33.174, <<: *addons}
+  - {name: 北京电信③, server: 220.181.111.189, <<: *addons}
+  - {name: 广州电信, server: 14.215.182.75, <<: *addons}
+  - {name: 保定联通①, server: 110.242.70.68, <<: *addons}
+  - {name: 保定联通②, server: 110.242.70.69, <<: *addons}
+  - {name: 南京联通, server: 153.3.237.117, <<: *addons}
+  - {name: 苏州联通, server: 157.0.146.158, <<: *addons}
+  - {name: 南京移动, server: 36.155.169.188, <<: *addons}
+  - {name: 广州移动, server: 183.240.98.84, <<: *addons}

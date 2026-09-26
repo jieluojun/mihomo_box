@@ -53,6 +53,20 @@ tun:
   auto-route: true
   auto-detect-interface: true
 
+# 本地 provider：包内自带两个文件（与 Android 版同一份），装好后在 $安装目录/proxies/ 下
+#   · 钉钉直连.yaml   12 个「钉钉免流直连」入口（With-At 补丁内核专用）
+#   · 非免节点.txt    普通机场/自建节点的空骨架，把自己的一行一个节点填进去即可
+# 用不到就整段删掉（面板 →「配置」页也能可视化改）。
+proxy-providers:
+  钉钉直连:
+    type: file
+    path: ./proxies/钉钉直连.yaml
+    override: { additional-prefix: "钉钉直连/" }
+  非免节点:
+    type: file
+    path: ./proxies/非免节点.txt
+    override: { additional-prefix: "非免节点/" }
+
 # 订阅示例（把 URL 换成你自己的；面板里也能加，加完会自动写回本文件）
 # proxy-providers:
 #   my-sub:
@@ -63,7 +77,16 @@ tun:
 #     health-check: { enable: true, url: "https://www.gstatic.com/generate_204", interval: 300 }
 
 proxies: []
-proxy-groups: []
+proxy-groups:
+  - name: 钉钉直连
+    type: select
+    use:
+      - 钉钉直连
+      - 非免节点
+    url: https://cp.cloudflare.com/generate_204
+    interval: 300
+    timeout: 5000
+    lazy: true
 
 rules:
   # 局域网与保留地址一律直连：路由器上这条很关键

@@ -43,6 +43,8 @@ tar -xzf mihomo-box-openwrt-<版本>.tar.gz -C /tmp && sh /tmp/install.sh
 ├── scripts/mihomo.sh        调度器 —— 面板前端固定调用的入口，等价 box.sh
 ├── scripts/box.sh           命令行入口（软链为 /usr/bin/mihomo-box）
 ├── scripts/lib/common.sh    公共库：镜像 / 版本探测 / 按架构装内核
+├── proxies/钉钉直连.yaml     本地 provider：12 个钉钉免流直连入口（默认配置已引用）
+├── proxies/非免节点.txt      本地 provider：自建/机场节点的空骨架，自行填入
 ├── webroot/ui/…             面板 WebUI（含 cgi-bin 执行桥）
 ├── webroot/index.html       跳转页
 └── run/…                    pid / 日志 / 访问令牌 / 状态缓存
@@ -95,6 +97,19 @@ procd 监督的是 `box.sh supervise`：开机按设置拉起内核、面板 htt
   （OpenWrt 22.03+ 是 fw4/nft）。
 * 局域网直连规则已经在默认配置里写好，别删掉，否则内网流量会绕代理。
 
+## 本地 provider 文件（proxies/）
+
+默认配置里带了两个本地 provider（与 Android 版同一份文件），安装时放进
+`<安装目录>/proxies/`，**已存在的文件不会被覆盖**（你改过的节点清单会保住）：
+
+| 文件 | 用途 |
+|------|------|
+| `钉钉直连.yaml` | 12 个钉钉免流直连入口（需要带 `With-At` 补丁的 jieluojun 内核） |
+| `非免节点.txt` | 普通机场/自建节点，一行一个；默认是空骨架 |
+
+在面板「配置 → 代理集合」里能看到它们；不用就整段删掉 `config.yaml` 里的
+`proxy-providers:` 两项与对应的代理组。
+
 ## 卸载
 
 ```sh
@@ -103,6 +118,22 @@ mihomo-box uninstall --purge    # 连配置与内核一起删
 ```
 
 ## 常见问题
+
+**一行命令敲下去「没有反应」？** 先看是不是这两种情况：① 自举要访问 GitHub，
+   被墙的线路会在探测/下载阶段静默等一会（新版本会立刻打印「自举：正在探测程序包版本…」）；
+   ② 仓库里如果只有 `openwrt/` 而没有 `src/`、Release 里也没有
+   `mihomo-box-openwrt-<最新 tag>.tar.gz` 这个资产，自举最后会失败并说明缺什么。
+   验证网络别用 `curl -s` 干等，带上超时看结果：
+
+```sh
+curl -fSL --connect-timeout 8 -m 30 -o /tmp/owrt-install.sh \
+  "https://ghfast.top/https://raw.githubusercontent.com/jieluojun/mihomo_box/main/openwrt/install.sh" \
+  && sh /tmp/owrt-install.sh --mirror auto -y
+```
+
+**线上要能一键装，仓库需要满足什么？** 二选一：① Release 挂一个资产，名字必须是
+   `mihomo-box-openwrt-<最新 release 的 tag>.tar.gz`（自举优先用它，和 `src/` 无关）；
+   ② 仓库里有 `openwrt/` 且有 `src/`（模块脚本与面板源码），自举会下分支快照就地组装。
 
 **装完面板打不开？** `mihomo-box check-env` 看面板是否在跑、端口是否被占；
 `mihomo-box panel-url` 会打印完整地址（含令牌）。

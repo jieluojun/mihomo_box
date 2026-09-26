@@ -138,14 +138,26 @@ if [ ! -f "$HERE/lib/common.sh" ]; then
         mkdir -p "$_bs_dir/snap" || _bs_die "无法创建解压目录"
         tar -xzf "$_bs_dir/snapshot.tar.gz" -C "$_bs_dir/snap" || _bs_die "仓库快照解压失败"
         _bs_root=$(find "$_bs_dir/snap" -maxdepth 1 -mindepth 1 -type d | head -1)
-        if [ -n "$_bs_root" ] && [ -f "$_bs_root/openwrt/install.sh" ] && [ -f "$_bs_root/src/scripts/mihomo.sh" ]; then
-          _bs_info "转到完整安装器（仓库快照）…"
-          exec sh "$_bs_root/openwrt/install.sh" "$@"
-        fi
-        if [ -n "$_bs_root" ] && [ -f "$_bs_root/openwrt/install.sh" ] && [ ! -f "$_bs_root/src/scripts/mihomo.sh" ]; then
-          _bs_info "仓库快照里有 openwrt/，但没有 src/ —— 快照路线需要 src/（模块脚本 + 面板源码）。
-  两种解法：①把这个程序包挂到 Release（资产名 mihomo-box-openwrt-<tag>.tar.gz，
-  自举会优先用它，与 src/ 无关）；②把 src/ 一起推到仓库。"
+        if [ -n "$_bs_root" ] && [ -f "$_bs_root/openwrt/install.sh" ]; then
+          # 仓库快照里，安装所需的三种布局任选其一即可（都由快照里的安装器自己识别）：
+          #   ① openwrt/files/ 已是一份完整程序包（模块脚本 + 面板都在里面）—— 当前仓库就是这样
+          #   ② 仓库里有 src/（模块脚本 + 面板源码），安装器会就地组装
+          #   ③ openwrt/payload.tar.gz（把打好的 tgz 传上去）
+          if [ -f "$_bs_root/openwrt/files/mihomo.sh" ] && [ -d "$_bs_root/openwrt/files/webroot/ui" ]; then
+            _bs_info "仓库快照里带完整程序包（openwrt/files/），转到完整安装器…"
+            exec sh "$_bs_root/openwrt/install.sh" "$@"
+          elif [ -f "$_bs_root/src/scripts/mihomo.sh" ] && [ -d "$_bs_root/src/webroot/ui" ]; then
+            _bs_info "仓库快照里带源码（src/），转到完整安装器（就地组装）…"
+            exec sh "$_bs_root/openwrt/install.sh" "$@"
+          elif [ -f "$_bs_root/openwrt/payload.tar.gz" ]; then
+            _bs_info "仓库快照里带 openwrt/payload.tar.gz，转到完整安装器…"
+            exec sh "$_bs_root/openwrt/install.sh" "$@"
+          fi
+          _bs_info "仓库快照里只有 openwrt/ 的脚本，缺安装件。三者任选其一即可：
+  ① 让 openwrt/files/ 里带上 mihomo.sh 与 webroot/ui（README 里说明了怎么生成）；
+  ② 把 src/（模块脚本 + 面板源码）推到仓库；
+  ③ 把打好的程序包传到 openwrt/payload.tar.gz。
+  另外：Release 里挂 mihomo-box-openwrt-<最新 tag>.tar.gz 也行（自举优先用它）。"
         else
           _bs_info "仓库快照里没有 openwrt/install.sh（openwrt/ 目录还没提交？）"
         fi
@@ -406,6 +418,12 @@ if [ -z "$PAYLOAD_DIR" ]; then
   if [ -d "$HERE/files" ] && [ -f "$HERE/files/box.sh" ] && [ -f "$HERE/files/mihomo.sh" ] && [ -d "$HERE/files/webroot/ui" ]; then
     # 当前目录就是打好的程序包（tgz 解开的那个目录）
     PAYLOAD_DIR=$HERE
+  elif [ -f "$HERE/payload.tar.gz" ]; then
+    # 仓库里放了打好的程序包（openwrt/payload.tar.gz）：直接用它
+    info "使用仓库内程序包 openwrt/payload.tar.gz"
+    PDIR=$ETC/.payload; rm -rf "$PDIR"; mkdir -p "$PDIR"
+    tar -xzf "$HERE/payload.tar.gz" -C "$PDIR" || die "openwrt/payload.tar.gz 解压失败"
+    PAYLOAD_DIR=$PDIR
   elif [ -d "$HERE/files" ] && [ -f "$HERE/../src/scripts/mihomo.sh" ] && [ -d "$HERE/../src/webroot/ui" ]; then
     # 直接跑仓库检出（git clone 后 sh openwrt/install.sh）：把模块脚本与面板就地组装成程序包
     info "检测到仓库检出，就地组装程序包"
@@ -446,6 +464,30 @@ cp -f "$PAYLOAD_DIR/files/box.sh"    "$SCRIPTDIR/box.sh"           || die "复�
 # 真正的模块脚本放在 mihomo-module.sh，由调度器按需转发。
 cp -f "$PAYLOAD_DIR/files/box.sh"    "$SCRIPTDIR/mihomo.sh"        || die "复制调度器失败"
 chmod 755 "$SCRIPTDIR/mihomo-module.sh" "$SCRIPTDIR/box.sh" "$SCRIPTDIR/mihomo.sh"
+
+# 工作目录骨架与随包数据文件（与 Android 版 customize.sh 同一套语义）：
+#   · proxies/ 放本地 provider 文件（默认配置里的「钉钉直连」「非免节点」就指向它们）
+#   · rules/ backup/ 只是先建好，方便用户往里放文件
+# 已存在的文件一律不覆盖 —— 用户改过的节点清单要保住。
+mkdir -p "$ETC/proxies" "$ETC/rules" "$ETC/backup"
+if [ -d "$PAYLOAD_DIR/files/data/proxies" ]; then
+  _inst=0
+  for _pf in "$PAYLOAD_DIR/files/data/proxies/"*; do
+    [ -f "$_pf" ] || continue
+    _pn=${_pf##*/}
+    if [ -f "$ETC/proxies/$_pn" ]; then
+      info "已存在，保留不动：proxies/$_pn"
+    else
+      cp -f "$_pf" "$ETC/proxies/$_pn" || die "写入 proxies/$_pn 失败"
+      chmod 644 "$ETC/proxies/$_pn" 2>/dev/null || true
+      info "已放入 proxies/$_pn"
+      _inst=$((_inst + 1))
+    fi
+  done
+  [ "$_inst" -gt 0 ] || true
+else
+  warn "程序包里没有 data/proxies（钉钉直连.yaml / 非免节点.txt 未安装）"
+fi
 # 公共库：box.sh 的 update-core / check-env 等要用（装在 scripts/lib/ 下）
 mkdir -p "$SCRIPTDIR/lib"
 if [ -f "$PAYLOAD_DIR/lib/common.sh" ]; then
