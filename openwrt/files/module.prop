@@ -1,6 +1,0 @@
-id=mihomo_box_openwrt
-name=Mihomo Box (OpenWrt)
-version=20260926-2213
-versionCode=1790432023
-author=tg@jieluojun
-description=路由器版：mihomo 内核 + 面板（安装目录 /etc/mihomo_box）

@@ -1,6 +1,0 @@
-# 非免节点（普通机场/自建节点）：默认配置里的「非免节点」本地订阅固定读取本文件。
-# 写法：顶部仅保留 proxies: 列表，一行一个节点；节点的 server 必须含 IP 或域名。
-# 示例：
-# proxies:
-#   - {"name":"示例-香港01","type":"vmess","server":"example.com","port":443,"uuid":"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx","alterId":0,"cipher":"auto","tls":true,"network":"ws","ws-opts":{"path":"/","headers":{"Host":"example.com"}},"servername":"example.com"}
-proxies: []
