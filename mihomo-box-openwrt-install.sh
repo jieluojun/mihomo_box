@@ -1,0 +1,823 @@
+#!/bin/sh
+# ============================================================
+# Mihomo Box · OpenWrt 一键安装脚本
+#
+# 用法（路由器上以 root 执行）：
+#   sh mihomo-box-openwrt-install.sh                # 安装 / 热更新
+#   sh mihomo-box-openwrt-install.sh install        # 同上
+#   sh mihomo-box-openwrt-install.sh uninstall      # 卸载
+#
+# 可选参数（install）：
+#   --zip <本地包>   用本地发布包安装（离线安装，支持 .zip）
+#   --url <地址>     指定安装包下载地址（.zip / .tar.gz）
+#   --no-start       安装后不立即启动服务
+#
+# 与 Android 版（KernelSU / Magisk 模块）的对应关系：
+#   · 安装目录 /etc/mihomo_box —— 模块文件与工作目录同址
+#     （对应 Android 的 /data/adb/modules/mihomo_box + /data/adb/mihomo_box，
+#       仅路径不同，脚本 / 面板 / 默认配置全部保持与 Android 版一致）
+#   · 下载走「mihomo box 面板内核管理页」同款加速镜像，直连 GitHub 殿后兜底：
+#       v6.gh-proxy.org → ghfast.top → gh-proxy.com → ghproxy.net → moeyy → 直连
+#   · 不下载 mihomo 内核 —— 内核交给面板「内核管理」页下载（与 Android 版相同，
+#     模块包内本来就不含内核）
+#   · 默认配置 config.yaml / 钉钉直连 / 非免节点 / module-settings.conf /
+#     面板缓存打点等安装步骤与 Android 版 customize.sh 完全一致
+#   · 开机自启由 /etc/init.d/mihomo_box 承担（对应 Android 版 service.sh 流程）
+#
+# 兼容：busybox ash / dash / bash；OpenWrt 21.02+（含 iStoreOS / ImmortalWrt 等衍生版）
+# ============================================================
+
+# ---------- 可覆盖常量（测试 / 定制用，日常无需改动） ----------
+REPO="${MIHOMO_BOX_REPO:-jieluojun/mihomo_box}"
+INSTALL_DIR="${MIHOMO_BOX_DIR:-/etc/mihomo_box}"
+INITD="${MIHOMO_BOX_INITD:-/etc/init.d/mihomo_box}"
+UPDATE_JSON_URL="https://raw.githubusercontent.com/$REPO/main/update.json"
+LATEST_PAGE="https://github.com/$REPO/releases/latest"
+
+# ---------- 输出 ----------
+say()  { printf '%s\n' "$*"; }
+step() { printf '\n==> %s\n' "$*"; }
+ok()   { printf '  ✅ %s\n' "$*"; }
+info() { printf '  · %s\n' "$*"; }
+warn() { printf '  ⚠ %s\n' "$*"; }
+die()  { printf '\n  ❌ %s\n' "$*" >&2; exit 1; }
+
+# ---------- 加速镜像（与面板「内核管理」页的下载加速镜像一致） ----------
+# 候选顺序与面板「自动优选」相同：镜像按推荐序打头，直连 GitHub 殿后只作兜底，
+# 单条链路不通自动换下一条，不会拖垮整次下载。
+MIRRORS='https://v6.gh-proxy.org/
+https://ghfast.top/
+https://gh-proxy.com/
+https://ghproxy.net/
+https://github.moeyy.xyz/'
+
+is_github_url() {
+  case "$1" in
+    https://github.com/*|http://github.com/*|https://raw.githubusercontent.com/*|https://codeload.github.com/*)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------- HTTP 客户端（curl / wget / busybox wget 依次找一个能跑的） ----------
+HTTP_CLIENT=""
+pick_http() {
+  if command -v curl >/dev/null 2>&1; then HTTP_CLIENT=curl; return 0; fi
+  if command -v wget >/dev/null 2>&1; then HTTP_CLIENT=wget; return 0; fi
+  if command -v busybox >/dev/null 2>&1; then HTTP_CLIENT="busybox wget"; return 0; fi
+  return 1
+}
+
+# $1=url $2=输出文件 $3=最长等待秒
+http_get() {
+  _hg_t="${3:-300}"
+  case "$HTTP_CLIENT" in
+    curl)
+      curl -f -s -S -L --connect-timeout 10 --max-time "$_hg_t" -o "$2" "$1" ;;
+    wget)
+      if command -v timeout >/dev/null 2>&1; then
+        timeout "$_hg_t" wget -q -O "$2" "$1"
+      else
+        wget -q -O "$2" "$1"
+      fi ;;
+    "busybox wget")
+      if command -v timeout >/dev/null 2>&1; then
+        timeout "$_hg_t" busybox wget -q -O "$2" "$1"
+      else
+        busybox wget -q -O "$2" "$1"
+      fi ;;
+    *) return 1 ;;
+  esac
+}
+
+# 下载结果校验：镜像对不支持的路径可能回 200 + 错误页（HTML）甚至空 tar 包，
+# 只看非空会把垃圾当成功。按类型验真：
+#   zip    —— 文件头 PK 魔数 + 包内文件名明文含 module.prop（zip 文件名不压缩，
+#             grep 即可，不依赖 unzip；结构完整性解压时再验）
+#   tar.gz —— tar 能列出 module.prop
+#   json   —— 看结构
+valid_payload() {
+  # $1=文件 $2=类型(zip|tar.gz|json|any)
+  case "$2" in
+    zip)
+      [ "$(head -c 2 "$1" 2>/dev/null)" = "PK" ] && grep -q 'module\.prop' "$1" 2>/dev/null ;;
+    tar.gz)
+      tar -tzf "$1" 2>/dev/null | grep -q 'module\.prop' ;;
+    json)
+      grep -q '{' "$1" 2>/dev/null ;;
+    *)
+      [ -s "$1" ] ;;
+  esac
+}
+
+# ---------- 纯 shell 解 zip（终阶兜底，零外部依赖）----------
+# OpenWrt 默认既没有 Info-ZIP unzip，busybox 也不带 unzip 小程序，但必有
+# dd / od / gunzip。zip 条目若为 deflate（method 8），把裸 deflate 流包一层
+# gzip 头尾（CRC32/长度取自 zip 中央目录）交给 gunzip 解出；stored（method 0）
+# 直接 dd。由此任何 OpenWrt 都能解包，不必动 opkg。
+leN() {
+  # $1=偏移 $2=字节数(2|4) $3=文件 → stdout 无符号小端整数
+  case "$2" in
+    2) od -An -tu2 -j "$1" -N2 "$3" | tr -d ' \n' ;;
+    4) od -An -tu4 -j "$1" -N4 "$3" | tr -d ' \n' ;;
+  esac
+}
+
+emit_le4() {
+  # $1=十进制数(0..2^32-1) → stdout 4 个小端字节
+  _el_v=$1
+  _el_b0=$((_el_v % 256)); _el_v=$((_el_v / 256))
+  _el_b1=$((_el_v % 256)); _el_v=$((_el_v / 256))
+  _el_b2=$((_el_v % 256)); _el_v=$((_el_v / 256))
+  _el_b3=$((_el_v % 256))
+  printf "$(printf '\\%03o\\%03o\\%03o\\%03o' "$_el_b0" "$_el_b1" "$_el_b2" "$_el_b3")"
+}
+
+shell_unzip() {
+  # $1=zip文件 $2=输出目录
+  _sz_zip="$1"; _sz_out="$2"
+  command -v od >/dev/null 2>&1 || return 1
+  command -v gunzip >/dev/null 2>&1 || command -v zcat >/dev/null 2>&1 || return 1
+  _sz_size=$(wc -c < "$_sz_zip" | tr -d ' ')
+  case "$_sz_size" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_sz_size" -gt 22 ] || return 1
+
+  # ---- EOCD（签名 50 4b 05 06）：在文件尾部 66KB 内找最后一个 ----
+  _sz_span=$_sz_size
+  [ "$_sz_span" -gt 65558 ] && _sz_span=65558
+  _sz_tail_off=$((_sz_size - _sz_span))
+  _sz_eocd=$(od -An -v -tx1 -j "$_sz_tail_off" -N "$_sz_span" "$_sz_zip" | awk -v base="$_sz_tail_off" '
+    { for (i = 1; i <= NF; i++) { n++; b[n] = $i; o[n] = base + n - 1 } }
+    END {
+      p = 0
+      for (k = 1; k <= n - 3; k++)
+        if (b[k] == "50" && b[k+1] == "4b" && b[k+2] == "05" && b[k+3] == "06") p = k
+      if (p) print o[p]
+    }')
+  [ -n "$_sz_eocd" ] || return 1
+  _sz_cd_off=$(leN $((_sz_eocd + 16)) 4 "$_sz_zip")
+  _sz_nent=$(leN $((_sz_eocd + 10)) 2 "$_sz_zip")
+  case "$_sz_cd_off$_sz_nent" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_sz_nent" -gt 0 ] || return 1
+
+  # ---- 逐条目走中央目录（签名 50 4b 01 02 = 33639248）----
+  _sz_p=$_sz_cd_off
+  _sz_i=0
+  while [ "$_sz_i" -lt "$_sz_nent" ]; do
+    _sz_sig=$(leN "$_sz_p" 4 "$_sz_zip")
+    [ "$_sz_sig" = "33639248" ] || return 1
+    _sz_method=$(leN $((_sz_p + 10)) 2 "$_sz_zip")
+    _sz_crc=$(leN $((_sz_p + 16)) 4 "$_sz_zip")
+    _sz_csize=$(leN $((_sz_p + 20)) 4 "$_sz_zip")
+    _sz_usize=$(leN $((_sz_p + 24)) 4 "$_sz_zip")
+    _sz_nlen=$(leN $((_sz_p + 28)) 2 "$_sz_zip")
+    _sz_elen=$(leN $((_sz_p + 30)) 2 "$_sz_zip")
+    _sz_clen=$(leN $((_sz_p + 32)) 2 "$_sz_zip")
+    _sz_lho=$(leN $((_sz_p + 42)) 4 "$_sz_zip")
+    case "$_sz_method$_sz_csize$_sz_usize$_sz_nlen$_sz_lho" in ''|*[!0-9]*) return 1 ;; esac
+    _sz_name=$(dd if="$_sz_zip" bs=1 skip=$((_sz_p + 46)) count="$_sz_nlen" 2>/dev/null)
+    # 本地头 30 字节固定区，名字/扩展长度可能与中央目录不同，必须现场读
+    _sz_lnlen=$(leN $((_sz_lho + 26)) 2 "$_sz_zip")
+    _sz_lelen=$(leN $((_sz_lho + 28)) 2 "$_sz_zip")
+    case "$_sz_lnlen$_sz_lelen" in ''|*[!0-9]*) return 1 ;; esac
+    _sz_data=$((_sz_lho + 30 + _sz_lnlen + _sz_lelen))
+
+    if [ -n "$_sz_name" ]; then
+      case "$_sz_name" in
+        */)  # 目录条目
+          mkdir -p "$_sz_out/$_sz_name" 2>/dev/null ;;
+        *)   # 文件条目
+          _sz_dest="$_sz_out/$_sz_name"
+          mkdir -p "${_sz_dest%/*}" 2>/dev/null
+          if [ "$_sz_method" = "0" ]; then
+            dd if="$_sz_zip" of="$_sz_dest" bs=1 skip="$_sz_data" count="$_sz_csize" 2>/dev/null || return 1
+          elif [ "$_sz_method" = "8" ]; then
+            # 裸 deflate → gzip 容器（头固定，尾部 CRC32 + 原长度均小端）
+            _sz_gz="$_sz_out/.su.gz"
+            printf '\037\213\010\000\000\000\000\000\000\003' > "$_sz_gz"
+            dd if="$_sz_zip" bs=1 skip="$_sz_data" count="$_sz_csize" 2>/dev/null >> "$_sz_gz"
+            emit_le4 "$_sz_crc" >> "$_sz_gz"
+            emit_le4 "$_sz_usize" >> "$_sz_gz"
+            if command -v gunzip >/dev/null 2>&1; then
+              gunzip -c "$_sz_gz" > "$_sz_dest" 2>/dev/null
+            else
+              zcat "$_sz_gz" > "$_sz_dest" 2>/dev/null
+            fi
+            _sz_rc=$?
+            rm -f "$_sz_gz"
+            [ "$_sz_rc" = "0" ] || { rm -f "$_sz_dest"; return 1; }
+          else
+            return 1   # 不认识的压缩方法
+          fi ;;
+      esac
+    fi
+    _sz_p=$((_sz_p + 46 + _sz_nlen + _sz_elen + _sz_clen))
+    _sz_i=$((_sz_i + 1))
+  done
+  return 0
+}
+
+# zip 解包层层兜底：
+#   1) unzip（Info-ZIP） 2) busybox unzip  3) 纯 shell 解包（零依赖，必成）
+#   4) 包管理器装 unzip 后再解  5) 失败
+try_extract_zip() {
+  # $1=zip $2=目标目录
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -o -q "$1" -d "$2" 2>/dev/null && return 0
+  fi
+  if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx unzip; then
+    busybox unzip -o -q "$1" -d "$2" 2>/dev/null && return 0
+  fi
+  if shell_unzip "$1" "$2"; then
+    return 0
+  fi
+  warn "内置解包未成功，尝试通过包管理器安装 unzip"
+  if command -v opkg >/dev/null 2>&1; then
+    info "opkg update && opkg install unzip …"
+    opkg update >/dev/null 2>&1
+    opkg install unzip >/dev/null 2>&1
+    if command -v unzip >/dev/null 2>&1 && unzip -o -q "$1" -d "$2" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  if command -v apk >/dev/null 2>&1; then
+    info "apk add unzip …"
+    apk add --no-cache unzip >/dev/null 2>&1
+    if command -v unzip >/dev/null 2>&1 && unzip -o -q "$1" -d "$2" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# 镜像链抓取：GitHub 资源按「镜像 → 直连兜底」逐个尝试；非 GitHub 地址直连。
+# 成功把链路记进 $2.used；失败清掉残文件。
+# $3=最长等待秒（缺省 300） $4=内容类型（缺省 any，见 valid_payload）
+fetch_via_mirror() {
+  _fm_url="$1"; _fm_out="$2"; _fm_t="${3:-300}"; _fm_kind="${4:-any}"
+  rm -f "$_fm_out" "$_fm_out.used"
+  _fm_try() {
+    # $1=完整URL $2=链路描述
+    http_get "$1" "$_fm_out" "$_fm_t" || { rm -f "$_fm_out"; return 1; }
+    if [ "$_fm_kind" != "any" ] && ! valid_payload "$_fm_out" "$_fm_kind"; then
+      info "  内容校验未通过（$2 返回的不是有效 $_fm_kind），换下一条"
+      rm -f "$_fm_out"; return 1
+    fi
+    [ -s "$_fm_out" ] || { rm -f "$_fm_out"; return 1; }
+    return 0
+  }
+  if is_github_url "$_fm_url"; then
+    _fm_ok=""
+    for _fm_pre in $MIRRORS; do
+      [ -n "$_fm_pre" ] || continue
+      info "尝试加速镜像 ${_fm_pre}"
+      if _fm_try "${_fm_pre}${_fm_url}" "加速镜像 ${_fm_pre}"; then
+        _fm_ok="加速镜像 ${_fm_pre}"
+        break
+      fi
+      rm -f "$_fm_out"
+    done
+    if [ -z "$_fm_ok" ]; then
+      info "镜像均不可用，兜底直连 GitHub"
+      if _fm_try "$_fm_url" "直连 GitHub"; then
+        _fm_ok="直连 GitHub"
+      else
+        rm -f "$_fm_out"; return 1
+      fi
+    fi
+  else
+    info "直连下载 ${_fm_url}"
+    _fm_try "$_fm_url" "直连" || { rm -f "$_fm_out"; return 1; }
+    _fm_ok="直连"
+  fi
+  printf '%s\n' "$_fm_ok" > "$_fm_out.used"
+  return 0
+}
+
+# update.json 字段提取：$1=文件 $2=键名 → stdout 字符串值（取不到输出空）
+json_str_field() {
+  _jsf_re='s/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+  sed -n "$_jsf_re" "$1" 2>/dev/null | head -1
+}
+
+# 剥掉 update.json zipUrl 里可能自带的镜像前缀，还原 GitHub 原始地址
+canonical_github_url() {
+  printf '%s\n' "$1" | sed -n 's|.*\(https://github\.com/[^" ]*\)|\1|p'
+}
+
+# releases/latest 页面 HTML → stdout: 最新资产名（mihomo-box-YYYYMMDD-HHMM.zip）
+parse_asset_name() {
+  grep -o 'mihomo-box-[0-9]\{8\}-[0-9]\{4\}\.zip' 2>/dev/null | head -1
+}
+
+# ============================================================
+# 安装包获取：镜像链下载，直连兜底
+#   默认路线（依次降级）：
+#     1. update.json 里的 Release 资产 zip（与 Android 版同源）
+#     2. releases/latest 页面解析出的资产 zip
+#   （仓库只托管 update.json / CHANGELOG / README，模块内容仅存在于 Release 资产；
+#     解压不依赖 unzip —— 见 try_extract_zip 的层层兜底）
+# 成功后设置 PKG_FILE / PKG_KIND(zip|tar.gz)
+# ============================================================
+obtain_package() {
+  PKG_FILE=""; PKG_KIND=""
+
+  if [ -n "$ARG_ZIP" ]; then
+    [ -f "$ARG_ZIP" ] || die "本地安装包不存在: $ARG_ZIP"
+    PKG_FILE="$ARG_ZIP"; PKG_KIND=zip
+    info "使用本地安装包: $ARG_ZIP"
+    return 0
+  fi
+
+  if [ -n "$ARG_URL" ]; then
+    case "$ARG_URL" in
+      *.tar.gz|*.tgz) PKG_KIND=tar.gz ;;
+      *)              PKG_KIND=zip ;;
+    esac
+    step "下载安装包（自定义地址）"
+    PKG_FILE="$STAGE/pkg.$PKG_KIND"
+    fetch_via_mirror "$ARG_URL" "$PKG_FILE" 300 "$PKG_KIND" || die "安装包下载失败: $ARG_URL"
+    ok "下载完成（$(wc -c < "$PKG_FILE" | tr -d ' ') 字节，$(cat "$PKG_FILE.used" 2>/dev/null)）"
+    return 0
+  fi
+
+  # ---- 1. 版本信息（update.json）----
+  PKG_VER=""; ZIP_URL=""
+  UJ="$STAGE/update.json"
+  step "获取版本信息（update.json）"
+  if fetch_via_mirror "$UPDATE_JSON_URL" "$UJ" 20 json; then
+    PKG_VER=$(json_str_field "$UJ" version)
+    ZIP_URL=$(canonical_github_url "$(json_str_field "$UJ" zipUrl)")
+    ok "最新版本: ${PKG_VER:-未知}（$(cat "$UJ.used" 2>/dev/null)）"
+  else
+    warn "update.json 获取失败，改从 Release 页面解析"
+  fi
+
+  # ---- 2. Release 资产 zip ----
+  step "下载 Mihomo Box 发布包（Release zip）"
+  PKG_KIND=zip
+  PKG_FILE="$STAGE/pkg.zip"
+  _ob_ok=0
+  for _ob_u in \
+    "$ZIP_URL" \
+    "$( [ -n "$PKG_VER" ] && echo "https://github.com/$REPO/releases/latest/download/mihomo-box-$PKG_VER.zip" )"
+  do
+    [ -n "$_ob_u" ] || continue
+    info "地址: $_ob_u"
+    if fetch_via_mirror "$_ob_u" "$PKG_FILE" 300 zip; then
+      ok "下载完成（$(wc -c < "$PKG_FILE" | tr -d ' ') 字节，$(cat "$PKG_FILE.used" 2>/dev/null)）"
+      _ob_ok=1
+      break
+    fi
+    warn "该地址失败，换下一个"
+  done
+  if [ "$_ob_ok" != "1" ]; then
+    # 解析 releases/latest 页面拿资产名
+    _ob_page="$STAGE/releases.html"
+    if fetch_via_mirror "$LATEST_PAGE" "$_ob_page" 30; then
+      _ob_asset=$(parse_asset_name < "$_ob_page")
+      if [ -n "$_ob_asset" ]; then
+        info "地址: https://github.com/$REPO/releases/latest/download/$_ob_asset"
+        fetch_via_mirror "https://github.com/$REPO/releases/latest/download/$_ob_asset" "$PKG_FILE" 300 zip && {
+          ok "下载完成（$(wc -c < "$PKG_FILE" | tr -d ' ') 字节，$(cat "$PKG_FILE.used" 2>/dev/null)）"
+          _ob_ok=1
+        }
+      fi
+    fi
+  fi
+  [ "$_ob_ok" = "1" ] && return 0
+
+  # 全部通道失败只能报错或改走离线安装
+  die "Release 安装包下载失败（所有镜像与直连均不可用）。
+       可稍后重试；或在能下载的机器上打开 $LATEST_PAGE
+       取 mihomo-box-*.zip，传到路由器后用 --zip 离线安装"
+}
+
+# $1=包文件 $2=解压目标目录 $3=类型(zip|tar.gz)
+# 解压后定位包根目录（Release zip 在根上；自定义 tar.gz 包可能多一层剥离目录）→ PKG_ROOT
+extract_package() {
+  _ex_stage="$2"
+  rm -rf "$_ex_stage"; mkdir -p "$_ex_stage" || return 1
+  case "$3" in
+    zip)
+      try_extract_zip "$1" "$_ex_stage" || return 1 ;;
+    tar.gz)
+      tar -xzf "$1" -C "$_ex_stage" || return 1 ;;
+  esac
+  if [ -f "$_ex_stage/module.prop" ]; then
+    PKG_ROOT="$_ex_stage"
+  else
+    _ex_m=$(find "$_ex_stage" -name module.prop 2>/dev/null | head -1)
+    [ -n "$_ex_m" ] || return 1
+    PKG_ROOT=${_ex_m%/module.prop}
+  fi
+  [ -f "$PKG_ROOT/scripts/mihomo.sh" ] || return 1
+  [ -f "$PKG_ROOT/webroot/ui/cgi-bin/exec.sh" ] || return 1
+  [ -f "$PKG_ROOT/webroot/ui/index.html" ] || return 1
+  return 0
+}
+
+# 源码包路线的清理：剔除打包时本就不入包的开发文件（对齐 build.sh 的剔除清单），
+# 保证源码包安装结果与 Release zip 一致
+cleanup_pkg_root() {
+  rm -rf "$PKG_ROOT/tests" "$PKG_ROOT/.github" "$PKG_ROOT/node_modules" \
+         "$PKG_ROOT/.gitignore" "$PKG_ROOT/.gitattributes" 2>/dev/null
+  rm -f "$PKG_ROOT/update.json" "$PKG_ROOT/CHANGELOG.md" "$PKG_ROOT/UPDATE.md" 2>/dev/null
+  find "$PKG_ROOT" -name '*.zip' -type f -delete 2>/dev/null
+  find "$PKG_ROOT" -type d \( -name '__pycache__' -o -name node_modules \) -exec rm -rf {} + 2>/dev/null
+  return 0
+}
+
+# ============================================================
+# 递归清残：删除安装目录中「不在本次包内」的旧文件（对齐 Android 版 customize.sh）。
+# 用户数据与模块标记不删：config.yaml / module-settings.conf / core / run /
+# proxies / rules / backup / disable / remove / update / 卸载脚本
+# ============================================================
+stale_clean() {
+  _sc_list="$STAGE/manifest.txt"
+  ( cd "$PKG_ROOT" && find . -type f | sed 's|^\./||' ) > "$_sc_list"
+  _sc_n=0
+  for _sc_f in $(find "$INSTALL_DIR" -type f 2>/dev/null); do
+    _sc_r=${_sc_f#$INSTALL_DIR/}
+    case "$_sc_r" in
+      disable|remove|update|skip_test|uninstall-openwrt.sh|config.yaml|module-settings.conf|core/*|run/*|proxies/*|rules/*|backup/*)
+        continue ;;
+    esac
+    grep -qxF "$_sc_r" "$_sc_list" 2>/dev/null || { rm -f "$_sc_f"; _sc_n=$((_sc_n + 1)); }
+  done
+  find "$INSTALL_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null
+  [ "$_sc_n" -gt 0 ] && ok "已删除包外旧文件 $_sc_n 个（含子目录残留）"
+  return 0
+}
+
+# ============================================================
+# 路径适配：Android 的模块目录 / 工作目录两个路径，OpenWrt 上合并为 $INSTALL_DIR。
+# 长串先替换（/data/adb/modules/mihomo_box），避免被短串（/data/adb/mihomo_box）误伤。
+# 除此之外脚本内容不动 —— 其余部分保持与 Android 一样。
+# ============================================================
+patch_paths() {
+  step "适配安装路径（Android 路径 → $INSTALL_DIR）"
+  _pp_n=0
+  for _pp_f in $(grep -rl -e '/data/adb/modules/mihomo_box' -e '/data/adb/mihomo_box' "$INSTALL_DIR" 2>/dev/null); do
+    case "$_pp_f" in
+      *.dex|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.woff2|*.sha256) continue ;;
+    esac
+    sed -i \
+      -e "s|/data/adb/modules/mihomo_box|$INSTALL_DIR|g" \
+      -e "s|/data/adb/mihomo_box|$INSTALL_DIR|g" \
+      "$_pp_f" 2>/dev/null && _pp_n=$((_pp_n + 1))
+  done
+  # 模块描述改写（对应 Android 版 customize.sh 识别 root 方案后重写描述里的工具名）
+  [ -f "$INSTALL_DIR/module.prop" ] && \
+    sed -i 's/for KernelSU Next/for OpenWrt/; s/for KernelSU/for OpenWrt/; s/for APatch/for OpenWrt/; s/for Magisk/for OpenWrt/' \
+      "$INSTALL_DIR/module.prop" 2>/dev/null
+  ok "已改写 $_pp_n 个文件中的安装路径"
+}
+
+# ============================================================
+# 工作目录初始化 —— 与 Android 版 customize.sh 逐行对应：
+# 首次安装写默认配置，升级只补缺失文件 / 缺失键，用户配置一律保留
+# ============================================================
+setup_workdir() {
+  step "准备工作目录（默认配置 / 模块设置）"
+  mkdir -p "$INSTALL_DIR/core" "$INSTALL_DIR/run" "$INSTALL_DIR/backup" \
+           "$INSTALL_DIR/proxies" "$INSTALL_DIR/rules"
+
+  if [ ! -f "$INSTALL_DIR/config.yaml" ]; then
+    cp "$INSTALL_DIR/data/config.yaml" "$INSTALL_DIR/config.yaml" 2>/dev/null
+    ok "已写入默认配置 config.yaml"
+  else
+    info "检测到已有配置，保留 config.yaml"
+  fi
+
+  if [ ! -f "$INSTALL_DIR/proxies/钉钉直连.yaml" ]; then
+    cp "$INSTALL_DIR/data/proxies/钉钉直连.yaml" "$INSTALL_DIR/proxies/钉钉直连.yaml" 2>/dev/null
+    ok "已添加 钉钉直连.yaml"
+  fi
+
+  # 默认配置声明了「非免节点」本地订阅（./proxies/非免节点.txt），缺文件面板会挂红，
+  # 随包放一份空骨架（与 Android 版相同）
+  if [ ! -f "$INSTALL_DIR/proxies/非免节点.txt" ]; then
+    cp "$INSTALL_DIR/data/proxies/非免节点.txt" "$INSTALL_DIR/proxies/非免节点.txt" 2>/dev/null
+    ok "已添加 非免节点.txt（空骨架，自行填入节点）"
+  fi
+
+  if [ ! -f "$INSTALL_DIR/module-settings.conf" ]; then
+    cat > "$INSTALL_DIR/module-settings.conf" <<'EOF'
+core=jieluojun
+autostart=true
+mirror=direct
+webui=true
+EOF
+    ok "已写入默认模块设置（远程访问默认开启：监听 0.0.0.0）"
+  else
+    info "检测到已有模块设置，保留"
+    # 老版本升级补默认值：只在键完全不存在时补，不覆盖用户选择（与 Android 版相同）
+    if ! grep -qE '^webui=' "$INSTALL_DIR/module-settings.conf" 2>/dev/null; then
+      echo "webui=true" >> "$INSTALL_DIR/module-settings.conf"
+      ok "已为旧配置补上远程访问默认值"
+    fi
+  fi
+
+  chmod 755 "$INSTALL_DIR/scripts/mihomo.sh" 2>/dev/null
+  chmod 755 "$INSTALL_DIR/webroot/ui/cgi-bin/exec.sh" 2>/dev/null
+  chmod 755 "$INSTALL_DIR/service.sh" "$INSTALL_DIR/post-fs-data.sh" \
+            "$INSTALL_DIR/action.sh" "$INSTALL_DIR/uninstall.sh" 2>/dev/null
+  chmod 644 "$INSTALL_DIR/config.yaml" "$INSTALL_DIR/module-settings.conf" \
+            "$INSTALL_DIR/proxies/钉钉直连.yaml" "$INSTALL_DIR/proxies/非免节点.txt" 2>/dev/null
+
+  # 清理模块描述状态缓存（热更新必需，与 Android 版相同）：
+  # 旧缓存会让状态前缀 [🟢]/[🔴]/[⚪] 丢失，收尾由 syncdesc 按新 module.prop 重建
+  rm -f "$INSTALL_DIR/run/modstate.prev" "$INSTALL_DIR/run/desc.base" \
+        "$INSTALL_DIR/run/prop.tpl" 2>/dev/null
+  rmdir "$INSTALL_DIR/run/desc.lock" 2>/dev/null
+  return 0
+}
+
+# ============================================================
+# 面板缓存打点 —— 与 Android 版 customize.sh 完全一致：
+# 「版本戳.刷入时刻」写进 index.html 资源戳 / sw.js INSTALL_STAMP / install.stamp，
+# 每次安装都作废旧缓存，反复装同一个包也一样
+# ============================================================
+stamp_panel_cache() {
+  step "面板缓存打点"
+  _sp_ver=$(grep -m1 '^version=' "$INSTALL_DIR/module.prop" 2>/dev/null | cut -d= -f2- | tr -d '\r')
+  [ -n "$_sp_ver" ] || _sp_ver=$(date '+%Y%m%d-%H%M')
+  _sp_stamp="$_sp_ver.$(date '+%Y%m%d%H%M%S')"
+  if [ -f "$INSTALL_DIR/webroot/ui/index.html" ]; then
+    sed -i "s/?v=[0-9A-Za-z._-]*/?v=$_sp_stamp/g" "$INSTALL_DIR/webroot/ui/index.html"
+    chmod 644 "$INSTALL_DIR/webroot/ui/index.html"
+  fi
+  if [ -f "$INSTALL_DIR/webroot/ui/sw.js" ]; then
+    sed -i "s|^const INSTALL_STAMP = .*|const INSTALL_STAMP = '$_sp_stamp';|" "$INSTALL_DIR/webroot/ui/sw.js"
+    chmod 644 "$INSTALL_DIR/webroot/ui/sw.js"
+  fi
+  printf '%s\n' "$_sp_stamp" > "$INSTALL_DIR/webroot/ui/install.stamp"
+  chmod 644 "$INSTALL_DIR/webroot/ui/install.stamp"
+  # 静态文件 mtime 归零到本次安装时刻（busybox httpd 无缓存头，靠启发式新鲜期，
+  # 旧时间戳会让更新后仍读到旧面板 —— 与 Android 版相同处理）
+  find "$INSTALL_DIR/webroot/ui" -type f -exec touch {} + 2>/dev/null
+  [ -d "$INSTALL_DIR/webroot" ] && find "$INSTALL_DIR/webroot" -maxdepth 1 -type f -exec touch {} + 2>/dev/null
+  ok "刷入指纹 $_sp_stamp（旧缓存将在下次打开面板时自动清除）"
+}
+
+# 生成独立卸载脚本（随安装留存，更新时受 stale_clean 白名单保护）
+write_uninstall_helper() {
+  cat > "$INSTALL_DIR/uninstall-openwrt.sh" <<EOF
+#!/bin/sh
+# Mihomo Box · OpenWrt 卸载脚本（由 mihomo-box-openwrt-install.sh 生成）
+# 用法： sh $INSTALL_DIR/uninstall-openwrt.sh
+INITD=$INITD
+[ -x "\$INITD" ] && { "\$INITD" stop >/dev/null 2>&1; "\$INITD" disable >/dev/null 2>&1; }
+if [ -f "$INSTALL_DIR/scripts/mihomo.sh" ]; then
+  sh "$INSTALL_DIR/scripts/mihomo.sh" switch-stop >/dev/null 2>&1
+  sh "$INSTALL_DIR/scripts/mihomo.sh" stop >/dev/null 2>&1
+  sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop >/dev/null 2>&1
+fi
+rm -f "\$INITD"
+rm -rf "$INSTALL_DIR"
+# 兜底：stop 的后台清扫进程可能稍后才落盘，二次清理防止目录复活
+sleep 1
+rm -rf "$INSTALL_DIR" 2>/dev/null
+echo "✅ Mihomo Box 已卸载（$INSTALL_DIR 已删除）"
+EOF
+  chmod 755 "$INSTALL_DIR/uninstall-openwrt.sh"
+}
+
+# ============================================================
+# 开机自启（对应 Android 版 service.sh）：
+#   START=99 —— 等系统与网络就绪后由 boot 一次性拉起；
+#   不设 procd 守护 —— 与 Android 版一致，内核 / 开关监听 / 面板服务
+#   各自 nohup 常驻，本脚本只负责开机触发一次
+# ============================================================
+write_initd() {
+  if [ ! -f /etc/rc.common ]; then
+    warn "未找到 /etc/rc.common（非 OpenWrt 环境？），跳过开机自启配置"
+    return 0
+  fi
+  step "写入开机自启服务 $INITD"
+  cat > "$INITD" <<EOF
+#!/bin/sh /etc/rc.common
+# Mihomo Box 开机自启（由 mihomo-box-openwrt-install.sh 生成，与 Android 版 service.sh 同流程）
+START=99
+STOP=10
+
+start() {
+	# 与 Android 版 service.sh 相同：等网络就绪（最多约 90 秒）→ boot
+	(
+		sh $INSTALL_DIR/scripts/mihomo.sh wait-net >/dev/null 2>&1
+		sleep 3
+		sh $INSTALL_DIR/scripts/mihomo.sh boot
+	) >/dev/null 2>&1 &
+}
+
+stop() {
+	sh $INSTALL_DIR/scripts/mihomo.sh switch-stop >/dev/null 2>&1
+	sh $INSTALL_DIR/scripts/mihomo.sh stop >/dev/null 2>&1
+	sh $INSTALL_DIR/scripts/mihomo.sh webui-stop >/dev/null 2>&1
+}
+EOF
+  chmod 755 "$INITD"
+  if "$INITD" enable >/dev/null 2>&1; then
+    ok "已启用开机自启（rc.d S99）"
+  else
+    warn "enable 失败，可手动执行：$INITD enable"
+  fi
+}
+
+# HTTP 客户端自检（与 Android 版 customize.sh 相同：代理列表、切换节点都依赖它）
+httpclient_check() {
+  step "HTTP 客户端自检"
+  _hc_line=$(sh "$INSTALL_DIR/scripts/mihomo.sh" httpclient 2>/dev/null | head -1)
+  case "$_hc_line" in
+    OK:*) ok "读取内核数据用: ${_hc_line#OK: }" ;;
+    *)    warn "未找到可用的 HTTP 客户端，代理页可能读不到数据（建议安装 curl 或 wget）" ;;
+  esac
+}
+
+# ============================================================
+# 安装 / 热更新主流程
+# 判定与 Android 版一致：有完整上一版（scripts/mihomo.sh + module.prop）
+# 且跑过安装（module-settings.conf 存在）才算热更新，否则按首次安装
+# ============================================================
+do_install() {
+  say "─────────────────────────────"
+  say "  Mihomo Box · OpenWrt 安装"
+  say "  安装目录: $INSTALL_DIR"
+  say "─────────────────────────────"
+
+  if [ "$(id -u)" != "0" ]; then
+    case "$INSTALL_DIR" in
+      /etc/*|/usr/*|/data/*) die "请以 root 运行本脚本" ;;
+      *) warn "非 root 运行（自定义安装目录，按测试模式继续）" ;;
+    esac
+  fi
+
+  pick_http || die "未找到可用的 HTTP 客户端（curl / wget / busybox wget），请先安装 curl"
+  info "下载通道: $HTTP_CLIENT"
+
+  FIRST=1
+  if [ -f "$INSTALL_DIR/scripts/mihomo.sh" ] && [ -f "$INSTALL_DIR/module.prop" ] && \
+     [ -f "$INSTALL_DIR/module-settings.conf" ]; then
+    FIRST=0
+  fi
+
+  STAGE=$(mktemp -d /tmp/mihomo-box-install.XXXXXX 2>/dev/null) || {
+    STAGE="/tmp/mihomo-box-install.$$"; rm -rf "$STAGE"; mkdir -p "$STAGE" || die "无法创建临时目录"; }
+  trap 'rm -rf "$STAGE"' 0 1 2 15
+
+  # ---- 1. 下载 + 解压安装包（镜像链，直连兜底；不含内核）----
+  obtain_package
+  step "解压安装包"
+  extract_package "$PKG_FILE" "$STAGE/root" "$PKG_KIND" || die "安装包解压失败或结构异常"
+  cleanup_pkg_root
+  ok "安装包就绪: $PKG_ROOT"
+
+  MODSH="$INSTALL_DIR/scripts/mihomo.sh"
+
+  # ---- 2. 热更新：先停旧运行时（与 Android 版热更新同序）----
+  if [ "$FIRST" = "0" ]; then
+    step "检测到已安装，执行热更新"
+    sh "$MODSH" switch-stop >/dev/null 2>&1
+    sh "$MODSH" webui-stop >/dev/null 2>&1
+    # 旧版本把 httpd pid 记在 run/webui.pid（现为 run/httpd.pid），兜底杀一次
+    _old_wp=$(cat "$INSTALL_DIR/run/webui.pid" 2>/dev/null)
+    [ -n "$_old_wp" ] && kill "$_old_wp" 2>/dev/null
+    rm -f "$INSTALL_DIR/run/webui.pid" 2>/dev/null
+  fi
+
+  # ---- 3. 覆盖式同步模块文件（只新增与覆盖，用户数据不在包内、不受影响）----
+  step "同步模块文件到 $INSTALL_DIR"
+  mkdir -p "$INSTALL_DIR"
+  cp -af "$PKG_ROOT"/. "$INSTALL_DIR"/ 2>/dev/null
+  stale_clean
+
+  # ---- 4. 路径适配 + 工作目录 + 缓存打点 ----
+  patch_paths
+  setup_workdir
+  stamp_panel_cache
+  write_uninstall_helper
+
+  # ---- 5. 开机自启 ----
+  write_initd
+
+  # ---- 6. 启动 / 重载运行时 ----
+  if [ "$NO_START" = "1" ]; then
+    warn "按 --no-start 跳过服务启动（重启后由 $INITD 自动拉起）"
+  elif [ "$FIRST" = "0" ]; then
+    step "重载运行时（无需重启）"
+    sh "$MODSH" switch-start >/dev/null 2>&1
+    _wb_out=$(sh "$MODSH" webui-restart 2>&1)
+    sh "$MODSH" syncdesc >/dev/null 2>&1
+    case "$_wb_out" in
+      OK:*) ok "面板服务已按新版本重启（监听范围按你的设置恢复）" ;;
+      *)    warn "面板服务未能启动："; printf '%s\n' "$_wb_out" | head -4 | while IFS= read -r _l; do [ -n "$_l" ] && info "$_l"; done ;;
+    esac
+  else
+    step "启动服务（对应 Android 版开机流程，无需重启路由器）"
+    sh "$MODSH" boot 2>&1 | while IFS= read -r _l; do [ -n "$_l" ] && info "$_l"; done
+  fi
+
+  httpclient_check
+
+  # ---- 7. 收尾提示（对应 Android 版安装完成画面）----
+  VER=$(grep -m1 '^version=' "$INSTALL_DIR/module.prop" 2>/dev/null | cut -d= -f2- | tr -d '\r')
+  say ""
+  say "─────────────────────────────"
+  if [ "$FIRST" = "0" ]; then
+    say "  ✅ Mihomo Box 热更新完成（无需重启）"
+  else
+    say "  ✅ Mihomo Box 首次安装完成（无需重启）"
+  fi
+  say "  版本: ${VER:-未知}    目录: $INSTALL_DIR"
+  say "  ⚠ 安装脚本未下载 mihomo 内核（与 Android 版一致）"
+  say "  ⚠ 请打开面板 WebUI 完成后续："
+  say "  ·「内核管理」→ 下载内核（默认 jieluojun 分支）"
+  say "  ·「主页」→ 开启总开关启动内核"
+  say "  ·「工具」→ 面板服务：电脑 / 手机远程管理"
+  say "  ·「内核管理」→ 下载加速镜像：国内建议选「自动优选」"
+  if [ "$NO_START" != "1" ]; then
+    _wi=$(sh "$MODSH" webui-info 2>/dev/null)
+    [ -n "$_wi" ] && { say "  ───────────────────────────"; printf '%s\n' "$_wi" | while IFS= read -r _l; do say "  $_l"; done; }
+  fi
+  if [ -x "$INITD" ]; then
+    say "  开机自启: $INITD（enable 已开启）"
+  fi
+  say "  卸载:     sh $INSTALL_DIR/uninstall-openwrt.sh"
+  say "─────────────────────────────"
+  say "  提示: TUN / Tproxy 透明代理依赖 iptables（OpenWrt 23+ 可装 iptables-nft）"
+  say "        与 TUN 相关的内核选项，详见面板「内核管理」页环境自检"
+  say "─────────────────────────────"
+}
+
+do_uninstall() {
+  say "─────────────────────────────"
+  say "  Mihomo Box · OpenWrt 卸载"
+  say "─────────────────────────────"
+  [ -x "$INITD" ] && { "$INITD" stop >/dev/null 2>&1; "$INITD" disable >/dev/null 2>&1; }
+  if [ -f "$INSTALL_DIR/scripts/mihomo.sh" ]; then
+    step "停止服务（内核 / 开关监听 / 面板）"
+    sh "$INSTALL_DIR/scripts/mihomo.sh" switch-stop >/dev/null 2>&1
+    sh "$INSTALL_DIR/scripts/mihomo.sh" stop >/dev/null 2>&1
+    sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop >/dev/null 2>&1
+  fi
+  rm -f "$INITD"
+  rm -rf "$INSTALL_DIR"
+  # 兜底：stop 的后台清扫进程可能稍后才落盘，二次清理防止目录复活
+  sleep 1
+  rm -rf "$INSTALL_DIR" 2>/dev/null
+  ok "已删除 $INSTALL_DIR 与开机自启 $INITD"
+  say "─────────────────────────────"
+  say "  ✅ Mihomo Box 已卸载"
+  say "─────────────────────────────"
+}
+
+usage() {
+  if [ -r "$0" ]; then
+    sed -n '3,33p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+  else
+    cat <<'EOF'
+Mihomo Box · OpenWrt 一键安装脚本
+用法：
+  sh mihomo-box-openwrt-install.sh                # 安装 / 热更新
+  sh mihomo-box-openwrt-install.sh uninstall      # 卸载
+可选参数（install）：
+  --zip <本地包>   用本地发布包安装（离线安装，支持 .zip）
+  --url <地址>     指定安装包下载地址（.zip / .tar.gz）
+  --no-start       安装后不立即启动服务
+EOF
+  fi
+}
+
+# ============================================================
+# 入口
+# ============================================================
+CMD=install
+ARG_ZIP=""
+ARG_URL=""
+NO_START=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    install|uninstall)
+      CMD="$1" ;;
+    --zip)
+      shift; [ $# -ge 1 ] || die "--zip 缺少参数"
+      ARG_ZIP="$1" ;;
+    --url)
+      shift; [ $# -ge 1 ] || die "--url 缺少参数"
+      ARG_URL="$1" ;;
+    --no-start)
+      NO_START=1 ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      die "未知参数: $1（--help 查看用法）" ;;
+  esac
+  shift
+done
+
+case "$CMD" in
+  uninstall) do_uninstall ;;
+  *)         do_install ;;
+esac
+exit 0
