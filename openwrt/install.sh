@@ -53,8 +53,19 @@ _bs_get() {                        # $1 url → stdout（探测用，超时要�
 # （国内网络 api.github.com 常被连接超时拖死，所以每一步都短超时、且允许走镜像。）
 _bs_latest_tag() {                 # $1 repo  $2... 镜像前缀列表
   _bs_r=$1; shift
-  _bs_t=$(_bs_get "${_bs_api_base}/repos/$_bs_r/releases/latest" 2>/dev/null) || _bs_t=''
-  _bs_tag=$(printf '%s' "$_bs_t" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  _bs_tag=''
+  # 先直连 API，失败再逐个镜像（gh-proxy 这类镜像同样能代理 api.github.com）
+  for _bs_p0 in '' "$@"; do
+    case "$_bs_p0" in direct) continue ;; esac
+    if [ -n "$_bs_p0" ]; then
+      case "$_bs_p0" in */) _bs_u0="${_bs_p0}${_bs_api_base}/repos/$_bs_r/releases/latest" ;; *) _bs_u0="${_bs_p0}/${_bs_api_base}/repos/$_bs_r/releases/latest" ;; esac
+    else
+      _bs_u0="${_bs_api_base}/repos/$_bs_r/releases/latest"
+    fi
+    _bs_t=$(_bs_get "$_bs_u0" 2>/dev/null) || _bs_t=''
+    _bs_tag=$(printf '%s' "$_bs_t" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    if [ -n "$_bs_tag" ]; then break; fi
+  done
   if [ -z "$_bs_tag" ]; then
     _bs_h=$(_bs_get "${_bs_gh_base}/$_bs_r/releases/latest" 2>/dev/null) || _bs_h=''
     _bs_tag=$(printf '%s' "$_bs_h" | sed -n 's#.*/releases/tag/\(v\?[0-9][^"<]*\).*#\1#p' | head -1)
@@ -62,7 +73,7 @@ _bs_latest_tag() {                 # $1 repo  $2... 镜像前缀列表
   for _bs_p in "$@"; do
     [ -n "$_bs_tag" ] && break
     case "$_bs_p" in ''|direct) continue ;; esac
-    _bs_info "探测版本（镜像 $_bs_p）…"
+    printf '  探测版本（镜像 %s）…\n' "$_bs_p" >&2
     _bs_h=$(_bs_get "$_bs_p${_bs_gh_base}/$_bs_r/releases/latest" 2>/dev/null) || _bs_h=''
     _bs_tag=$(printf '%s' "$_bs_h" | sed -n 's#.*/releases/tag/\(v\?[0-9][^"<]*\).*#\1#p' | head -1)
   done
@@ -84,11 +95,18 @@ if [ ! -f "$HERE/lib/common.sh" ]; then
     case "$_bs_a" in --mirror=*) _bs_mir=${_bs_a#*=} ;; esac
     _bs_prev=$_bs_a
   done
+  # 默认就是「直连优先 + 镜像兜底」：国内路由器上不加任何参数也能装（直连成功就不走镜像）。
+  # 强制只直连：--mirror direct；指定前缀：--mirror https://你的前缀/
   case "$_bs_mir" in
-    auto) _bs_list='direct https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/' ;;
-    ''|direct) _bs_list='direct' ;;
-    *) _bs_list="$_bs_mir direct" ;;
+    auto)   _bs_list='direct https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/' ;;
+    '')     _bs_list='direct https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/' ;;
+    direct) _bs_list='direct' ;;
+    *)      _bs_list="$_bs_mir direct" ;;
   esac
+  # 用户没写 --mirror 时，把「镜像兜底」也交给后面那份完整安装器（内核下载同样需要）
+  _bs_auto=''
+  if [ -z "$_bs_mir" ]; then _bs_auto='--mirror auto'; fi
+  _bs_info "线路：直连优先，失败自动换镜像（gh-proxy.com / ghfast.top / ghproxy.net）"
   _bs_dir=$(mktemp -d "${TMPDIR:-/tmp}/mihomo-box.XXXXXX") || _bs_die "无法创建临时目录"
   # 尝试顺序（每条内部再走镜像列表）：
   #   ① release 资产 mihomo-box-openwrt-<tag>.tar.gz —— 最稳，装了就能用
@@ -145,13 +163,13 @@ if [ ! -f "$HERE/lib/common.sh" ]; then
           #   ③ openwrt/payload.tar.gz（把打好的 tgz 传上去）
           if [ -f "$_bs_root/openwrt/files/mihomo.sh" ] && [ -d "$_bs_root/openwrt/files/webroot/ui" ]; then
             _bs_info "仓库快照里带完整程序包（openwrt/files/），转到完整安装器…"
-            exec sh "$_bs_root/openwrt/install.sh" "$@"
+            exec sh "$_bs_root/openwrt/install.sh" "$@" $_bs_auto
           elif [ -f "$_bs_root/src/scripts/mihomo.sh" ] && [ -d "$_bs_root/src/webroot/ui" ]; then
             _bs_info "仓库快照里带源码（src/），转到完整安装器（就地组装）…"
-            exec sh "$_bs_root/openwrt/install.sh" "$@"
+            exec sh "$_bs_root/openwrt/install.sh" "$@" $_bs_auto
           elif [ -f "$_bs_root/openwrt/payload.tar.gz" ]; then
             _bs_info "仓库快照里带 openwrt/payload.tar.gz，转到完整安装器…"
-            exec sh "$_bs_root/openwrt/install.sh" "$@"
+            exec sh "$_bs_root/openwrt/install.sh" "$@" $_bs_auto
           fi
           _bs_info "仓库快照里只有 openwrt/ 的脚本，缺安装件。三者任选其一即可：
   ① 让 openwrt/files/ 里带上 mihomo.sh 与 webroot/ui（README 里说明了怎么生成）；
@@ -169,7 +187,7 @@ if [ ! -f "$HERE/lib/common.sh" ]; then
   fi
   [ -f "$_bs_dir/install.sh" ] || _bs_die "程序包里没有 install.sh"
   _bs_info "转到完整安装器…"
-  exec sh "$_bs_dir/install.sh" "$@"
+  exec sh "$_bs_dir/install.sh" "$@" $_bs_auto
 fi
 
 
@@ -189,7 +207,8 @@ usage() {
   --core <文件|URL>     用本地内核文件或直链安装（.gz 或裸 ELF）
   --core-version <v>    指定内核版本，如 v1.19.31（默认取最新正式版）
   --variant <变体>      amd64: compatible|v2|v3；mips/le: softfloat|hardfloat；loong64: abi1|abi2
-  --mirror <前缀>       GitHub 加速前缀（如 https://ghfast.top/）；auto=内置镜像列表；direct=直连
+  --mirror <前缀>       GitHub 加速前缀（如 https://gh-proxy.com/）；auto=内置镜像列表（默认：
+                        直连优先，失败自动换镜像）；direct=只直连，不换镜像
   --no-core             跳过内核安装（自备内核或只想先装面板）
   --install-tun         顺带安装 kmod-tun（配置里用 TUN 接管流量时需要）
   --no-curl-install     缺少 curl 时不尝试用 opkg/apk 安装，只提示
@@ -285,7 +304,7 @@ if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then PORT=$DEFAULT_PORT; fi
 # 镜像前缀列表（程序包与内核共用）
 case "$MIRROR" in
   auto)   MIRLIST=$MIRROR_LIST_DEFAULT ;;
-  '')     MIRLIST='direct' ;;
+  '')     MIRLIST=$MIRROR_LIST_DEFAULT ;;   # 默认：直连优先 + 镜像兜底（国内不写参数也能装）
   direct) MIRLIST='direct' ;;
   *)      MIRLIST="$MIRROR direct" ;;
 esac
@@ -470,9 +489,16 @@ chmod 755 "$SCRIPTDIR/mihomo-module.sh" "$SCRIPTDIR/box.sh" "$SCRIPTDIR/mihomo.s
 #   · rules/ backup/ 只是先建好，方便用户往里放文件
 # 已存在的文件一律不覆盖 —— 用户改过的节点清单要保住。
 mkdir -p "$ETC/proxies" "$ETC/rules" "$ETC/backup"
-if [ -d "$PAYLOAD_DIR/files/data/proxies" ]; then
+# 数据文件的来源：程序包里带就用程序包的；源码检出（openwrt/ 与 src/ 并列）时退回 src/data/proxies，
+# 免得「就地组装」这条路漏了 data 文件（路由器的本地包必须带上钉钉直连.yaml / 非免节点.txt）。
+_DATA_DIR=$PAYLOAD_DIR/files/data/proxies
+if [ ! -d "$_DATA_DIR" ] && [ -d "$HERE/../src/data/proxies" ]; then
+  _DATA_DIR=$HERE/../src/data/proxies
+  info "程序包内没有 data/proxies，改用源码目录：$_DATA_DIR"
+fi
+if [ -d "$_DATA_DIR" ]; then
   _inst=0
-  for _pf in "$PAYLOAD_DIR/files/data/proxies/"*; do
+  for _pf in "$_DATA_DIR/"*; do
     [ -f "$_pf" ] || continue
     _pn=${_pf##*/}
     if [ -f "$ETC/proxies/$_pn" ]; then
@@ -486,7 +512,7 @@ if [ -d "$PAYLOAD_DIR/files/data/proxies" ]; then
   done
   [ "$_inst" -gt 0 ] || true
 else
-  warn "程序包里没有 data/proxies（钉钉直连.yaml / 非免节点.txt 未安装）"
+  warn "没有 data/proxies（钉钉直连.yaml / 非免节点.txt 未安装）"
 fi
 # 公共库：box.sh 的 update-core / check-env 等要用（装在 scripts/lib/ 下）
 mkdir -p "$SCRIPTDIR/lib"
