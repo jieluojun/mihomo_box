@@ -24,7 +24,7 @@
 #     面板缓存打点等安装步骤与 Android 版 customize.sh 完全一致
 #   · 开机自启由 /etc/init.d/mihomo_box 承担（对应 Android 版 service.sh 流程）
 #   · 面板服务依赖 busybox httpd，而 OpenWrt 的 busybox 一般不含 httpd 小程序：
-#     缺失时自动安装 uhttpd 适配器 /usr/sbin/httpd（参数与 busybox httpd 同构，
+#     缺失时自动安装兼容垫片（httpd→uhttpd 透传 / nohup / base64，只补不覆盖，
 #     模块脚本零改动）；busybox 自带 httpd 时则直接使用
 #
 # 兼容：busybox ash / dash / bash；OpenWrt 21.02+（含 iStoreOS / ImmortalWrt 等衍生版）
@@ -34,8 +34,9 @@
 REPO="${MIHOMO_BOX_REPO:-jieluojun/mihomo_box}"
 INSTALL_DIR="${MIHOMO_BOX_DIR:-/etc/mihomo_box}"
 INITD="${MIHOMO_BOX_INITD:-/etc/init.d/mihomo_box}"
-HTTPD_SHIM="${MIHOMO_BOX_HTTPD:-/usr/sbin/httpd}"   # 面板 httpd 适配器落点（uhttpd 后端）
-SHIM_MARKER="mihomo-box-openwrt-httpd"
+COMPAT_DIR="${MIHOMO_BOX_COMPAT:-/usr/sbin}"         # 兼容垫片落点（在 CGI/init PATH 内）
+HTTPD_SHIM="${MIHOMO_BOX_HTTPD:-$COMPAT_DIR/httpd}"  # 面板 httpd 适配器（uhttpd 后端）
+SHIM_MARKER="mihomo-box-openwrt"
 UPDATE_JSON_URL="https://raw.githubusercontent.com/$REPO/main/update.json"
 LATEST_PAGE="https://github.com/$REPO/releases/latest"
 
@@ -586,8 +587,8 @@ if [ -f "$INSTALL_DIR/scripts/mihomo.sh" ]; then
   sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop >/dev/null 2>&1
 fi
 rm -f "\$INITD"
-# 移除面板 httpd 适配器（只删自动生成的，不碰系统原有 httpd）
-for _hp in $HTTPD_SHIM \$(command -v httpd 2>/dev/null); do
+# 移除兼容垫片 httpd/nohup/base64（只删自动生成的，不碰系统原有文件）
+for _hp in $HTTPD_SHIM $COMPAT_DIR/nohup $COMPAT_DIR/base64 \$(command -v httpd 2>/dev/null) \$(command -v nohup 2>/dev/null) \$(command -v base64 2>/dev/null); do
   [ -f "\$_hp" ] && grep -q "$SHIM_MARKER" "\$_hp" 2>/dev/null && rm -f "\$_hp"
 done
 rm -rf "$INSTALL_DIR"
@@ -641,12 +642,31 @@ EOF
 }
 
 # ============================================================
-# 面板 httpd 适配器（OpenWrt 特有，模块脚本保持与 Android 一样不改动）
-# 面板服务由 mihomo.sh 以 busybox httpd 语法启动（httpd -f -p bind:port -h 站点根
-# -c conf）。Android 上 busybox-ndk 的 busybox 自带 httpd，而 OpenWrt / ImmortalWrt
-# 的 busybox 一般不编入 httpd 小程序。uhttpd（LuCI 标配、全系自带）与 busybox httpd
-# 调用同构：-f/-p/-h/-c 参数一致，-c 配置文件也解析同样的 `*.sh:解释器` 行，
-# CGI 默认前缀同为 /cgi-bin —— 所以只需一个透传的 httpd 垫片即可，零模块改动。
+# 系统兼容垫片（OpenWrt 特有，模块脚本保持与 Android 一样不改动）
+# ImmortalWrt / OpenWrt 的精简 busybox 默认不编入这些小工具（上游 Config-defaults：
+# httpd=n nohup=n base64=n od=n usleep=n stat=n），Android 靠 busybox-ndk 全都有。
+# 这里按缺失情况生成兼容垫片，mihomo.sh / exec.sh 原样可用：
+#   1) httpd  —— 面板服务（busybox httpd 语法 → uhttpd，LuCI 标配全系自带）
+#   2) nohup  —— 面板 / 开关监听 / 内核 / 后台下载共 7 处拉起常驻进程都用它
+#   3) base64 —— CGI 执行桥协议与配置快照的编解码硬依赖
+# ============================================================
+
+# 垫片通用写入：$1=路径 $2=用途描述；已是自家垫片则原地更新，别人的文件不覆盖
+shim_target_ok() {
+  # $1=目标路径 → 0=可写（不存在或是自家垫片）
+  [ -e "$1" ] || return 0
+  grep -q "$SHIM_MARKER" "$1" 2>/dev/null
+}
+
+write_shim_head() {
+  # $1=路径 $2=用途（写入文件头注释）—— 调用方接着往 fd 1 输出正文
+  printf '%s\n%s\n%s\n' \
+    "#!/bin/sh" \
+    "# $SHIM_MARKER-$2 —— $2 兼容垫片（由 mihomo-box-openwrt-install.sh 生成）" \
+    "# 精简 busybox 无 $2 小程序时的等价实现；系统自带 $2 时本文件不会生成。"
+}
+
+# ---- 1) httpd 适配器 ----
 install_httpd_shim() {
   if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx httpd; then
     info "系统 busybox 自带 httpd 小程序，面板服务直接使用（无需适配）"
@@ -655,7 +675,7 @@ install_httpd_shim() {
   _hs_target="$HTTPD_SHIM"
   _hs_cur=$(command -v httpd 2>/dev/null)
   if [ -n "$_hs_cur" ]; then
-    if grep -q "$SHIM_MARKER" "$_hs_cur" 2>/dev/null; then
+    if grep -q "$SHIM_MARKER-httpd" "$_hs_cur" 2>/dev/null; then
       _hs_target="$_hs_cur"   # 已是本适配器，原地更新
     else
       info "系统已有 httpd（$_hs_cur），面板服务直接使用（不覆盖）"
@@ -670,21 +690,135 @@ install_httpd_shim() {
   case "$_hs_target" in
     */*) mkdir -p "${_hs_target%/*}" 2>/dev/null ;;
   esac
-  cat > "$_hs_target" <<EOF
-#!/bin/sh
-# $SHIM_MARKER —— busybox httpd → uhttpd 适配器（由 mihomo-box-openwrt-install.sh 生成）
-# mihomo.sh 以 busybox httpd 语法启动面板：httpd -f -p bind:port -h 站点根 -c conf
-# uhttpd 与之同构（-f/-p/-h/-c 同义，conf 里 \`*.sh:解释器\` 行同语法），直接透传。
-exec uhttpd "\$@"
-EOF
+  {
+    write_shim_head "$_hs_target" httpd
+    printf '%s\n' \
+      "# mihomo.sh 以 busybox httpd 语法启动面板：httpd -f -p bind:port -h 站点根 -c conf" \
+      "# uhttpd 与之同构（-f/-p/-h/-c 同义，conf 里 \`*.sh:解释器\` 行同语法），直接透传。" \
+      "exec uhttpd \"\$@\""
+  } > "$_hs_target"
   chmod 755 "$_hs_target" 2>/dev/null || { warn "无法写入 $_hs_target"; return 1; }
   ok "已安装面板 httpd 适配器: $_hs_target（uhttpd 后端，busybox httpd 兼容语法）"
   return 0
 }
 
-# 卸载时移除适配器（只删自己生成的，不碰系统原有 httpd）
-remove_httpd_shim() {
-  for _hr_p in "$HTTPD_SHIM" $(command -v httpd 2>/dev/null); do
+# ---- 2) nohup 垫片 ----
+ensure_nohup() {
+  if command -v nohup >/dev/null 2>&1 && ! grep -q "$SHIM_MARKER-nohup" "$(command -v nohup)" 2>/dev/null; then
+    info "系统已有 nohup，无需适配"
+    return 0
+  fi
+  _nh_target="$COMPAT_DIR/nohup"
+  _nh_cur=$(command -v nohup 2>/dev/null)
+  [ -n "$_nh_cur" ] && grep -q "$SHIM_MARKER-nohup" "$_nh_cur" 2>/dev/null && _nh_target="$_nh_cur"
+  mkdir -p "${_nh_target%/*}" 2>/dev/null
+  {
+    write_shim_head "$_nh_target" nohup
+    printf '%s\n' \
+      "# POSIX nohup 最小语义：忽略 SIGHUP（忽略态经 exec 被目标进程继承），其余还原命令。" \
+      "# mihomo.sh 7 处 `nohup cmd >> log 2>&1 &` 的输出重定向由调用方自行处理。" \
+      "trap '' HUP" \
+      "exec \"\$@\""
+  } > "$_nh_target"
+  chmod 755 "$_nh_target" 2>/dev/null || { warn "无法写入 $_nh_target"; return 1; }
+  ok "已安装 nohup 适配器: $_nh_target（SIGHUP 免疫，等价 busybox nohup）"
+  return 0
+}
+
+# ---- 3) base64 垫片（awk 实现，编码/解码与 GNU base64 互操作）----
+ensure_base64() {
+  if command -v base64 >/dev/null 2>&1; then
+    if grep -q "$SHIM_MARKER-base64" "$(command -v base64)" 2>/dev/null; then
+      : # 已是自家垫片，走下方原地更新
+    else
+      info "系统已有 base64，无需适配"
+      return 0
+    fi
+  fi
+  _b6_target="$COMPAT_DIR/base64"
+  _b6_cur=$(command -v base64 2>/dev/null)
+  [ -n "$_b6_cur" ] && grep -q "$SHIM_MARKER-base64" "$_b6_cur" 2>/dev/null && _b6_target="$_b6_cur"
+  mkdir -p "${_b6_target%/*}" 2>/dev/null
+  {
+    write_shim_head "$_b6_target" base64
+    cat <<'SHIMEOF'
+# 用法与 busybox base64 最小子集一致：base64 编码 stdin；base64 -d 解码 stdin。
+# awk 仅按字节处理（LC_ALL=C），输出为标准 base64 字母表（与 atob/btoa 互通）。
+# 限制：编码侧不含 NUL 字节（经 tr 预剔除），文本 / 日志 / 配置场景无感。
+mode=enc
+case "$1" in
+  -d|-D|--decode|--decrypt) mode=dec ;;
+esac
+if [ "$mode" = dec ]; then
+  LC_ALL=C awk '
+    BEGIN {
+      B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+      for (i = 0; i < 64; i++) dec[substr(B, i + 1, 1)] = i
+    }
+    { gsub(/[ \t\r\n]/, ""); buf = buf $0
+      while (length(buf) >= 4) {
+        a = dec[substr(buf, 1, 1)] + 0; b = dec[substr(buf, 2, 1)] + 0
+        c1 = substr(buf, 3, 1); d1 = substr(buf, 4, 1); buf = substr(buf, 5)
+        c = (c1 == "=") ? 0 : dec[c1] + 0
+        d = (d1 == "=") ? 0 : dec[d1] + 0
+        printf "%c", a * 4 + int(b / 16)
+        if (c1 != "=") printf "%c", (b % 16) * 16 + int(c / 4)
+        if (d1 != "=") printf "%c", (c % 4) * 64 + d
+      }
+    }'
+  exit $?
+fi
+# 编码：先落盘拿换行计数（判定结尾换行），再按 3 字节一组流式编码
+_t="/tmp/.mihomo-b64.$$"
+tr -d '\000' > "$_t" 2>/dev/null
+_n=$(wc -l < "$_t" | tr -d " ")
+LC_ALL=C awk -v NLEN="$_n" '
+  BEGIN {
+    B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i
+    acc = 0; cnt = 0; out = ""
+  }
+  {
+    s = $0
+    if (NR <= NLEN) s = s sprintf("%c", 10)
+    for (i = 1; i <= length(s); i++) {
+      acc = acc * 256 + ord[substr(s, i, 1)]; cnt++
+      if (cnt == 3) {
+        out = out substr(B, int(acc / 262144) + 1, 1) substr(B, int(acc / 4096) % 64 + 1, 1) \
+                   substr(B, int(acc / 64) % 64 + 1, 1) substr(B, acc % 64 + 1, 1)
+        acc = 0; cnt = 0
+        if (length(out) >= 76) { printf "%s\n", out; out = "" }
+      }
+    }
+  }
+  END {
+    if (cnt == 1) out = out substr(B, int(acc / 4) + 1, 1) substr(B, acc % 4 * 16 + 1, 1) "=="
+    else if (cnt == 2) out = out substr(B, int(acc / 1024) + 1, 1) substr(B, int(acc / 16) % 64 + 1, 1) \
+                           substr(B, acc % 16 * 4 + 1, 1) "="
+    if (out != "") printf "%s\n", out
+  }' < "$_t"
+_rc=$?
+rm -f "$_t"
+exit $_rc
+SHIMEOF
+  } > "$_b6_target"
+  chmod 755 "$_b6_target" 2>/dev/null || { warn "无法写入 $_b6_target"; return 1; }
+  ok "已安装 base64 适配器: $_b6_target（awk 实现，编解码与 GNU base64 互通）"
+  return 0
+}
+
+install_compat_shims() {
+  step "系统兼容垫片（busybox 精简缺失项）"
+  install_httpd_shim
+  ensure_nohup
+  ensure_base64
+  return 0
+}
+
+# 卸载时移除垫片（只删自己生成的，不碰系统原有文件）
+remove_compat_shims() {
+  for _hr_p in "$HTTPD_SHIM" "$COMPAT_DIR/nohup" "$COMPAT_DIR/base64" \
+               $(command -v httpd 2>/dev/null) $(command -v nohup 2>/dev/null) $(command -v base64 2>/dev/null); do
     [ -f "$_hr_p" ] || continue
     grep -q "$SHIM_MARKER" "$_hr_p" 2>/dev/null && rm -f "$_hr_p"
   done
@@ -764,9 +898,9 @@ do_install() {
   stamp_panel_cache
   write_uninstall_helper
 
-  # ---- 5. 开机自启 + 面板 httpd 适配 ----
+  # ---- 5. 开机自启 + 系统兼容垫片（httpd/nohup/base64，按需生成）----
   write_initd
-  install_httpd_shim
+  install_compat_shims
 
   # ---- 6. 启动 / 重载运行时 ----
   if [ "$NO_START" = "1" ]; then
@@ -829,7 +963,7 @@ do_uninstall() {
     sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop >/dev/null 2>&1
   fi
   rm -f "$INITD"
-  remove_httpd_shim
+  remove_compat_shims
   rm -rf "$INSTALL_DIR"
   # 兜底：stop 的后台清扫进程可能稍后才落盘，二次清理防止目录复活
   sleep 1
