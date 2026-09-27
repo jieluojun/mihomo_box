@@ -1,1 +1,1 @@
-mihomo box for kernelsu/magisk
+Mihomo 可视化内核模块 for KernelSU/Magisk
