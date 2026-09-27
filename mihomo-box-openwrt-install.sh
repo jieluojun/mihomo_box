@@ -24,8 +24,9 @@
 #     面板缓存打点等安装步骤与 Android 版 customize.sh 完全一致
 #   · 开机自启由 /etc/init.d/mihomo_box 承担（对应 Android 版 service.sh 流程）
 #   · 面板服务依赖 busybox httpd，而 OpenWrt 的 busybox 一般不含 httpd 小程序：
-#     缺失时自动安装兼容垫片（httpd→uhttpd 透传 / nohup / base64，只补不覆盖，
-#     模块脚本零改动）；busybox 自带 httpd 时则直接使用
+#     缺失时自动安装兼容垫片（httpd→uhttpd 透传 / nohup / base64 / od，只补不覆盖，
+#     模块脚本零改动）；busybox 自带时则直接使用（od 垫片修内核下载 gzip/ELF
+#     校验在缺 od 系统上「每个镜像下完就判损坏、换镜像重下」的死循环）
 #   · 自动识别包管理器（opkg / apk）与防火墙后端，检查并安装 TUN / Tproxy 依赖
 #     （kmod-tun；iptables 防火墙装 iptables tproxy 套件，nftables 防火墙另加
 #     kmod-nft-tproxy 与 iptables-nft 兼容层）；已具备则跳过，不重复安装
@@ -590,8 +591,8 @@ if [ -f "$INSTALL_DIR/scripts/mihomo.sh" ]; then
   sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop >/dev/null 2>&1
 fi
 rm -f "\$INITD"
-# 移除兼容垫片 httpd/nohup/base64（只删自动生成的，不碰系统原有文件）
-for _hp in $HTTPD_SHIM $COMPAT_DIR/nohup $COMPAT_DIR/base64 \$(command -v httpd 2>/dev/null) \$(command -v nohup 2>/dev/null) \$(command -v base64 2>/dev/null); do
+# 移除兼容垫片 httpd/nohup/base64/od（只删自动生成的，不碰系统原有文件）
+for _hp in $HTTPD_SHIM $COMPAT_DIR/nohup $COMPAT_DIR/base64 $COMPAT_DIR/od \$(command -v httpd 2>/dev/null) \$(command -v nohup 2>/dev/null) \$(command -v base64 2>/dev/null) \$(command -v od 2>/dev/null); do
   [ -f "\$_hp" ] && grep -q "$SHIM_MARKER" "\$_hp" 2>/dev/null && rm -f "\$_hp"
 done
 rm -rf "$INSTALL_DIR"
@@ -805,6 +806,7 @@ ensure_system_deps() {
 #   1) httpd  —— 面板服务（busybox httpd 语法 → uhttpd，LuCI 标配全系自带）
 #   2) nohup  —— 面板 / 开关监听 / 内核 / 后台下载共 7 处拉起常驻进程都用它
 #   3) base64 —— CGI 执行桥协议与配置快照的编解码硬依赖
+#   4) od     —— 内核下载的 gzip/ELF 魔数校验（缺了会「换镜像无限重下」）
 # ============================================================
 
 # 垫片通用写入：$1=路径 $2=用途描述；已是自家垫片则原地更新，别人的文件不覆盖
@@ -963,18 +965,123 @@ SHIMEOF
   return 0
 }
 
+# ---- 4) od 垫片（读魔数/字节值；内核下载的 gzip/ELF 校验硬依赖）----
+# mihomo.sh 用 od 读 gzip 魔数(1f8b08)、ELF 魔数(7f454c46)、ZIP 头 u16/u32
+# （内核下载 gzip_decode_checked / gunzip_to / ci_magic，以及安装器 shell_unzip）。
+# ImmortalWrt 的 busybox 无 od 小程序（Config-defaults: OD=n）——缺了它，
+# 内核每个镜像下载完成后都被判「gzip 文件头无效」，换镜像从头再来，永无止境。
+# 实现：优先 busybox hexdump（Config-defaults: HEXDUMP=y，逐字节精确），
+# 无 hexdump 时退化为 dd 逐字节取值（精确但有 8192 字节上限，魔数场景足够）。
+ensure_od() {
+  if command -v od >/dev/null 2>&1 && ! grep -q "$SHIM_MARKER-od" "$(command -v od)" 2>/dev/null; then
+    info "系统已有 od，无需适配"
+    return 0
+  fi
+  _od_target="$COMPAT_DIR/od"
+  _od_cur=$(command -v od 2>/dev/null)
+  [ -n "$_od_cur" ] && grep -q "$SHIM_MARKER-od" "$_od_cur" 2>/dev/null && _od_target="$_od_cur"
+  mkdir -p "${_od_target%/*}" 2>/dev/null
+  {
+    write_shim_head "$_od_target" od
+    cat <<'SHIMEOF'
+# 用法子集（覆盖 mihomo.sh / 安装器 shell_unzip 的全部调用）：
+#   od [-An|-A n] [-v] (-tx1|-t x1|-tu2|-t u2|-tu4|-t u4) [-j N|-jN] [-N N|-NN] [file]
+# 输出与 GNU od 等价（调用方均以 tr 去空白取紧凑值）；x1=十六进制字节，
+# u2/u4=小端无符号整数（路由器均为小端）。无文件参数或 file=- 时读标准输入。
+type=x1; skip=0; cnt=0; file=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -An) ;;
+    -A) shift ;;
+    -v) ;;
+    -tx1) type=x1 ;;
+    -tu2) type=u2 ;;
+    -tu4) type=u4 ;;
+    -t) shift
+        case "$1" in x1) type=x1;; u2) type=u2;; u4) type=u4;; esac ;;
+    -j*) skip="${1#-j}"; [ -n "$skip" ] || { shift; skip="$1"; } ;;
+    -N*) cnt="${1#-N}"; [ -n "$cnt" ] || { shift; cnt="$1"; } ;;
+    -*) ;;
+    -) file="" ;;
+    *) file="$1" ;;
+  esac
+  shift
+done
+case "$skip" in ''|*[!0-9]*) skip=0 ;; esac
+case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
+# 取十六进制字节流：优先 hexdump（逐字节精确、一次 fork）
+hex_stream() {
+  _hs_hx=""
+  if command -v hexdump >/dev/null 2>&1; then _hs_hx="hexdump"
+  else
+    for _hs_b in "$(command -v busybox 2>/dev/null)" busybox; do
+      [ -n "$_hs_b" ] && [ -x "$_hs_b" ] && "$_hs_b" --list 2>/dev/null | grep -qx hexdump && { _hs_hx="$_hs_b hexdump"; break; }
+    done
+  fi
+  if [ -n "$_hs_hx" ]; then
+    set -- $_hs_hx
+    if [ "$cnt" -gt 0 ] 2>/dev/null; then
+      [ -n "$file" ] && "$@" -v -s "$skip" -n "$cnt" -e '1/1 "%02x "' "$file" \
+                     || "$@" -v -s "$skip" -n "$cnt" -e '1/1 "%02x "' -
+    else
+      [ -n "$file" ] && "$@" -v -s "$skip" -e '1/1 "%02x "' "$file" \
+                     || "$@" -v -s "$skip" -e '1/1 "%02x "' -
+    fi
+    return 0
+  fi
+  # 退化：dd 逐字节取值（NUL 字节经 $() 变空串，判 0 即正确值）
+  [ "$cnt" -gt 8192 ] 2>/dev/null && { echo "od 垫片: 无 hexdump 且请求超过 8192 字节" >&2; return 1; }
+  _hs_i=0
+  while [ "$cnt" -eq 0 ] || [ "$_hs_i" -lt "$cnt" ]; do
+    if [ -n "$file" ]; then
+      _hs_c=$(dd if="$file" bs=1 skip=$((skip + _hs_i)) count=1 2>/dev/null)
+    else
+      _hs_c=$(dd bs=1 count=1 2>/dev/null)
+    fi
+    [ -z "$_hs_c" ] && [ "$cnt" -eq 0 ] && break
+    if [ -z "$_hs_c" ]; then printf '00 '
+    else printf '%02x ' "$(printf '%d' "'$_hs_c")"; fi
+    _hs_i=$((_hs_i + 1))
+    [ "$cnt" -eq 0 ] && [ "$_hs_i" -ge 8192 ] && break
+  done
+  return 0
+}
+hex_stream | awk -v t="$type" '
+  function h2d(s,  i,v,c) { v=0; s=tolower(s)
+    for (i=1; i<=length(s); i++) { c=substr(s,i,1); v=v*16+index("0123456789abcdef",c)-1 }
+    return v }
+  { for (i=1; i<=NF; i++) b[++n]=h2d($i) }
+  END {
+    if (n == 0) exit
+    if (t == "x1") { for (i=1; i<=n; i++) printf "%02x ", b[i]; print ""; exit }
+    step = (t == "u2") ? 2 : 4
+    for (i=1; i<=n; i+=step) {
+      v = 0
+      for (j=0; j<step; j++) v += (b[i+j]+0) * (256 ^ j)
+      printf "%.0f ", v
+    }
+    print ""
+  }'
+SHIMEOF
+  } > "$_od_target"
+  chmod 755 "$_od_target" 2>/dev/null || { warn "无法写入 $_od_target"; return 1; }
+  ok "已安装 od 适配器: $_od_target（hexdump 实现，内核下载 gzip/ELF 校验用）"
+  return 0
+}
+
 install_compat_shims() {
   step "系统兼容垫片（busybox 精简缺失项）"
   install_httpd_shim
   ensure_nohup
   ensure_base64
+  ensure_od
   return 0
 }
 
 # 卸载时移除垫片（只删自己生成的，不碰系统原有文件）
 remove_compat_shims() {
-  for _hr_p in "$HTTPD_SHIM" "$COMPAT_DIR/nohup" "$COMPAT_DIR/base64" \
-               $(command -v httpd 2>/dev/null) $(command -v nohup 2>/dev/null) $(command -v base64 2>/dev/null); do
+  for _hr_p in "$HTTPD_SHIM" "$COMPAT_DIR/nohup" "$COMPAT_DIR/base64" "$COMPAT_DIR/od" \
+               $(command -v httpd 2>/dev/null) $(command -v nohup 2>/dev/null) $(command -v base64 2>/dev/null) $(command -v od 2>/dev/null); do
     [ -f "$_hr_p" ] || continue
     grep -q "$SHIM_MARKER" "$_hr_p" 2>/dev/null && rm -f "$_hr_p"
   done
