@@ -26,6 +26,9 @@
 #   · 面板服务依赖 busybox httpd，而 OpenWrt 的 busybox 一般不含 httpd 小程序：
 #     缺失时自动安装兼容垫片（httpd→uhttpd 透传 / nohup / base64，只补不覆盖，
 #     模块脚本零改动）；busybox 自带 httpd 时则直接使用
+#   · 自动识别包管理器（opkg / apk）与防火墙后端，检查并安装 TUN / Tproxy 依赖
+#     （kmod-tun；iptables 防火墙装 iptables tproxy 套件，nftables 防火墙另加
+#     kmod-nft-tproxy 与 iptables-nft 兼容层）；已具备则跳过，不重复安装
 #
 # 兼容：busybox ash / dash / bash；OpenWrt 21.02+（含 iStoreOS / ImmortalWrt 等衍生版）
 # ============================================================
@@ -642,6 +645,159 @@ EOF
 }
 
 # ============================================================
+# 系统依赖包（TUN / Tproxy）—— 自动识别包管理器（opkg / apk）与防火墙后端
+# mihomo.sh 的 Tproxy 同步 / 热点转发用 iptables 语法（tproxy-sync / tunhs）：
+# fw4+nftables 系统经 iptables-nft 兼容层执行，fw3/legacy 直接执行。能力已具备
+# 则整组跳过；缺什么装什么（只装缺失包，不重复安装）。
+#   · TUN:      kmod-tun（/dev/net/tun 已存在则跳过）
+#   · Tproxy:   TPROXY 目标 + socket 匹配 + owner 匹配（tproxy_probe 硬要求）
+#               iptables 防火墙 → iptables-mod-tproxy kmod-ipt-tproxy iptables-mod-extra
+#               nftables 防火墙 → 另加 kmod-nft-tproxy（原生 tproxy 内核支持）
+#               且 iptables/ip6tables 命令缺失时装 iptables-nft / ip6tables-nft
+#   · 策略路由: ip 命令缺失时 ip-full（tproxy/tunhs 的 ip rule/route table 需要）
+# 卸载不移除这些系统包（属路由器通用能力，留给其他组件复用）。
+# ============================================================
+
+PKG_MGR=""
+FIREWALL=""
+
+detect_pkg_mgr() {
+  # OpenWrt ≤24.10 用 opkg；25.12+ / ImmortalWrt 25.12 起默认 apk
+  if command -v apk >/dev/null 2>&1 && [ -d /etc/apk ]; then PKG_MGR=apk
+  elif command -v opkg >/dev/null 2>&1; then PKG_MGR=opkg
+  elif command -v apk >/dev/null 2>&1; then PKG_MGR=apk
+  else PKG_MGR=""; fi
+  [ -n "$PKG_MGR" ]
+}
+
+detect_firewall() {
+  # fw4 = firewall4/nftables（22.03+ 默认）；fw3 = 旧 iptables 防火墙
+  if command -v fw4 >/dev/null 2>&1 || [ -x /sbin/fw4 ]; then FIREWALL=nftables
+  elif command -v fw3 >/dev/null 2>&1 || [ -x /sbin/fw3 ]; then FIREWALL=iptables
+  elif command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then FIREWALL=nftables
+  elif command -v iptables >/dev/null 2>&1 && ! command -v nft >/dev/null 2>&1; then FIREWALL=iptables
+  else FIREWALL=nftables   # 22.03+ 默认 fw4，取保守值
+  fi
+}
+
+pkg_is_installed() {
+  case "$PKG_MGR" in
+    opkg) opkg status "$1" 2>/dev/null | grep -q '^Status: install' ;;
+    apk)  apk info -e "$1" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+_pkg_updated=""
+pkg_install_one() {
+  # $1=包名 → 0=已装或装好；索引过期时自动 update 后重试一次
+  pkg_is_installed "$1" && { info "$1 已安装，跳过"; return 0; }
+  info "安装 $1 …"
+  case "$PKG_MGR" in
+    opkg)
+      opkg install "$1" >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
+      if [ "$_pkg_updated" != "1" ]; then
+        _pkg_updated=1
+        info "软件源索引可能过期，opkg update 后重试"
+        opkg update >/dev/null 2>&1
+        opkg install "$1" >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
+      fi ;;
+    apk)
+      apk add "$1" >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
+      if [ "$_pkg_updated" != "1" ]; then
+        _pkg_updated=1
+        info "软件源索引可能过期，apk update 后重试"
+        apk update >/dev/null 2>&1
+        apk add "$1" >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
+      fi ;;
+    *) return 1 ;;
+  esac
+  warn "$1 安装失败（可稍后手动 $PKG_MGR install $1）"
+  return 1
+}
+
+# Tproxy 能力探测（与 mihomo.sh tproxy_probe 同款口径：TPROXY + socket + owner
+# 三件套 + ip 命令，临时链探测完毕即删）——全过则整组依赖视为已就绪
+dep_tproxy_cap_ok() {
+  command -v iptables >/dev/null 2>&1 || return 1
+  command -v ip >/dev/null 2>&1 || return 1
+  iptables -w -t mangle -N mihomo_dep_probe 2>/dev/null || return 1
+  _dp_ok=1
+  iptables -w -t mangle -A mihomo_dep_probe -p tcp -j TPROXY --on-ip 127.0.0.1 \
+    --on-port 1 --tproxy-mark 1 2>/dev/null || _dp_ok=0
+  [ "$_dp_ok" = "1" ] && { iptables -w -t mangle -A mihomo_dep_probe -p tcp \
+    -m socket --transparent -j RETURN 2>/dev/null || _dp_ok=0; }
+  [ "$_dp_ok" = "1" ] && { iptables -w -t mangle -A mihomo_dep_probe -m owner \
+    --uid-owner 0 -j RETURN 2>/dev/null || _dp_ok=0; }
+  iptables -w -t mangle -F mihomo_dep_probe 2>/dev/null
+  iptables -w -t mangle -X mihomo_dep_probe 2>/dev/null
+  [ "$_dp_ok" = "1" ]
+}
+
+ensure_system_deps() {
+  detect_pkg_mgr || {
+    warn "未找到包管理器（opkg / apk），跳过 TUN / Tproxy 依赖检查"
+    return 0
+  }
+  detect_firewall
+  step "系统依赖检查（TUN / Tproxy · 包管理器 $PKG_MGR · 防火墙 $FIREWALL）"
+
+  # ---- 1) TUN（/dev/net/tun 是唯一硬指标，存在即跳过）----
+  if [ -c /dev/net/tun ]; then
+    ok "TUN: /dev/net/tun 已存在，跳过"
+  else
+    if pkg_is_installed kmod-tun; then
+      info "kmod-tun 已安装，加载内核模块"
+    else
+      pkg_install_one kmod-tun
+    fi
+    command -v modprobe >/dev/null 2>&1 && modprobe tun >/dev/null 2>&1
+    if [ -c /dev/net/tun ]; then
+      ok "TUN: /dev/net/tun 就绪"
+    else
+      warn "TUN: /dev/net/tun 仍不可用（内核可能未编入 TUN 或需重启后生效）"
+    fi
+  fi
+
+  # ---- 2) 策略路由 ip 命令（tproxy / tunhs 的 ip rule、路由表 8995 需要）----
+  if command -v ip >/dev/null 2>&1; then
+    ok "ip: 系统已有，跳过"
+  else
+    pkg_install_one ip-full
+  fi
+
+  # ---- 3) Tproxy 能力（TPROXY + socket + owner，缺则按防火墙后端补齐）----
+  if dep_tproxy_cap_ok; then
+    ok "Tproxy 能力已就绪（TPROXY / socket / owner），跳过"
+    return 0
+  fi
+  _dp_list=""
+  # iptables / ip6tables 命令是 mihomo.sh tproxy-sync 的语法载体，缺失必须补
+  if ! command -v iptables >/dev/null 2>&1; then
+    if [ "$FIREWALL" = "nftables" ]; then _dp_list="$_dp_list iptables-nft"
+    else _dp_list="$_dp_list iptables"; fi
+  fi
+  if ! command -v ip6tables >/dev/null 2>&1; then
+    if [ "$FIREWALL" = "nftables" ]; then _dp_list="$_dp_list ip6tables-nft"
+    else _dp_list="$_dp_list ip6tables"; fi
+  fi
+  # nftables 防火墙加装原生 tproxy 内核支持（用户 nft 规则 / LuCI 场景直接受益）
+  [ "$FIREWALL" = "nftables" ] && _dp_list="$_dp_list kmod-nft-tproxy"
+  # 三件套：TPROXY 目标 + socket 匹配（iptables-mod-tproxy）；owner 匹配（mod-extra）
+  _dp_list="$_dp_list iptables-mod-tproxy kmod-ipt-tproxy iptables-mod-extra"
+  for _dp_p in $_dp_list; do
+    pkg_install_one "$_dp_p"
+  done
+  if dep_tproxy_cap_ok; then
+    ok "Tproxy 能力就绪（TPROXY / socket / owner）"
+  else
+    warn "Tproxy 能力探测仍未通过——透明代理暂不可用，面板可正常安装"
+    warn "排查：$PKG_MGR install iptables-mod-tproxy iptables-mod-extra；确认内核含 xt_TPROXY / xt_socket / xt_owner"
+  fi
+  return 0
+}
+
+# ============================================================
 # 系统兼容垫片（OpenWrt 特有，模块脚本保持与 Android 一样不改动）
 # ImmortalWrt / OpenWrt 的精简 busybox 默认不编入这些小工具（上游 Config-defaults：
 # httpd=n nohup=n base64=n od=n usleep=n stat=n），Android 靠 busybox-ndk 全都有。
@@ -898,11 +1054,14 @@ do_install() {
   stamp_panel_cache
   write_uninstall_helper
 
-  # ---- 5. 开机自启 + 系统兼容垫片（httpd/nohup/base64，按需生成）----
+  # ---- 5. 系统依赖（TUN / Tproxy，opkg/apk 自动识别）----
+  ensure_system_deps
+
+  # ---- 6. 开机自启 + 系统兼容垫片（httpd/nohup/base64，按需生成）----
   write_initd
   install_compat_shims
 
-  # ---- 6. 启动 / 重载运行时 ----
+  # ---- 7. 启动 / 重载运行时 ----
   if [ "$NO_START" = "1" ]; then
     warn "按 --no-start 跳过服务启动（重启后由 $INITD 自动拉起）"
   elif [ "$FIRST" = "0" ]; then
@@ -921,7 +1080,7 @@ do_install() {
 
   httpclient_check
 
-  # ---- 7. 收尾提示（对应 Android 版安装完成画面）----
+  # ---- 8. 收尾提示（对应 Android 版安装完成画面）----
   VER=$(grep -m1 '^version=' "$INSTALL_DIR/module.prop" 2>/dev/null | cut -d= -f2- | tr -d '\r')
   say ""
   say "─────────────────────────────"
@@ -946,7 +1105,7 @@ do_install() {
   fi
   say "  卸载:     sh $INSTALL_DIR/uninstall-openwrt.sh"
   say "─────────────────────────────"
-  say "  提示: TUN / Tproxy 透明代理依赖 iptables（OpenWrt 23+ 可装 iptables-nft）"
+  say "  提示: TUN / Tproxy 依赖已自动检查安装（kmod-tun / iptables 或 nftables tproxy 套件）"
   say "        与 TUN 相关的内核选项，详见面板「内核管理」页环境自检"
   say "─────────────────────────────"
 }
