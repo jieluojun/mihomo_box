@@ -46,7 +46,15 @@ LATEST_PAGE="https://github.com/$REPO/releases/latest"
 
 # ---------- 输出 ----------
 say()  { printf '%s\n' "$*"; }
-step() { printf '\n==> %s\n' "$*"; }
+step() {
+  printf '\n==> %s\n' "$*"
+  # 现场痕迹：每步落一行时间戳到 run/install.trace ——真机万一再出现
+  # 「输出停在某处」，看这个文件就知道卡在哪一步（curl|sh 场景排障专用）
+  if [ -n "$INSTALL_DIR" ]; then
+    mkdir -p "$INSTALL_DIR/run" 2>/dev/null
+    printf '%s %s\n' "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$*" >> "$INSTALL_DIR/run/install.trace" 2>/dev/null
+  fi
+}
 ok()   { printf '  ✅ %s\n' "$*"; }
 info() { printf '  · %s\n' "$*"; }
 warn() { printf '  ⚠ %s\n' "$*"; }
@@ -244,15 +252,15 @@ try_extract_zip() {
   warn "内置解包未成功，尝试通过包管理器安装 unzip"
   if command -v opkg >/dev/null 2>&1; then
     info "opkg update && opkg install unzip …"
-    opkg update >/dev/null 2>&1
-    opkg install unzip >/dev/null 2>&1
+    opkg update </dev/null >/dev/null 2>&1
+    opkg install unzip </dev/null >/dev/null 2>&1
     if command -v unzip >/dev/null 2>&1 && unzip -o -q "$1" -d "$2" 2>/dev/null; then
       return 0
     fi
   fi
   if command -v apk >/dev/null 2>&1; then
     info "apk add unzip …"
-    apk add --no-cache unzip >/dev/null 2>&1
+    apk add --no-cache unzip </dev/null >/dev/null 2>&1
     if command -v unzip >/dev/null 2>&1 && unzip -o -q "$1" -d "$2" 2>/dev/null; then
       return 0
     fi
@@ -488,6 +496,36 @@ patch_paths() {
     sed -i '1s|^#!/system/bin/sh|#!/bin/sh|' "$_pp_s" 2>/dev/null
   done
   ok "已改写 $_pp_n 个文件中的安装路径"
+
+  # —— WebUI 渲染时序补丁（慢设备放大前端竞态；Android 快设备上被速度掩盖）——
+  # 原逻辑：status 结构变化后只重绘概览页，其它页仅作废「落地缓存」等下次切页重建；
+  # 而内核/工具/代理页的空数据预热构建会赶在 status 返回之前落地（路由器上 status 要
+  # 跑数秒，窗口极大）。两件事叠加＝刷新网页后内核页永远停在「未安装」（后端明明
+  # exists=1，却没人再画一遍）。这里把「status 结构变化 → 重绘」扩展到当前停留的
+  # 任意页（编辑/滚动中不打扰）。幂等：已应用则原样跳过。
+  _pj_f="$INSTALL_DIR/webroot/ui/js/app.js"
+  if [ -f "$_pj_f" ] && grep -q "visibilityState !== 'visible' || current" "$_pj_f" 2>/dev/null; then
+    _pj_tmp="$_pj_f.p.$$"
+    awk '
+      /if \(document\.visibilityState !== .visible. \|\| current !== .page-dashboard.\) return;/ {
+        print "  if (document.visibilityState !== '\''visible'\'') return;"
+        print "  // 状态结构变化后，停留中的页面必须整体重绘——不只是概览页。内核/工具/代理页"
+        print "  // 的空数据预热构建会赶在 status 之前落地（慢设备上是常态）；若这里不重绘，"
+        print "  // 刷新网页后内核页会永远停在「未安装」——后端 exists=1 也没人再画一遍。"
+        print "  if (sigChanged) {"
+        print "    if (current === '\''page-dashboard'\'' || (!isInteracting() && !userScrollingOrEditing())) rerenderCurrent();"
+        print "  } else if (current === '\''page-dashboard'\'') { paintUptime(); paintResources(); }"
+        getline; getline
+        next
+      }
+      { print }
+    ' "$_pj_f" > "$_pj_tmp" 2>/dev/null && mv "$_pj_tmp" "$_pj_f" 2>/dev/null || rm -f "$_pj_tmp"
+    if grep -q "停留中的页面必须整体重绘" "$_pj_f" 2>/dev/null; then
+      ok "已应用 WebUI 渲染时序补丁（修复刷新后内核页误显未安装）"
+    else
+      warn "WebUI 渲染时序补丁未应用（app.js 结构可能与预期不同），如遇内核页误显未安装请反馈"
+    fi
+  fi
 }
 
 # ============================================================
@@ -584,11 +622,11 @@ write_uninstall_helper() {
 # Mihomo Box · OpenWrt 卸载脚本（由 mihomo-box-openwrt-install.sh 生成）
 # 用法： sh $INSTALL_DIR/uninstall-openwrt.sh
 INITD=$INITD
-[ -x "\$INITD" ] && { "\$INITD" stop >/dev/null 2>&1; "\$INITD" disable >/dev/null 2>&1; }
+[ -x "\$INITD" ] && { "\$INITD" stop </dev/null >/dev/null 2>&1; "\$INITD" disable </dev/null >/dev/null 2>&1; }
 if [ -f "$INSTALL_DIR/scripts/mihomo.sh" ]; then
-  sh "$INSTALL_DIR/scripts/mihomo.sh" switch-stop >/dev/null 2>&1
-  sh "$INSTALL_DIR/scripts/mihomo.sh" stop >/dev/null 2>&1
-  sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop >/dev/null 2>&1
+  sh "$INSTALL_DIR/scripts/mihomo.sh" switch-stop </dev/null >/dev/null 2>&1
+  sh "$INSTALL_DIR/scripts/mihomo.sh" stop </dev/null >/dev/null 2>&1
+  sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop </dev/null >/dev/null 2>&1
 fi
 rm -f "\$INITD"
 # 移除兼容垫片 httpd/nohup/base64/od（只删自动生成的，不碰系统原有文件）
@@ -638,7 +676,7 @@ stop() {
 }
 EOF
   chmod 755 "$INITD"
-  if "$INITD" enable >/dev/null 2>&1; then
+  if "$INITD" enable </dev/null >/dev/null 2>&1; then
     ok "已启用开机自启（rc.d S99）"
   else
     warn "enable 失败，可手动执行：$INITD enable"
@@ -684,7 +722,7 @@ detect_firewall() {
 pkg_is_installed() {
   case "$PKG_MGR" in
     opkg) opkg status "$1" 2>/dev/null | grep -q '^Status: install' ;;
-    apk)  apk info -e "$1" >/dev/null 2>&1 ;;
+    apk)  apk info -e "$1" </dev/null >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }
@@ -696,20 +734,20 @@ pkg_install_one() {
   info "安装 $1 …"
   case "$PKG_MGR" in
     opkg)
-      opkg install "$1" >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
+      opkg install "$1" </dev/null >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
       if [ "$_pkg_updated" != "1" ]; then
         _pkg_updated=1
         info "软件源索引可能过期，opkg update 后重试"
-        opkg update >/dev/null 2>&1
-        opkg install "$1" >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
+        opkg update </dev/null >/dev/null 2>&1
+        opkg install "$1" </dev/null >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
       fi ;;
     apk)
-      apk add "$1" >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
+      apk add "$1" </dev/null >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
       if [ "$_pkg_updated" != "1" ]; then
         _pkg_updated=1
         info "软件源索引可能过期，apk update 后重试"
-        apk update >/dev/null 2>&1
-        apk add "$1" >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
+        apk update </dev/null >/dev/null 2>&1
+        apk add "$1" </dev/null >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
       fi ;;
     *) return 1 ;;
   esac
@@ -718,18 +756,21 @@ pkg_install_one() {
 }
 
 # Tproxy 能力探测（与 mihomo.sh tproxy_probe 同款口径：TPROXY + socket + owner
-# 三件套 + ip 命令，临时链探测完毕即删）——全过则整组依赖视为已就绪
+# 三件套 + ip 命令，临时链探测完毕即删）——全过则整组依赖视为已就绪；
+# 失败时把缺项写进 _DP_MISS，告警可直说缺什么
 dep_tproxy_cap_ok() {
-  command -v iptables >/dev/null 2>&1 || return 1
-  command -v ip >/dev/null 2>&1 || return 1
-  iptables -w -t mangle -N mihomo_dep_probe 2>/dev/null || return 1
+  _DP_MISS=""
+  command -v iptables >/dev/null 2>&1 || { _DP_MISS="iptables 命令"; return 1; }
+  command -v ip >/dev/null 2>&1 || { _DP_MISS="ip 命令"; return 1; }
+  iptables -w -t mangle -N mihomo_dep_probe 2>/dev/null || { _DP_MISS="mangle 表建链（iptables 与内核兼容层）"; return 1; }
   _dp_ok=1
+  _DP_MISS=""
   iptables -w -t mangle -A mihomo_dep_probe -p tcp -j TPROXY --on-ip 127.0.0.1 \
-    --on-port 1 --tproxy-mark 1 2>/dev/null || _dp_ok=0
-  [ "$_dp_ok" = "1" ] && { iptables -w -t mangle -A mihomo_dep_probe -p tcp \
-    -m socket --transparent -j RETURN 2>/dev/null || _dp_ok=0; }
-  [ "$_dp_ok" = "1" ] && { iptables -w -t mangle -A mihomo_dep_probe -m owner \
-    --uid-owner 0 -j RETURN 2>/dev/null || _dp_ok=0; }
+    --on-port 1 --tproxy-mark 1 2>/dev/null || { _dp_ok=0; _DP_MISS="$_DP_MISS TPROXY目标"; }
+  iptables -w -t mangle -A mihomo_dep_probe -p tcp \
+    -m socket --transparent -j RETURN 2>/dev/null || { _dp_ok=0; _DP_MISS="$_DP_MISS socket匹配"; }
+  iptables -w -t mangle -A mihomo_dep_probe -m owner \
+    --uid-owner 0 -j RETURN 2>/dev/null || { _dp_ok=0; _DP_MISS="$_DP_MISS owner匹配"; }
   iptables -w -t mangle -F mihomo_dep_probe 2>/dev/null
   iptables -w -t mangle -X mihomo_dep_probe 2>/dev/null
   [ "$_dp_ok" = "1" ]
@@ -792,7 +833,7 @@ ensure_system_deps() {
   if dep_tproxy_cap_ok; then
     ok "Tproxy 能力就绪（TPROXY / socket / owner）"
   else
-    warn "Tproxy 能力探测仍未通过——透明代理暂不可用，面板可正常安装"
+    warn "Tproxy 能力探测未通过（缺：${_DP_MISS:-未知}）——透明代理暂不可用，面板可正常安装"
     warn "排查：$PKG_MGR install iptables-mod-tproxy iptables-mod-extra；确认内核含 xt_TPROXY / xt_socket / xt_owner"
   fi
   return 0
@@ -1091,7 +1132,7 @@ remove_compat_shims() {
 # HTTP 客户端自检（与 Android 版 customize.sh 相同：代理列表、切换节点都依赖它）
 httpclient_check() {
   step "HTTP 客户端自检"
-  _hc_line=$(sh "$INSTALL_DIR/scripts/mihomo.sh" httpclient 2>/dev/null | head -1)
+  _hc_line=$(sh "$INSTALL_DIR/scripts/mihomo.sh" httpclient </dev/null 2>/dev/null | head -1)
   case "$_hc_line" in
     OK:*) ok "读取内核数据用: ${_hc_line#OK: }" ;;
     *)    warn "未找到可用的 HTTP 客户端，代理页可能读不到数据（建议安装 curl 或 wget）" ;;
@@ -1141,8 +1182,8 @@ do_install() {
   # ---- 2. 热更新：先停旧运行时（与 Android 版热更新同序）----
   if [ "$FIRST" = "0" ]; then
     step "检测到已安装，执行热更新"
-    sh "$MODSH" switch-stop >/dev/null 2>&1
-    sh "$MODSH" webui-stop >/dev/null 2>&1
+    sh "$MODSH" switch-stop </dev/null >/dev/null 2>&1
+    sh "$MODSH" webui-stop </dev/null >/dev/null 2>&1
     # 旧版本把 httpd pid 记在 run/webui.pid（现为 run/httpd.pid），兜底杀一次
     _old_wp=$(cat "$INSTALL_DIR/run/webui.pid" 2>/dev/null)
     [ -n "$_old_wp" ] && kill "$_old_wp" 2>/dev/null
@@ -1169,20 +1210,29 @@ do_install() {
   install_compat_shims
 
   # ---- 7. 启动 / 重载运行时 ----
+  # 子进程统一断开 stdin + 输出走文件捕获：curl|sh 时安装器脚本本身就在 stdin
+  # 管道上，任何后代命令误读 stdin 都会把剩余脚本吃掉（输出戛然而止、无任何报错）；
+  # 输出若用 管道/$() 捕获，后台常驻进程意外继承捕获端又会让这里永久挂住。
   if [ "$NO_START" = "1" ]; then
     warn "按 --no-start 跳过服务启动（重启后由 $INITD 自动拉起）"
   elif [ "$FIRST" = "0" ]; then
     step "重载运行时（无需重启）"
-    sh "$MODSH" switch-start >/dev/null 2>&1
-    _wb_out=$(sh "$MODSH" webui-restart 2>&1)
-    sh "$MODSH" syncdesc >/dev/null 2>&1
+    sh "$MODSH" switch-start </dev/null >/dev/null 2>&1
+    _wb_file="$INSTALL_DIR/run/.webui-restart.out"
+    sh "$MODSH" webui-restart </dev/null > "$_wb_file" 2>&1
+    _wb_out=$(cat "$_wb_file" 2>/dev/null)
+    rm -f "$_wb_file"
+    sh "$MODSH" syncdesc </dev/null >/dev/null 2>&1
     case "$_wb_out" in
       OK:*) ok "面板服务已按新版本重启（监听范围按你的设置恢复）" ;;
       *)    warn "面板服务未能启动："; printf '%s\n' "$_wb_out" | head -4 | while IFS= read -r _l; do [ -n "$_l" ] && info "$_l"; done ;;
     esac
   else
     step "启动服务（对应 Android 版开机流程，无需重启路由器）"
-    sh "$MODSH" boot 2>&1 | while IFS= read -r _l; do [ -n "$_l" ] && info "$_l"; done
+    _bt_file="$INSTALL_DIR/run/.boot.out"
+    sh "$MODSH" boot </dev/null > "$_bt_file" 2>&1
+    while IFS= read -r _l; do [ -n "$_l" ] && info "$_l"; done < "$_bt_file"
+    rm -f "$_bt_file"
   fi
 
   httpclient_check
@@ -1204,7 +1254,7 @@ do_install() {
   say "  ·「工具」→ 面板服务：电脑 / 手机远程管理"
   say "  ·「内核管理」→ 下载加速镜像：国内建议选「自动优选」"
   if [ "$NO_START" != "1" ]; then
-    _wi=$(sh "$MODSH" webui-info 2>/dev/null)
+    _wi=$(sh "$MODSH" webui-info </dev/null 2>/dev/null)
     [ -n "$_wi" ] && { say "  ───────────────────────────"; printf '%s\n' "$_wi" | while IFS= read -r _l; do say "  $_l"; done; }
   fi
   if [ -x "$INITD" ]; then
@@ -1221,12 +1271,12 @@ do_uninstall() {
   say "─────────────────────────────"
   say "  Mihomo Box · OpenWrt 卸载"
   say "─────────────────────────────"
-  [ -x "$INITD" ] && { "$INITD" stop >/dev/null 2>&1; "$INITD" disable >/dev/null 2>&1; }
+  [ -x "$INITD" ] && { "$INITD" stop </dev/null >/dev/null 2>&1; "$INITD" disable </dev/null >/dev/null 2>&1; }
   if [ -f "$INSTALL_DIR/scripts/mihomo.sh" ]; then
     step "停止服务（内核 / 开关监听 / 面板）"
-    sh "$INSTALL_DIR/scripts/mihomo.sh" switch-stop >/dev/null 2>&1
-    sh "$INSTALL_DIR/scripts/mihomo.sh" stop >/dev/null 2>&1
-    sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop >/dev/null 2>&1
+    sh "$INSTALL_DIR/scripts/mihomo.sh" switch-stop </dev/null >/dev/null 2>&1
+    sh "$INSTALL_DIR/scripts/mihomo.sh" stop </dev/null >/dev/null 2>&1
+    sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop </dev/null >/dev/null 2>&1
   fi
   rm -f "$INITD"
   remove_compat_shims
