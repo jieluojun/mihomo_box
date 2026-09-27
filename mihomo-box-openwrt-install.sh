@@ -638,8 +638,8 @@ if [ -f "$INSTALL_DIR/scripts/mihomo.sh" ]; then
   sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop </dev/null >/dev/null 2>&1
 fi
 rm -f "\$INITD"
-# 移除兼容垫片 httpd/nohup/base64/od（只删自动生成的，不碰系统原有文件）
-for _hp in $HTTPD_SHIM $COMPAT_DIR/nohup $COMPAT_DIR/base64 $COMPAT_DIR/od \$(command -v httpd 2>/dev/null) \$(command -v nohup 2>/dev/null) \$(command -v base64 2>/dev/null) \$(command -v od 2>/dev/null); do
+# 移除兼容垫片 httpd/nohup/base64/od/usleep（只删自动生成的，不碰系统原有文件）
+for _hp in $HTTPD_SHIM $COMPAT_DIR/nohup $COMPAT_DIR/base64 $COMPAT_DIR/od $COMPAT_DIR/usleep \$(command -v httpd 2>/dev/null) \$(command -v nohup 2>/dev/null) \$(command -v base64 2>/dev/null) \$(command -v od 2>/dev/null) \$(command -v usleep 2>/dev/null); do
   [ -f "\$_hp" ] && grep -q "$SHIM_MARKER" "\$_hp" 2>/dev/null && rm -f "\$_hp"
 done
 rm -rf "$INSTALL_DIR"
@@ -1119,19 +1119,52 @@ SHIMEOF
   return 0
 }
 
+ensure_usleep() {
+  # usleep 垫片：busybox 精简版既无 usleep、sleep 又只认整数时，面板启动探测链
+  # （usleep 20000 || sleep 0.02 || sleep 1）每轮都会退化成 sleep 1 —— 探测 100 轮
+  # 就是约 100 秒假死（真机实测：uhttpd 一秒内就起来了，安装却"卡"在启动服务两分钟）。
+  # 延时内核：系统 sleep 支持小数直接用；否则 read -t 小数 + 空 FIFO 硬等（busybox ash 实测 20ms 精确）。
+  command -v usleep >/dev/null 2>&1 && return 0
+  _us_target="$COMPAT_DIR/usleep"
+  if [ -e "$_us_target" ] && ! grep -q "$SHIM_MARKER" "$_us_target" 2>/dev/null; then
+    warn "$_us_target 已存在且非本脚本生成，跳过 usleep 适配器"
+    return 1
+  fi
+  {
+    echo "#!/bin/sh"
+    echo "# $SHIM_MARKER-usleep: BusyBox-minimal usleep replacement (read -t fractional + empty FIFO)."
+    cat <<'SHIMEOF'
+us_n=${1:-0}
+case "$us_n" in ''|*[!0-9]*) exit 1 ;; esac
+us_t="$((us_n / 1000000)).$(printf '%06d' $((us_n % 1000000)))"
+# 系统 sleep 支持小数时最快（busybox FANCY_SLEEP / GNU sleep）
+sleep "$us_t" 2>/dev/null && exit 0
+# 整数-only sleep：read -t 小数 + 以读写方式打开的空 FIFO（打开不阻塞，read 等满超时）
+us_f=/tmp/.mihomo-usleep.fifo
+[ -p "$us_f" ] || mkfifo "$us_f" 2>/dev/null
+[ -p "$us_f" ] && read -t "$us_t" us_x <> "$us_f" 2>/dev/null
+exit 0
+SHIMEOF
+  } > "$_us_target"
+  chmod 755 "$_us_target" 2>/dev/null || { warn "无法写入 $_us_target"; return 1; }
+  ok "已安装 usleep 适配器: $_us_target（微秒延时，消除面板探测循环百秒假死）"
+  return 0
+}
+
 install_compat_shims() {
   step "系统兼容垫片（busybox 精简缺失项）"
   install_httpd_shim
   ensure_nohup
   ensure_base64
   ensure_od
+  ensure_usleep
   return 0
 }
 
 # 卸载时移除垫片（只删自己生成的，不碰系统原有文件）
 remove_compat_shims() {
-  for _hr_p in "$HTTPD_SHIM" "$COMPAT_DIR/nohup" "$COMPAT_DIR/base64" "$COMPAT_DIR/od" \
-               $(command -v httpd 2>/dev/null) $(command -v nohup 2>/dev/null) $(command -v base64 2>/dev/null) $(command -v od 2>/dev/null); do
+  for _hr_p in "$HTTPD_SHIM" "$COMPAT_DIR/nohup" "$COMPAT_DIR/base64" "$COMPAT_DIR/od" "$COMPAT_DIR/usleep" \
+               $(command -v httpd 2>/dev/null) $(command -v nohup 2>/dev/null) $(command -v base64 2>/dev/null) $(command -v od 2>/dev/null) $(command -v usleep 2>/dev/null); do
     [ -f "$_hr_p" ] || continue
     grep -q "$SHIM_MARKER" "$_hr_p" 2>/dev/null && rm -f "$_hr_p"
   done
