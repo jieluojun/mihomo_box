@@ -638,8 +638,8 @@ if [ -f "$INSTALL_DIR/scripts/mihomo.sh" ]; then
   sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop </dev/null >/dev/null 2>&1
 fi
 rm -f "\$INITD"
-# 移除兼容垫片 httpd/nohup/base64/od/usleep（只删自动生成的，不碰系统原有文件）
-for _hp in $HTTPD_SHIM $COMPAT_DIR/nohup $COMPAT_DIR/base64 $COMPAT_DIR/od $COMPAT_DIR/usleep \$(command -v httpd 2>/dev/null) \$(command -v nohup 2>/dev/null) \$(command -v base64 2>/dev/null) \$(command -v od 2>/dev/null) \$(command -v usleep 2>/dev/null); do
+# 移除兼容垫片 httpd/nohup/base64/od/usleep/sleep/curl/wget（只删自动生成的，不碰系统原有文件）
+for _hp in $HTTPD_SHIM $COMPAT_DIR/nohup $COMPAT_DIR/base64 $COMPAT_DIR/od $COMPAT_DIR/usleep $COMPAT_DIR/sleep $COMPAT_DIR/curl $COMPAT_DIR/wget \$(command -v httpd 2>/dev/null) \$(command -v nohup 2>/dev/null) \$(command -v base64 2>/dev/null) \$(command -v od 2>/dev/null) \$(command -v usleep 2>/dev/null) \$(command -v sleep 2>/dev/null) \$(command -v curl 2>/dev/null) \$(command -v wget 2>/dev/null); do
   [ -f "\$_hp" ] && grep -q "$SHIM_MARKER" "\$_hp" 2>/dev/null && rm -f "\$_hp"
 done
 rm -rf "$INSTALL_DIR"
@@ -1151,6 +1151,80 @@ SHIMEOF
   return 0
 }
 
+ensure_sleep() {
+  # sleep 小数适配：busybox 精简版 sleep 只认整数，模块里 sleep 0.05/0.1/0.2/0.5
+  # 的轮询/节拍全部报 "invalid number" 并空转（run_timeout 的限时校验也因此失准）。
+  # 整数参数原样转交真 sleep；小数走 read -t + 空 FIFO（busybox ash 实测精确）。
+  if sleep 0.01 2>/dev/null; then return 0; fi   # 真 sleep 支持小数则无需垫片
+  _sl_real=""
+  for _sl_c in /bin/sleep /usr/bin/sleep; do
+    [ -x "$_sl_c" ] && { _sl_real=$_sl_c; break; }
+  done
+  [ -n "$_sl_real" ] || _sl_real="busybox sleep"
+  _sl_target="$COMPAT_DIR/sleep"
+  if [ -e "$_sl_target" ] && ! grep -q "$SHIM_MARKER" "$_sl_target" 2>/dev/null; then
+    warn "$_sl_target 已存在且非本脚本生成，跳过 sleep 适配器"
+    return 1
+  fi
+  {
+    echo "#!/bin/sh"
+    echo "# $SHIM_MARKER-sleep: fractional-capable sleep (integer passthrough; fraction via read -t + FIFO)."
+    cat <<SHIMEOF
+case "\$1" in
+  ''|*[!0-9]*)
+    case "\$1" in *.*) ;; *) exit 1 ;; esac
+    _fs=\${1%%.*}; [ -n "\$_fs" ] || _fs=0
+    _ff=\$(printf '%-6s' "\${1#*.}" | cut -c1-6 | tr ' ' '0')
+    _fp=/tmp/.mihomo-usleep.fifo
+    [ -p "\$_fp" ] || mkfifo "\$_fp" 2>/dev/null
+    [ -p "\$_fp" ] && read -t "\$_fs.\$_ff" _x <> "\$_fp" 2>/dev/null
+    exit 0 ;;
+esac
+exec $_sl_real "\$@"
+SHIMEOF
+  } > "$_sl_target"
+  chmod 755 "$_sl_target" 2>/dev/null || { warn "无法写入 $_sl_target"; return 1; }
+  ok "已安装 sleep 适配器: $_sl_target（小数秒支持，修复轮询报错与限时校验）"
+  return 0
+}
+
+ensure_dlrewrite() {
+  # 下载 URL 改写垫片（curl/wget）：mihomo.sh 的内核下载硬编码 Android 资产名
+  # （android-arm64-v8 / android-amd64）。Android 构建动态链接 /system/bin/linker64，
+  # OpenWrt 上一跑就是 "line N: core: not found"。发布页里 linux 构建与 Android 构建
+  # 同 tag 同后缀，把 URL 里的资产名改写为 linux-* 即可拿到能跑的内核；
+  # 其余 URL 原样透传。只此一处桥接，模块源码保持与 Android 一致。
+  for _dw_cmd in curl wget; do
+    _dw_real=$(command -v "$_dw_cmd" 2>/dev/null) || continue
+    case "$_dw_real" in "$COMPAT_DIR"/*) continue ;; esac
+    _dw_target="$COMPAT_DIR/$_dw_cmd"
+    if [ -e "$_dw_target" ] && ! grep -q "$SHIM_MARKER" "$_dw_target" 2>/dev/null; then
+      warn "$_dw_target 已存在且非本脚本生成，跳过 $_dw_cmd 下载改写垫片"
+      continue
+    fi
+    {
+      echo "#!/bin/sh"
+      echo "# $SHIM_MARKER-dlrewrite: rewrite mihomo-android-* kernel assets to linux builds."
+      cat <<SHIMEOF
+_dw_r=0; _dw_n=\$#
+while [ \$_dw_r -lt \$_dw_n ]; do
+  _dw_a=\$1; shift
+  case "\$_dw_a" in
+    *mihomo-android-arm64-v8*) _dw_a=\$(printf '%s' "\$_dw_a" | sed 's/mihomo-android-arm64-v8/mihomo-linux-arm64/g') ;;
+    *mihomo-android-amd64*)   _dw_a=\$(printf '%s' "\$_dw_a" | sed 's/mihomo-android-amd64/mihomo-linux-amd64/g') ;;
+  esac
+  set -- "\$@" "\$_dw_a"
+  _dw_r=\$((_dw_r + 1))
+done
+exec $_dw_real "\$@"
+SHIMEOF
+    } > "$_dw_target"
+    chmod 755 "$_dw_target" 2>/dev/null || { warn "无法写入 $_dw_target"; continue; }
+    ok "已安装 $_dw_cmd 下载改写垫片: $_dw_target（Android 资产 → linux 构建）"
+  done
+  return 0
+}
+
 install_compat_shims() {
   step "系统兼容垫片（busybox 精简缺失项）"
   install_httpd_shim
@@ -1158,13 +1232,15 @@ install_compat_shims() {
   ensure_base64
   ensure_od
   ensure_usleep
+  ensure_sleep
+  ensure_dlrewrite
   return 0
 }
 
 # 卸载时移除垫片（只删自己生成的，不碰系统原有文件）
 remove_compat_shims() {
-  for _hr_p in "$HTTPD_SHIM" "$COMPAT_DIR/nohup" "$COMPAT_DIR/base64" "$COMPAT_DIR/od" "$COMPAT_DIR/usleep" \
-               $(command -v httpd 2>/dev/null) $(command -v nohup 2>/dev/null) $(command -v base64 2>/dev/null) $(command -v od 2>/dev/null) $(command -v usleep 2>/dev/null); do
+  for _hr_p in "$HTTPD_SHIM" "$COMPAT_DIR/nohup" "$COMPAT_DIR/base64" "$COMPAT_DIR/od" "$COMPAT_DIR/usleep" "$COMPAT_DIR/sleep" "$COMPAT_DIR/curl" "$COMPAT_DIR/wget" \
+               $(command -v httpd 2>/dev/null) $(command -v nohup 2>/dev/null) $(command -v base64 2>/dev/null) $(command -v od 2>/dev/null) $(command -v usleep 2>/dev/null) $(command -v sleep 2>/dev/null) $(command -v curl 2>/dev/null) $(command -v wget 2>/dev/null); do
     [ -f "$_hr_p" ] || continue
     grep -q "$SHIM_MARKER" "$_hr_p" 2>/dev/null && rm -f "$_hr_p"
   done
@@ -1313,6 +1389,14 @@ do_uninstall() {
   say "─────────────────────────────"
   say "  Mihomo Box · OpenWrt 卸载"
   say "─────────────────────────────"
+  if [ "$ASSUME_YES" != 1 ]; then
+    printf "🛑 确认卸载全部数据？[y/N] "
+    read -r _uninstall_ans || _uninstall_ans=""
+    case "$_uninstall_ans" in
+      y|Y|yes|YES) : ;;
+      *) say "已取消卸载"; return 0 ;;
+    esac
+  fi
   [ -x "$INITD" ] && { "$INITD" stop </dev/null >/dev/null 2>&1; "$INITD" disable </dev/null >/dev/null 2>&1; }
   if [ -f "$INSTALL_DIR/scripts/mihomo.sh" ]; then
     step "停止服务（内核 / 开关监听 / 面板）"
@@ -1356,6 +1440,7 @@ CMD=install
 ARG_ZIP=""
 ARG_URL=""
 NO_START=0
+ASSUME_YES=0
 while [ $# -gt 0 ]; do
   case "$1" in
     install|uninstall)
@@ -1368,6 +1453,8 @@ while [ $# -gt 0 ]; do
       ARG_URL="$1" ;;
     --no-start)
       NO_START=1 ;;
+    -y|--y|--yes|--force)
+      ASSUME_YES=1 ;;
     -h|--help)
       usage; exit 0 ;;
     *)
