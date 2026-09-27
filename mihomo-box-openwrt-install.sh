@@ -476,17 +476,21 @@ stale_clean() {
 patch_paths() {
   step "适配安装路径（Android 路径 → $INSTALL_DIR）"
   _pp_n=0
-  for _pp_f in $(grep -rl -e '/data/adb/modules/mihomo_box' -e '/data/adb/mihomo_box' "$INSTALL_DIR" 2>/dev/null); do
+  for _pp_f in $(find "$INSTALL_DIR" -type f 2>/dev/null); do
     case "$_pp_f" in
       *.dex|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.woff2|*.sha256) continue ;;
       # 用户数据与运行期产物永不进路径重写：core/ 里的内核二进制动辄 60MB+，
       # 内部常整 MB 无换行，busybox sed 逐字节啃「超长行」再回写几十 MB，
-      # 真机上就是安装永久停在「适配安装路径」这一步（等多久都不动）
+      # 真机上就是安装永久停在「适配安装路径」这一步（等多久都不动）。
+      # 注意跳过必须发生在「扫描」之前——早先用 grep -rl 全树找待改写文件，
+      # grep 会先把 core/backup/run 里几百 MB 内核字节全读一遍才轮到跳过
+      # 判断，真机上同样永远停在这一步；现在逐文件先分类后读内容。
       */core/*|*/run/*|*/backup/*) continue ;;
     esac
     _pp_sz=$(wc -c < "$_pp_f" 2>/dev/null | tr -d ' ')
     case "$_pp_sz" in ''|*[!0-9]*) continue ;; esac
     [ "$_pp_sz" -gt 2097152 ] && continue   # 模块文本文件都远小于此；超大一律当二进制跳过
+    grep -q -e '/data/adb/modules/mihomo_box' -e '/data/adb/mihomo_box' "$_pp_f" 2>/dev/null || continue
     mkdir -p "$INSTALL_DIR/run" 2>/dev/null
     printf '%s 路径重写 %s\n' "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$_pp_f" >> "$INSTALL_DIR/run/install.trace" 2>/dev/null
     sed -i \
