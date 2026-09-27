@@ -479,7 +479,16 @@ patch_paths() {
   for _pp_f in $(grep -rl -e '/data/adb/modules/mihomo_box' -e '/data/adb/mihomo_box' "$INSTALL_DIR" 2>/dev/null); do
     case "$_pp_f" in
       *.dex|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.woff2|*.sha256) continue ;;
+      # 用户数据与运行期产物永不进路径重写：core/ 里的内核二进制动辄 60MB+，
+      # 内部常整 MB 无换行，busybox sed 逐字节啃「超长行」再回写几十 MB，
+      # 真机上就是安装永久停在「适配安装路径」这一步（等多久都不动）
+      */core/*|*/run/*|*/backup/*) continue ;;
     esac
+    _pp_sz=$(wc -c < "$_pp_f" 2>/dev/null | tr -d ' ')
+    case "$_pp_sz" in ''|*[!0-9]*) continue ;; esac
+    [ "$_pp_sz" -gt 2097152 ] && continue   # 模块文本文件都远小于此；超大一律当二进制跳过
+    mkdir -p "$INSTALL_DIR/run" 2>/dev/null
+    printf '%s 路径重写 %s\n' "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$_pp_f" >> "$INSTALL_DIR/run/install.trace" 2>/dev/null
     sed -i \
       -e "s|/data/adb/modules/mihomo_box|$INSTALL_DIR|g" \
       -e "s|/data/adb/mihomo_box|$INSTALL_DIR|g" \
