@@ -23,6 +23,9 @@
 #   · 默认配置 config.yaml / 钉钉直连 / 非免节点 / module-settings.conf /
 #     面板缓存打点等安装步骤与 Android 版 customize.sh 完全一致
 #   · 开机自启由 /etc/init.d/mihomo_box 承担（对应 Android 版 service.sh 流程）
+#   · 面板服务依赖 busybox httpd，而 OpenWrt 的 busybox 一般不含 httpd 小程序：
+#     缺失时自动安装 uhttpd 适配器 /usr/sbin/httpd（参数与 busybox httpd 同构，
+#     模块脚本零改动）；busybox 自带 httpd 时则直接使用
 #
 # 兼容：busybox ash / dash / bash；OpenWrt 21.02+（含 iStoreOS / ImmortalWrt 等衍生版）
 # ============================================================
@@ -31,6 +34,8 @@
 REPO="${MIHOMO_BOX_REPO:-jieluojun/mihomo_box}"
 INSTALL_DIR="${MIHOMO_BOX_DIR:-/etc/mihomo_box}"
 INITD="${MIHOMO_BOX_INITD:-/etc/init.d/mihomo_box}"
+HTTPD_SHIM="${MIHOMO_BOX_HTTPD:-/usr/sbin/httpd}"   # 面板 httpd 适配器落点（uhttpd 后端）
+SHIM_MARKER="mihomo-box-openwrt-httpd"
 UPDATE_JSON_URL="https://raw.githubusercontent.com/$REPO/main/update.json"
 LATEST_PAGE="https://github.com/$REPO/releases/latest"
 
@@ -471,6 +476,12 @@ patch_paths() {
   [ -f "$INSTALL_DIR/module.prop" ] && \
     sed -i 's/for KernelSU Next/for OpenWrt/; s/for KernelSU/for OpenWrt/; s/for APatch/for OpenWrt/; s/for Magisk/for OpenWrt/' \
       "$INSTALL_DIR/module.prop" 2>/dev/null
+  # shebang 里的 Android shell 路径改写为 /bin/sh：
+  # busybox httpd 靠 httpd.conf 的 *.sh:解释器 启动 CGI 不看 shebang，但 uhttpd
+  # 后端无解释器匹配时会按 shebang 直接 exec（#!/system/bin/sh 在 OpenWrt 不存在）
+  for _pp_s in $(find "$INSTALL_DIR" -type f -name '*.sh' 2>/dev/null); do
+    sed -i '1s|^#!/system/bin/sh|#!/bin/sh|' "$_pp_s" 2>/dev/null
+  done
   ok "已改写 $_pp_n 个文件中的安装路径"
 }
 
@@ -575,6 +586,10 @@ if [ -f "$INSTALL_DIR/scripts/mihomo.sh" ]; then
   sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop >/dev/null 2>&1
 fi
 rm -f "\$INITD"
+# 移除面板 httpd 适配器（只删自动生成的，不碰系统原有 httpd）
+for _hp in $HTTPD_SHIM \$(command -v httpd 2>/dev/null); do
+  [ -f "\$_hp" ] && grep -q "$SHIM_MARKER" "\$_hp" 2>/dev/null && rm -f "\$_hp"
+done
 rm -rf "$INSTALL_DIR"
 # 兜底：stop 的后台清扫进程可能稍后才落盘，二次清理防止目录复活
 sleep 1
@@ -623,6 +638,57 @@ EOF
   else
     warn "enable 失败，可手动执行：$INITD enable"
   fi
+}
+
+# ============================================================
+# 面板 httpd 适配器（OpenWrt 特有，模块脚本保持与 Android 一样不改动）
+# 面板服务由 mihomo.sh 以 busybox httpd 语法启动（httpd -f -p bind:port -h 站点根
+# -c conf）。Android 上 busybox-ndk 的 busybox 自带 httpd，而 OpenWrt / ImmortalWrt
+# 的 busybox 一般不编入 httpd 小程序。uhttpd（LuCI 标配、全系自带）与 busybox httpd
+# 调用同构：-f/-p/-h/-c 参数一致，-c 配置文件也解析同样的 `*.sh:解释器` 行，
+# CGI 默认前缀同为 /cgi-bin —— 所以只需一个透传的 httpd 垫片即可，零模块改动。
+install_httpd_shim() {
+  if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx httpd; then
+    info "系统 busybox 自带 httpd 小程序，面板服务直接使用（无需适配）"
+    return 0
+  fi
+  _hs_target="$HTTPD_SHIM"
+  _hs_cur=$(command -v httpd 2>/dev/null)
+  if [ -n "$_hs_cur" ]; then
+    if grep -q "$SHIM_MARKER" "$_hs_cur" 2>/dev/null; then
+      _hs_target="$_hs_cur"   # 已是本适配器，原地更新
+    else
+      info "系统已有 httpd（$_hs_cur），面板服务直接使用（不覆盖）"
+      return 0
+    fi
+  fi
+  if ! command -v uhttpd >/dev/null 2>&1; then
+    warn "系统既无 busybox httpd 也未找到 uhttpd —— 面板服务将无法启动"
+    warn "请先安装 uhttpd（opkg install uhttpd / apk add uhttpd），再重跑本脚本"
+    return 0
+  fi
+  case "$_hs_target" in
+    */*) mkdir -p "${_hs_target%/*}" 2>/dev/null ;;
+  esac
+  cat > "$_hs_target" <<EOF
+#!/bin/sh
+# $SHIM_MARKER —— busybox httpd → uhttpd 适配器（由 mihomo-box-openwrt-install.sh 生成）
+# mihomo.sh 以 busybox httpd 语法启动面板：httpd -f -p bind:port -h 站点根 -c conf
+# uhttpd 与之同构（-f/-p/-h/-c 同义，conf 里 \`*.sh:解释器\` 行同语法），直接透传。
+exec uhttpd "\$@"
+EOF
+  chmod 755 "$_hs_target" 2>/dev/null || { warn "无法写入 $_hs_target"; return 1; }
+  ok "已安装面板 httpd 适配器: $_hs_target（uhttpd 后端，busybox httpd 兼容语法）"
+  return 0
+}
+
+# 卸载时移除适配器（只删自己生成的，不碰系统原有 httpd）
+remove_httpd_shim() {
+  for _hr_p in "$HTTPD_SHIM" $(command -v httpd 2>/dev/null); do
+    [ -f "$_hr_p" ] || continue
+    grep -q "$SHIM_MARKER" "$_hr_p" 2>/dev/null && rm -f "$_hr_p"
+  done
+  return 0
 }
 
 # HTTP 客户端自检（与 Android 版 customize.sh 相同：代理列表、切换节点都依赖它）
@@ -698,8 +764,9 @@ do_install() {
   stamp_panel_cache
   write_uninstall_helper
 
-  # ---- 5. 开机自启 ----
+  # ---- 5. 开机自启 + 面板 httpd 适配 ----
   write_initd
+  install_httpd_shim
 
   # ---- 6. 启动 / 重载运行时 ----
   if [ "$NO_START" = "1" ]; then
@@ -762,6 +829,7 @@ do_uninstall() {
     sh "$INSTALL_DIR/scripts/mihomo.sh" webui-stop >/dev/null 2>&1
   fi
   rm -f "$INITD"
+  remove_httpd_shim
   rm -rf "$INSTALL_DIR"
   # 兜底：stop 的后台清扫进程可能稍后才落盘，二次清理防止目录复活
   sleep 1
