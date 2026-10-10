@@ -687,6 +687,9 @@ START=99
 STOP=10
 
 start() {
+	# 面板先起：不依赖网络与内核（restart 时 stop() 已停掉面板，这里立刻拉起，
+	# 不必等 wait-net 的 ping 与内核校验）
+	sh $INSTALL_DIR/scripts/mihomo.sh webui-start >/dev/null 2>&1
 	(
 		sh $INSTALL_DIR/scripts/mihomo.sh wait-net >/dev/null 2>&1
 		sleep 3
