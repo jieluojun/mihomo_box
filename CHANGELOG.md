@@ -1,6 +1,8 @@
-## 20261001-1620
-ebpf 入站的 enabled 字段统一改为 enable
+## 20261010-0759
+适配 OpenWrt 系统
 
-新增 tun 开启时打开 ebpf 入站总开关或单独启用 local 弹出关闭 tun 的弹窗选择
+安装
+curl -fsSL https://v6.gh-proxy.org/https://raw.githubusercontent.com/jieluojun/mihomo_box/main/mihomo-box-openwrt-install.sh | sh
 
-修复重启服务时运行状态概率抽搐
+卸载
+curl -fsSL https://v6.gh-proxy.org/https://raw.githubusercontent.com/jieluojun/mihomo_box/main/mihomo-box-openwrt-install.sh | sh -s uninstall
