@@ -1,8 +1,2 @@
-## 20261010-0759
-适配 OpenWrt 系统
-
-安装
-curl -fsSL https://v6.gh-proxy.org/https://raw.githubusercontent.com/jieluojun/mihomo_box/main/mihomo-box-openwrt-install.sh | sh
-
-卸载
-curl -fsSL https://v6.gh-proxy.org/https://raw.githubusercontent.com/jieluojun/mihomo_box/main/mihomo-box-openwrt-install.sh | sh -s uninstall
+## 20261010-2222
+IPv6 开关逻辑改为开启或关闭的同时修改配置里的 IPv6 相关开关并重启服务
