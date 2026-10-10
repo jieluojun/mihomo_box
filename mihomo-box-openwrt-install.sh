@@ -12,7 +12,8 @@
 #   · 安装包来自 Release 资产：加速镜像「自动优选」（与面板内核页同序），直连兜底
 #   · 不下载内核：内核在面板「内核管理」页下载，按 uname -m 自动匹配资产
 #   · 首次安装写默认配置 config.yaml 与模块设置；升级覆盖模块文件，用户配置保留
-#   · 按需生成系统兼容垫片（httpd / nohup / base64 / od / usleep / sleep），mihomo.sh 原样可用
+#   · 不生成系统垫片：精简 busybox 的兼容（nohup / base64 / od / 小数 sleep / uhttpd）由模块层完成
+#   · 清理旧版安装器留下的垫片（只删带本脚本标记的文件）
 #   · 依赖按需安装：TUN（kmod-tun）与 Tproxy（iptables / nftables 套件），已具备则跳过
 # ============================================================
 
@@ -21,7 +22,6 @@ REPO="${MIHOMO_BOX_REPO:-jieluojun/mihomo_box}"
 INSTALL_DIR="${MIHOMO_BOX_DIR:-/etc/mihomo_box}"
 INITD="${MIHOMO_BOX_INITD:-/etc/init.d/mihomo_box}"
 COMPAT_DIR="${MIHOMO_BOX_COMPAT:-/usr/sbin}"          # 兼容垫片落点（在 CGI / init 的 PATH 内）
-HTTPD_SHIM="${MIHOMO_BOX_HTTPD:-$COMPAT_DIR/httpd}"   # 面板 httpd 适配器（uhttpd 后端）
 SHIM_MARKER="mihomo-box-openwrt"
 UPDATE_JSON_URL="https://raw.githubusercontent.com/$REPO/main/update.json"
 LATEST_PAGE="https://github.com/$REPO/releases/latest"
@@ -189,7 +189,7 @@ extract_package() {
 # ---------- 卸载相关 ----------
 # 删除本脚本生成的兼容垫片（只删带标记的文件，不碰系统原有的 curl / wget / sleep 等）
 remove_compat_shims() {
-  for _p in "$HTTPD_SHIM" "$COMPAT_DIR/nohup" "$COMPAT_DIR/base64" "$COMPAT_DIR/od" \
+  for _p in "$COMPAT_DIR/httpd" "$COMPAT_DIR/nohup" "$COMPAT_DIR/base64" "$COMPAT_DIR/od" \
             "$COMPAT_DIR/usleep" "$COMPAT_DIR/sleep" "$COMPAT_DIR/curl" "$COMPAT_DIR/wget" \
             $(for _c in httpd nohup base64 od usleep sleep curl wget; do command -v "$_c" 2>/dev/null; done); do
     [ -f "$_p" ] && grep -q "$SHIM_MARKER" "$_p" 2>/dev/null && rm -f "$_p"
@@ -202,13 +202,13 @@ write_uninstall_helper() {
   cat > "$INSTALL_DIR/uninstall-openwrt.sh" <<'HELPER'
 #!/bin/sh
 # Mihomo Box · OpenWrt 卸载（离线可用，由安装脚本生成）
-INSTALL_DIR="@DIR@"; INITD="@INITD@"; COMPAT_DIR="@COMPAT@"; HTTPD_SHIM="@HTTPD@"
+INSTALL_DIR="@DIR@"; INITD="@INITD@"; COMPAT_DIR="@COMPAT@"
 [ -x "$INITD" ] && { "$INITD" stop </dev/null >/dev/null 2>&1; "$INITD" disable </dev/null >/dev/null 2>&1; }
 for _c in switch-stop stop webui-stop; do
   sh "$INSTALL_DIR/scripts/mihomo.sh" "$_c" </dev/null >/dev/null 2>&1
 done
 rm -f "$INITD"
-for _p in "$HTTPD_SHIM" "$COMPAT_DIR/nohup" "$COMPAT_DIR/base64" "$COMPAT_DIR/od" \
+for _p in "$COMPAT_DIR/httpd" "$COMPAT_DIR/nohup" "$COMPAT_DIR/base64" "$COMPAT_DIR/od" \
           "$COMPAT_DIR/usleep" "$COMPAT_DIR/sleep" "$COMPAT_DIR/curl" "$COMPAT_DIR/wget" \
           $(for _c in httpd nohup base64 od usleep sleep curl wget; do command -v "$_c" 2>/dev/null; done); do
   [ -f "$_p" ] && grep -q "mihomo-box-openwrt" "$_p" 2>/dev/null && rm -f "$_p"
@@ -218,7 +218,7 @@ sleep 1
 rm -rf "$INSTALL_DIR" 2>/dev/null
 echo "✅ Mihomo Box 已卸载（$INSTALL_DIR 已删除）"
 HELPER
-  sed -i "s|@DIR@|$INSTALL_DIR|; s|@INITD@|$INITD|; s|@COMPAT@|$COMPAT_DIR|; s|@HTTPD@|$HTTPD_SHIM|" \
+  sed -i "s|@DIR@|$INSTALL_DIR|; s|@INITD@|$INITD|; s|@COMPAT@|$COMPAT_DIR|" \
     "$INSTALL_DIR/uninstall-openwrt.sh"
   chmod 755 "$INSTALL_DIR/uninstall-openwrt.sh"
 }
@@ -293,7 +293,7 @@ do_install() {
 
   ensure_system_deps
   write_initd
-  install_compat_shims
+  clean_legacy_shims
 
   # 子进程统一断开 stdin：curl | sh 时脚本本身在 stdin 上，误读会吞掉剩余脚本
   if [ "$NO_START" = 1 ]; then
@@ -496,304 +496,7 @@ ensure_system_deps() {
 }
 
 
-# ---------- 系统兼容垫片（mihomo.sh 依赖的 busybox 缺失小工具，按需生成） ----------
-shim_target_ok() {
-  [ -e "$1" ] || return 0
-  grep -q "$SHIM_MARKER" "$1" 2>/dev/null
-}
-
-write_shim_head() {
-  printf '%s\n%s\n%s\n' \
-    "#!/bin/sh" \
-    "# $SHIM_MARKER-$2 —— $2 兼容垫片（由 mihomo-box-openwrt-install.sh 生成）" \
-    "# 精简 busybox 无 $2 小程序时的等价实现；系统自带 $2 时本文件不会生成。"
-}
-
-install_httpd_shim() {
-  if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx httpd; then
-    info "系统 busybox 自带 httpd 小程序，面板服务直接使用（无需适配）"
-    return 0
-  fi
-  _hs_target="$HTTPD_SHIM"
-  _hs_cur=$(command -v httpd 2>/dev/null)
-  if [ -n "$_hs_cur" ]; then
-    if grep -q "$SHIM_MARKER-httpd" "$_hs_cur" 2>/dev/null; then
-      _hs_target="$_hs_cur"   # 已是本适配器，原地更新
-    else
-      info "系统已有 httpd（$_hs_cur），面板服务直接使用（不覆盖）"
-      return 0
-    fi
-  fi
-  if ! command -v uhttpd >/dev/null 2>&1; then
-    warn "系统既无 busybox httpd 也未找到 uhttpd —— 面板服务将无法启动"
-    warn "请先安装 uhttpd（opkg install uhttpd / apk add uhttpd），再重跑本脚本"
-    return 0
-  fi
-  case "$_hs_target" in
-    */*) mkdir -p "${_hs_target%/*}" 2>/dev/null ;;
-  esac
-  {
-    write_shim_head "$_hs_target" httpd
-    printf '%s\n' \
-      "# mihomo.sh 以 busybox httpd 语法启动面板：httpd -f -p bind:port -h 站点根 -c conf" \
-      "# uhttpd 与之同构（-f/-p/-h/-c 同义，conf 里 \`*.sh:解释器\` 行同语法），直接透传。" \
-      "exec uhttpd \"\$@\""
-  } > "$_hs_target"
-  chmod 755 "$_hs_target" 2>/dev/null || { warn "无法写入 $_hs_target"; return 1; }
-  ok "已安装面板 httpd 适配器: $_hs_target（uhttpd 后端，busybox httpd 兼容语法）"
-  return 0
-}
-
-ensure_nohup() {
-  if command -v nohup >/dev/null 2>&1 && ! grep -q "$SHIM_MARKER-nohup" "$(command -v nohup)" 2>/dev/null; then
-    info "系统已有 nohup，无需适配"
-    return 0
-  fi
-  _nh_target="$COMPAT_DIR/nohup"
-  _nh_cur=$(command -v nohup 2>/dev/null)
-  [ -n "$_nh_cur" ] && grep -q "$SHIM_MARKER-nohup" "$_nh_cur" 2>/dev/null && _nh_target="$_nh_cur"
-  mkdir -p "${_nh_target%/*}" 2>/dev/null
-  {
-    write_shim_head "$_nh_target" nohup
-    printf '%s\n' \
-      "# POSIX nohup 最小语义：忽略 SIGHUP（忽略态经 exec 被目标进程继承），其余还原命令。" \
-      "# mihomo.sh 7 处 `nohup cmd >> log 2>&1 &` 的输出重定向由调用方自行处理。" \
-      "trap '' HUP" \
-      "exec \"\$@\""
-  } > "$_nh_target"
-  chmod 755 "$_nh_target" 2>/dev/null || { warn "无法写入 $_nh_target"; return 1; }
-  ok "已安装 nohup 适配器: $_nh_target（SIGHUP 免疫，等价 busybox nohup）"
-  return 0
-}
-
-ensure_base64() {
-  if command -v base64 >/dev/null 2>&1; then
-    if grep -q "$SHIM_MARKER-base64" "$(command -v base64)" 2>/dev/null; then
-      : # 已是自家垫片，走下方原地更新
-    else
-      info "系统已有 base64，无需适配"
-      return 0
-    fi
-  fi
-  _b6_target="$COMPAT_DIR/base64"
-  _b6_cur=$(command -v base64 2>/dev/null)
-  [ -n "$_b6_cur" ] && grep -q "$SHIM_MARKER-base64" "$_b6_cur" 2>/dev/null && _b6_target="$_b6_cur"
-  mkdir -p "${_b6_target%/*}" 2>/dev/null
-  {
-    write_shim_head "$_b6_target" base64
-    cat <<'SHIMEOF'
-mode=enc
-case "$1" in
-  -d|-D|--decode|--decrypt) mode=dec ;;
-esac
-if [ "$mode" = dec ]; then
-  LC_ALL=C awk '
-    BEGIN {
-      B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-      for (i = 0; i < 64; i++) dec[substr(B, i + 1, 1)] = i
-    }
-    { gsub(/[ \t\r\n]/, ""); buf = buf $0
-      while (length(buf) >= 4) {
-        a = dec[substr(buf, 1, 1)] + 0; b = dec[substr(buf, 2, 1)] + 0
-        c1 = substr(buf, 3, 1); d1 = substr(buf, 4, 1); buf = substr(buf, 5)
-        c = (c1 == "=") ? 0 : dec[c1] + 0
-        d = (d1 == "=") ? 0 : dec[d1] + 0
-        printf "%c", a * 4 + int(b / 16)
-        if (c1 != "=") printf "%c", (b % 16) * 16 + int(c / 4)
-        if (d1 != "=") printf "%c", (c % 4) * 64 + d
-      }
-    }'
-  exit $?
-fi
-_t="/tmp/.mihomo-b64.$$"
-tr -d '\000' > "$_t" 2>/dev/null
-_n=$(wc -l < "$_t" | tr -d " ")
-LC_ALL=C awk -v NLEN="$_n" '
-  BEGIN {
-    B = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i
-    acc = 0; cnt = 0; out = ""
-  }
-  {
-    s = $0
-    if (NR <= NLEN) s = s sprintf("%c", 10)
-    for (i = 1; i <= length(s); i++) {
-      acc = acc * 256 + ord[substr(s, i, 1)]; cnt++
-      if (cnt == 3) {
-        out = out substr(B, int(acc / 262144) + 1, 1) substr(B, int(acc / 4096) % 64 + 1, 1) \
-                   substr(B, int(acc / 64) % 64 + 1, 1) substr(B, acc % 64 + 1, 1)
-        acc = 0; cnt = 0
-        if (length(out) >= 76) { printf "%s\n", out; out = "" }
-      }
-    }
-  }
-  END {
-    if (cnt == 1) out = out substr(B, int(acc / 4) + 1, 1) substr(B, acc % 4 * 16 + 1, 1) "=="
-    else if (cnt == 2) out = out substr(B, int(acc / 1024) + 1, 1) substr(B, int(acc / 16) % 64 + 1, 1) \
-                           substr(B, acc % 16 * 4 + 1, 1) "="
-    if (out != "") printf "%s\n", out
-  }' < "$_t"
-_rc=$?
-rm -f "$_t"
-exit $_rc
-SHIMEOF
-  } > "$_b6_target"
-  chmod 755 "$_b6_target" 2>/dev/null || { warn "无法写入 $_b6_target"; return 1; }
-  ok "已安装 base64 适配器: $_b6_target（awk 实现，编解码与 GNU base64 互通）"
-  return 0
-}
-
-ensure_od() {
-  if command -v od >/dev/null 2>&1 && ! grep -q "$SHIM_MARKER-od" "$(command -v od)" 2>/dev/null; then
-    info "系统已有 od，无需适配"
-    return 0
-  fi
-  _od_target="$COMPAT_DIR/od"
-  _od_cur=$(command -v od 2>/dev/null)
-  [ -n "$_od_cur" ] && grep -q "$SHIM_MARKER-od" "$_od_cur" 2>/dev/null && _od_target="$_od_cur"
-  mkdir -p "${_od_target%/*}" 2>/dev/null
-  {
-    write_shim_head "$_od_target" od
-    cat <<'SHIMEOF'
-type=x1; skip=0; cnt=0; file=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -An) ;;
-    -A) shift ;;
-    -v) ;;
-    -tx1) type=x1 ;;
-    -tu2) type=u2 ;;
-    -tu4) type=u4 ;;
-    -t) shift
-        case "$1" in x1) type=x1;; u2) type=u2;; u4) type=u4;; esac ;;
-    -j*) skip="${1#-j}"; [ -n "$skip" ] || { shift; skip="$1"; } ;;
-    -N*) cnt="${1#-N}"; [ -n "$cnt" ] || { shift; cnt="$1"; } ;;
-    -*) ;;
-    -) file="" ;;
-    *) file="$1" ;;
-  esac
-  shift
-done
-case "$skip" in ''|*[!0-9]*) skip=0 ;; esac
-case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
-hex_stream() {
-  _hs_hx=""
-  if command -v hexdump >/dev/null 2>&1; then _hs_hx="hexdump"
-  else
-    for _hs_b in "$(command -v busybox 2>/dev/null)" busybox; do
-      [ -n "$_hs_b" ] && [ -x "$_hs_b" ] && "$_hs_b" --list 2>/dev/null | grep -qx hexdump && { _hs_hx="$_hs_b hexdump"; break; }
-    done
-  fi
-  if [ -n "$_hs_hx" ]; then
-    set -- $_hs_hx
-    if [ "$cnt" -gt 0 ] 2>/dev/null; then
-      [ -n "$file" ] && "$@" -v -s "$skip" -n "$cnt" -e '1/1 "%02x "' "$file" \
-                     || "$@" -v -s "$skip" -n "$cnt" -e '1/1 "%02x "' -
-    else
-      [ -n "$file" ] && "$@" -v -s "$skip" -e '1/1 "%02x "' "$file" \
-                     || "$@" -v -s "$skip" -e '1/1 "%02x "' -
-    fi
-    return 0
-  fi
-  [ "$cnt" -gt 8192 ] 2>/dev/null && { echo "od 垫片: 无 hexdump 且请求超过 8192 字节" >&2; return 1; }
-  _hs_i=0
-  while [ "$cnt" -eq 0 ] || [ "$_hs_i" -lt "$cnt" ]; do
-    if [ -n "$file" ]; then
-      _hs_c=$(dd if="$file" bs=1 skip=$((skip + _hs_i)) count=1 2>/dev/null)
-    else
-      _hs_c=$(dd bs=1 count=1 2>/dev/null)
-    fi
-    [ -z "$_hs_c" ] && [ "$cnt" -eq 0 ] && break
-    if [ -z "$_hs_c" ]; then printf '00 '
-    else printf '%02x ' "$(printf '%d' "'$_hs_c")"; fi
-    _hs_i=$((_hs_i + 1))
-    [ "$cnt" -eq 0 ] && [ "$_hs_i" -ge 8192 ] && break
-  done
-  return 0
-}
-hex_stream | awk -v t="$type" '
-  function h2d(s,  i,v,c) { v=0; s=tolower(s)
-    for (i=1; i<=length(s); i++) { c=substr(s,i,1); v=v*16+index("0123456789abcdef",c)-1 }
-    return v }
-  { for (i=1; i<=NF; i++) b[++n]=h2d($i) }
-  END {
-    if (n == 0) exit
-    if (t == "x1") { for (i=1; i<=n; i++) printf "%02x ", b[i]; print ""; exit }
-    step = (t == "u2") ? 2 : 4
-    for (i=1; i<=n; i+=step) {
-      v = 0
-      for (j=0; j<step; j++) v += (b[i+j]+0) * (256 ^ j)
-      printf "%.0f ", v
-    }
-    print ""
-  }'
-SHIMEOF
-  } > "$_od_target"
-  chmod 755 "$_od_target" 2>/dev/null || { warn "无法写入 $_od_target"; return 1; }
-  ok "已安装 od 适配器: $_od_target（hexdump 实现，内核下载 gzip/ELF 校验用）"
-  return 0
-}
-
-ensure_usleep() {
-  command -v usleep >/dev/null 2>&1 && return 0
-  _us_target="$COMPAT_DIR/usleep"
-  if [ -e "$_us_target" ] && ! grep -q "$SHIM_MARKER" "$_us_target" 2>/dev/null; then
-    warn "$_us_target 已存在且非本脚本生成，跳过 usleep 适配器"
-    return 1
-  fi
-  {
-    echo "#!/bin/sh"
-    echo "# $SHIM_MARKER-usleep: BusyBox-minimal usleep replacement (read -t fractional + empty FIFO)."
-    cat <<'SHIMEOF'
-us_n=${1:-0}
-case "$us_n" in ''|*[!0-9]*) exit 1 ;; esac
-us_t="$((us_n / 1000000)).$(printf '%06d' $((us_n % 1000000)))"
-sleep "$us_t" 2>/dev/null && exit 0
-us_f=/tmp/.mihomo-usleep.fifo
-[ -p "$us_f" ] || mkfifo "$us_f" 2>/dev/null
-[ -p "$us_f" ] && read -t "$us_t" us_x <> "$us_f" 2>/dev/null
-exit 0
-SHIMEOF
-  } > "$_us_target"
-  chmod 755 "$_us_target" 2>/dev/null || { warn "无法写入 $_us_target"; return 1; }
-  ok "已安装 usleep 适配器: $_us_target（微秒延时，消除面板探测循环百秒假死）"
-  return 0
-}
-
-ensure_sleep() {
-  if sleep 0.01 2>/dev/null; then return 0; fi   # 真 sleep 支持小数则无需垫片
-  _sl_real=""
-  for _sl_c in /bin/sleep /usr/bin/sleep; do
-    [ -x "$_sl_c" ] && { _sl_real=$_sl_c; break; }
-  done
-  [ -n "$_sl_real" ] || _sl_real="busybox sleep"
-  _sl_target="$COMPAT_DIR/sleep"
-  if [ -e "$_sl_target" ] && ! grep -q "$SHIM_MARKER" "$_sl_target" 2>/dev/null; then
-    warn "$_sl_target 已存在且非本脚本生成，跳过 sleep 适配器"
-    return 1
-  fi
-  {
-    echo "#!/bin/sh"
-    echo "# $SHIM_MARKER-sleep: fractional-capable sleep (integer passthrough; fraction via read -t + FIFO)."
-    cat <<SHIMEOF
-case "\$1" in
-  ''|*[!0-9]*)
-    case "\$1" in *.*) ;; *) exit 1 ;; esac
-    _fs=\${1%%.*}; [ -n "\$_fs" ] || _fs=0
-    _ff=\$(printf '%-6s' "\${1#*.}" | cut -c1-6 | tr ' ' '0')
-    _fp=/tmp/.mihomo-usleep.fifo
-    [ -p "\$_fp" ] || mkfifo "\$_fp" 2>/dev/null
-    [ -p "\$_fp" ] && read -t "\$_fs.\$_ff" _x <> "\$_fp" 2>/dev/null
-    exit 0 ;;
-esac
-exec $_sl_real "\$@"
-SHIMEOF
-  } > "$_sl_target"
-  chmod 755 "$_sl_target" 2>/dev/null || { warn "无法写入 $_sl_target"; return 1; }
-  ok "已安装 sleep 适配器: $_sl_target（小数秒支持，修复轮询报错与限时校验）"
-  return 0
-}
-
+# ---------- 旧版残留垫片清理（精简 busybox 的兼容已移至模块层，安装器不再生成垫片） ----------
 drop_dlrewrite() {
   for _dr_p in "$COMPAT_DIR/curl" "$COMPAT_DIR/wget"; do
     [ -f "$_dr_p" ] || continue
@@ -804,14 +507,9 @@ drop_dlrewrite() {
   return 0
 }
 
-install_compat_shims() {
-  step "系统兼容垫片（busybox 精简缺失项）"
-  install_httpd_shim
-  ensure_nohup
-  ensure_base64
-  ensure_od
-  ensure_usleep
-  ensure_sleep
+clean_legacy_shims() {
+  step "清理旧版残留垫片"
+  remove_compat_shims
   drop_dlrewrite
   return 0
 }
