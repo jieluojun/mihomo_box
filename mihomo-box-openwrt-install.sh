@@ -547,19 +547,32 @@ parse_asset_name() {
 
 # ---------- 安装目录同步：清残、路径适配、缓存打点 ----------
 stale_clean() {
-  _sc_list="$STAGE/manifest.txt"
-  ( cd "$PKG_ROOT" && find . -type f | sed 's|^\./||' ) > "$_sc_list"
+  # 只删除「上一版包清单里有、本版包里已没有」的文件。
+  # 旧逻辑是「安装目录里凡不在包内的文件全删」，会误删内核运行时生成的文件
+  # （外部面板 ui/、cache.db、geoip.metadb、geoip.dat、geosite.dat 等）。
+  # 清单存 run/pkg.manifest；首次升级没有旧清单时不删任何文件（宁可留残留，不误删）。
+  _sc_new="$STAGE/manifest.txt"
+  _sc_old="$INSTALL_DIR/run/pkg.manifest"
+  ( cd "$PKG_ROOT" && find . -type f | sed 's|^\./||' ) > "$_sc_new"
   _sc_n=0
-  for _sc_f in $(find "$INSTALL_DIR" -type f 2>/dev/null); do
-    _sc_r=${_sc_f#$INSTALL_DIR/}
-    case "$_sc_r" in
-      disable|remove|update|skip_test|uninstall-openwrt.sh|config.yaml|module-settings.conf|core/*|run/*|proxies/*|rules/*|backup/*)
-        continue ;;
-    esac
-    grep -qxF "$_sc_r" "$_sc_list" 2>/dev/null || { rm -f "$_sc_f"; _sc_n=$((_sc_n + 1)); }
-  done
-  find "$INSTALL_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null
-  [ "$_sc_n" -gt 0 ] && ok "已删除包外旧文件 $_sc_n 个（含子目录残留）"
+  if [ -s "$_sc_old" ]; then
+    while IFS= read -r _sc_r; do
+      [ -n "$_sc_r" ] || continue
+      case "$_sc_r" in
+        disable|remove|update|skip_test|uninstall-openwrt.sh|config.yaml|module-settings.conf|core/*|run/*|proxies/*|rules/*|backup/*|ui/*) continue ;;
+      esac
+      grep -qxF "$_sc_r" "$_sc_new" 2>/dev/null && continue
+      if [ -f "$INSTALL_DIR/$_sc_r" ]; then
+        rm -f "$INSTALL_DIR/$_sc_r" && _sc_n=$((_sc_n + 1))
+      fi
+    done < "$_sc_old"
+    find "$INSTALL_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null
+    [ "$_sc_n" -gt 0 ] && ok "已删除上一版包内的旧文件 $_sc_n 个"
+  else
+    info "首次记录安装包清单，本次不做清残（用户/内核文件均保留）"
+  fi
+  mkdir -p "$INSTALL_DIR/run" 2>/dev/null
+  cp -f "$_sc_new" "$_sc_old" 2>/dev/null
   return 0
 }
 
