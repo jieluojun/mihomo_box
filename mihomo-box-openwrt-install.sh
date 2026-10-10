@@ -570,6 +570,9 @@ patch_paths() {
     case "$_pp_f" in
       *.dex|*.png|*.jpg|*.jpeg|*.gif|*.webp|*.woff2|*.sha256) continue ;;
       */core/*|*/run/*|*/backup/*) continue ;;
+      # 面板脚本与执行桥自己按安装位置推断路径（见两者头部），不改写：
+      # 安装后与发布包内文件逐字节一致，手动覆盖也能直接用
+      */scripts/mihomo.sh|*/webroot/ui/cgi-bin/exec.sh) continue ;;
     esac
     _pp_sz=$(wc -c < "$_pp_f" 2>/dev/null | tr -d ' ')
     case "$_pp_sz" in ''|*[!0-9]*) continue ;; esac
@@ -586,6 +589,7 @@ patch_paths() {
     sed -i 's/for KernelSU Next/for OpenWrt/; s/for KernelSU/for OpenWrt/; s/for APatch/for OpenWrt/; s/for Magisk/for OpenWrt/' \
       "$INSTALL_DIR/module.prop" 2>/dev/null
   for _pp_s in $(find "$INSTALL_DIR" -type f -name '*.sh' 2>/dev/null); do
+    case "$_pp_s" in */scripts/mihomo.sh|*/webroot/ui/cgi-bin/exec.sh) continue ;; esac
     sed -i '1s|^#!/system/bin/sh|#!/bin/sh|' "$_pp_s" 2>/dev/null
   done
   ok "已改写 $_pp_n 个文件中的安装路径"
