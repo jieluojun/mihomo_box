@@ -422,17 +422,20 @@ pkg_install_one() {
 
 dep_tproxy_cap_ok() {
   _DP_MISS=""
+  _DP_OPT=""
   command -v iptables >/dev/null 2>&1 || { _DP_MISS="iptables 命令"; return 1; }
   command -v ip >/dev/null 2>&1 || { _DP_MISS="ip 命令"; return 1; }
   iptables -w -t mangle -N mihomo_dep_probe 2>/dev/null || { _DP_MISS="mangle 表建链（iptables 与内核兼容层）"; return 1; }
   _dp_ok=1
   _DP_MISS=""
+  _DP_OPT=""
   iptables -w -t mangle -A mihomo_dep_probe -p tcp -j TPROXY --on-ip 127.0.0.1 \
     --on-port 1 --tproxy-mark 1 2>/dev/null || { _dp_ok=0; _DP_MISS="$_DP_MISS TPROXY目标"; }
-  iptables -w -t mangle -A mihomo_dep_probe -p tcp \
-    -m socket --transparent -j RETURN 2>/dev/null || { _dp_ok=0; _DP_MISS="$_DP_MISS socket匹配"; }
   iptables -w -t mangle -A mihomo_dep_probe -m owner \
     --uid-owner 0 -j RETURN 2>/dev/null || { _dp_ok=0; _DP_MISS="$_DP_MISS owner匹配"; }
+  # socket 匹配只是已建连接的快速通道（运行时可缺省），缺它不影响 TPROXY 工作
+  iptables -w -t mangle -A mihomo_dep_probe -p tcp \
+    -m socket --transparent -j RETURN 2>/dev/null || _DP_OPT="socket匹配"
   iptables -w -t mangle -F mihomo_dep_probe 2>/dev/null
   iptables -w -t mangle -X mihomo_dep_probe 2>/dev/null
   [ "$_dp_ok" = "1" ]
@@ -468,7 +471,7 @@ ensure_system_deps() {
     pkg_install_one ip-full
   fi
 
-  if dep_tproxy_cap_ok; then
+  if dep_tproxy_cap_ok && [ -z "$_DP_OPT" ]; then
     ok "Tproxy 能力已就绪（TPROXY / socket / owner），跳过"
     return 0
   fi
@@ -481,16 +484,21 @@ ensure_system_deps() {
     if [ "$FIREWALL" = "nftables" ]; then _dp_list="$_dp_list ip6tables-nft"
     else _dp_list="$_dp_list ip6tables"; fi
   fi
-  [ "$FIREWALL" = "nftables" ] && _dp_list="$_dp_list kmod-nft-tproxy"
-  _dp_list="$_dp_list iptables-mod-tproxy kmod-ipt-tproxy iptables-mod-extra"
+  if [ "$FIREWALL" = "nftables" ]; then _dp_list="$_dp_list kmod-nft-tproxy kmod-nft-socket"; fi
+  _dp_list="$_dp_list iptables-mod-tproxy kmod-ipt-tproxy iptables-mod-extra iptables-mod-socket"
   for _dp_p in $_dp_list; do
     pkg_install_one "$_dp_p"
   done
   if dep_tproxy_cap_ok; then
-    ok "Tproxy 能力就绪（TPROXY / socket / owner）"
+    if [ -n "$_DP_OPT" ]; then
+      warn "Tproxy 就绪，但缺 ${_DP_OPT}（已建连接快速通道不可用，不影响透明代理）"
+      warn "排查：$PKG_MGR install iptables-mod-socket；确认内核含 xt_socket"
+    else
+      ok "Tproxy 能力就绪（TPROXY / socket / owner）"
+    fi
   else
     warn "Tproxy 能力探测未通过（缺：${_DP_MISS:-未知}）——透明代理暂不可用，面板可正常安装"
-    warn "排查：$PKG_MGR install iptables-mod-tproxy iptables-mod-extra；确认内核含 xt_TPROXY / xt_socket / xt_owner"
+    warn "排查：$PKG_MGR install iptables-mod-tproxy iptables-mod-extra iptables-mod-socket；确认内核含 xt_TPROXY / xt_owner / xt_socket"
   fi
   return 0
 }
