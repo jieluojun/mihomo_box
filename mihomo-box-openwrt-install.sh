@@ -458,6 +458,16 @@ cleanup_pkg_root() {
   rm -rf "$PKG_ROOT/tests" "$PKG_ROOT/.github" "$PKG_ROOT/node_modules" \
          "$PKG_ROOT/.gitignore" "$PKG_ROOT/.gitattributes" 2>/dev/null
   rm -f "$PKG_ROOT/update.json" "$PKG_ROOT/CHANGELOG.md" "$PKG_ROOT/UPDATE.md" 2>/dev/null
+  # Android 专属文件（OpenWrt 上用不到）：刷机安装器、KSU/Magisk 生命周期脚本、
+  # Android dex 组件（应用信息）、面板 Java 工具源码。
+  # 安装器已用自己的实现替代 customize.sh / service.sh 的逻辑，这些文件不再复制到安装目录；
+  # 升级时 stale_clean 会按本清单删除旧版本残留的同名文件。
+  rm -rf "$PKG_ROOT/META-INF" "$PKG_ROOT/webroot/tools" 2>/dev/null
+  rm -f "$PKG_ROOT/customize.sh" "$PKG_ROOT/post-fs-data.sh" "$PKG_ROOT/service.sh" \
+        "$PKG_ROOT/action.sh" "$PKG_ROOT/uninstall.sh" \
+        "$PKG_ROOT/scripts/app-info.dex" 2>/dev/null
+  # 开发 / 打包工具：路由器上不需要
+  rm -f "$PKG_ROOT/build.sh" "$PKG_ROOT/scripts/publish-release.sh" 2>/dev/null
   find "$PKG_ROOT" -name '*.zip' -type f -delete 2>/dev/null
   find "$PKG_ROOT" -type d \( -name '__pycache__' -o -name node_modules \) -exec rm -rf {} + 2>/dev/null
   return 0
@@ -607,8 +617,6 @@ EOF
 
   chmod 755 "$INSTALL_DIR/scripts/mihomo.sh" 2>/dev/null
   chmod 755 "$INSTALL_DIR/webroot/ui/cgi-bin/exec.sh" 2>/dev/null
-  chmod 755 "$INSTALL_DIR/service.sh" "$INSTALL_DIR/post-fs-data.sh" \
-            "$INSTALL_DIR/action.sh" "$INSTALL_DIR/uninstall.sh" 2>/dev/null
   chmod 644 "$INSTALL_DIR/config.yaml" "$INSTALL_DIR/module-settings.conf" \
             "$INSTALL_DIR/proxies/钉钉直连.yaml" "$INSTALL_DIR/proxies/非免节点.txt" 2>/dev/null
 
