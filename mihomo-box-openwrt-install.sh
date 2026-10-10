@@ -19,7 +19,12 @@
 #   · 下载走「mihomo box 面板内核管理页」同款加速镜像，直连 GitHub 殿后兜底：
 #       v6.gh-proxy.org → ghfast.top → gh-proxy.com → ghproxy.net → moeyy → 直连
 #   · 不下载 mihomo 内核 —— 内核交给面板「内核管理」页下载（与 Android 版相同，
-#     模块包内本来就不含内核）
+#     模块包内本来就不含内核）。内核资产按 uname -m 自动匹配架构（与上游 liuran001/mihomo
+#     矩阵一致：linux-arm64 / linux-amd64-v1..v3（按 CPU 标志选）/ linux-armv5..7 /
+#     linux-mipsle-softfloat / linux-loong64-abi1 …）；首次默认内核：
+#     aarch64 → jieluojun，其余架构 → official（jieluojun 分支待其发布页补齐全部架构后可统一为默认）
+#   · 默认镜像为「自动优选」（与面板内核页同序：v6.gh-proxy → ghfast → gh-proxy.com →
+#     ghproxy.net → moeyy → 直连兜底）
 #   · 默认配置 config.yaml / 钉钉直连 / 非免节点 / module-settings.conf /
 #     面板缓存打点等安装步骤与 Android 版 customize.sh 完全一致
 #   · 开机自启由 /etc/init.d/mihomo_box 承担（对应 Android 版 service.sh 流程）
@@ -78,6 +83,18 @@ is_github_url() {
 }
 
 # ---------- HTTP 客户端（curl / wget / busybox wget 依次找一个能跑的） ----------
+# ---------- 系统架构（OpenWrt 上 uname -m；与模块内 core_arch_token 的映射保持一致） ----------
+ARCH_RAW=""
+arch_label() { ARCH_RAW=$(uname -m 2>/dev/null); printf '%s' "${ARCH_RAW:-unknown}"; }
+
+# 首次安装默认内核：jieluojun/mihomo 发布页目前仅 linux-arm64 / android-arm64-v8 / android-armv7，其余架构默认 official（MetaCubeX 全架构）
+default_core_for_arch() {
+  case "$(uname -m 2>/dev/null)" in
+    aarch64|arm64) echo jieluojun ;;
+    *)             echo official ;;
+  esac
+}
+
 HTTP_CLIENT=""
 pick_http() {
   if command -v curl >/dev/null 2>&1; then HTTP_CLIENT=curl; return 0; fi
@@ -570,10 +587,12 @@ setup_workdir() {
   fi
 
   if [ ! -f "$INSTALL_DIR/module-settings.conf" ]; then
-    cat > "$INSTALL_DIR/module-settings.conf" <<'EOF'
-core=jieluojun
+    # 首次默认：内核按架构选（jieluojun 发布页尚未补齐时，非 arm64 用 official）；
+    # 镜像默认「自动优选」，与安装包下载链路一致（国内直连 GitHub 通常很慢）
+    cat > "$INSTALL_DIR/module-settings.conf" <<EOF
+core=$(default_core_for_arch)
 autostart=true
-mirror=direct
+mirror=auto
 webui=true
 EOF
     ok "已写入默认模块设置（远程访问默认开启：监听 0.0.0.0）"
@@ -1192,39 +1211,15 @@ SHIMEOF
   return 0
 }
 
-ensure_dlrewrite() {
-  # 下载 URL 改写垫片（curl/wget）：mihomo.sh 的内核下载硬编码 Android 资产名
-  # （android-arm64-v8 / android-amd64）。Android 构建动态链接 /system/bin/linker64，
-  # OpenWrt 上一跑就是 "line N: core: not found"。发布页里 linux 构建与 Android 构建
-  # 同 tag 同后缀，把 URL 里的资产名改写为 linux-* 即可拿到能跑的内核；
-  # 其余 URL 原样透传。只此一处桥接，模块源码保持与 Android 一致。
-  for _dw_cmd in curl wget; do
-    _dw_real=$(command -v "$_dw_cmd" 2>/dev/null) || continue
-    case "$_dw_real" in "$COMPAT_DIR"/*) continue ;; esac
-    _dw_target="$COMPAT_DIR/$_dw_cmd"
-    if [ -e "$_dw_target" ] && ! grep -q "$SHIM_MARKER" "$_dw_target" 2>/dev/null; then
-      warn "$_dw_target 已存在且非本脚本生成，跳过 $_dw_cmd 下载改写垫片"
-      continue
+# 旧版安装器生成的下载改写垫片（curl/wget 包装，把 mihomo-android-* 资产名改成 linux-*）：
+# 模块现已按 uname -m 原生选择 linux 资产，垫片已多余，且会套在系统 curl 外面，这里清掉。
+# 只删带本脚本标记的文件，不碰系统原有的 curl / wget。
+drop_dlrewrite() {
+  for _dr_p in "$COMPAT_DIR/curl" "$COMPAT_DIR/wget"; do
+    [ -f "$_dr_p" ] || continue
+    if grep -q "$SHIM_MARKER-dlrewrite" "$_dr_p" 2>/dev/null; then
+      rm -f "$_dr_p" && info "已移除旧版下载改写垫片: $_dr_p"
     fi
-    {
-      echo "#!/bin/sh"
-      echo "# $SHIM_MARKER-dlrewrite: rewrite mihomo-android-* kernel assets to linux builds."
-      cat <<SHIMEOF
-_dw_r=0; _dw_n=\$#
-while [ \$_dw_r -lt \$_dw_n ]; do
-  _dw_a=\$1; shift
-  case "\$_dw_a" in
-    *mihomo-android-arm64-v8*) _dw_a=\$(printf '%s' "\$_dw_a" | sed 's/mihomo-android-arm64-v8/mihomo-linux-arm64/g') ;;
-    *mihomo-android-amd64*)   _dw_a=\$(printf '%s' "\$_dw_a" | sed 's/mihomo-android-amd64/mihomo-linux-amd64/g') ;;
-  esac
-  set -- "\$@" "\$_dw_a"
-  _dw_r=\$((_dw_r + 1))
-done
-exec $_dw_real "\$@"
-SHIMEOF
-    } > "$_dw_target"
-    chmod 755 "$_dw_target" 2>/dev/null || { warn "无法写入 $_dw_target"; continue; }
-    ok "已安装 $_dw_cmd 下载改写垫片: $_dw_target（Android 资产 → linux 构建）"
   done
   return 0
 }
@@ -1237,7 +1232,7 @@ install_compat_shims() {
   ensure_od
   ensure_usleep
   ensure_sleep
-  ensure_dlrewrite
+  drop_dlrewrite
   return 0
 }
 
@@ -1369,9 +1364,15 @@ do_install() {
     say "  ✅ Mihomo Box 首次安装完成（无需重启）"
   fi
   say "  版本: ${VER:-未知}    目录: $INSTALL_DIR"
+  _dc=$(default_core_for_arch)
   say "  ⚠ 安装脚本未下载 mihomo 内核（与 Android 版一致）"
+  say "  ⚠ 系统架构: $(arch_label)（内核按此架构匹配）"
   say "  ⚠ 请打开面板 WebUI 完成后续："
-  say "  ·「内核管理」→ 下载内核（默认 jieluojun 分支）"
+  if [ "$_dc" = "jieluojun" ]; then
+    say "  ·「内核管理」→ 下载内核（默认 jieluojun 分支）"
+  else
+    say "  ·「内核管理」→ 下载内核（已默认 official 内核；jieluojun 发布页目前仅 arm 系列构建）"
+  fi
   say "  ·「主页」→ 开启总开关启动内核"
   say "  ·「工具」→ 面板服务：电脑 / 手机远程管理"
   say "  ·「内核管理」→ 下载加速镜像：国内建议选「自动优选」"
@@ -1393,14 +1394,6 @@ do_uninstall() {
   say "─────────────────────────────"
   say "  Mihomo Box · OpenWrt 卸载"
   say "─────────────────────────────"
-  if [ "$ASSUME_YES" != 1 ]; then
-    printf "🛑 确认卸载全部数据？[y/N] "
-    read -r _uninstall_ans || _uninstall_ans=""
-    case "$_uninstall_ans" in
-      y|Y|yes|YES) : ;;
-      *) say "已取消卸载"; return 0 ;;
-    esac
-  fi
   [ -x "$INITD" ] && { "$INITD" stop </dev/null >/dev/null 2>&1; "$INITD" disable </dev/null >/dev/null 2>&1; }
   if [ -f "$INSTALL_DIR/scripts/mihomo.sh" ]; then
     step "停止服务（内核 / 开关监听 / 面板）"
