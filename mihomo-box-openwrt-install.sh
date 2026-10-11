@@ -324,9 +324,9 @@ do_install() {
   say "─────────────────────────────"
   if [ "$FIRST" = 0 ]; then say "  ✅ Mihomo Box 热更新完成"; else say "  ✅ Mihomo Box 首次安装完成"; fi
   say "  版本: ${VER:-未知}    目录: $INSTALL_DIR"
-  say "  内核未随安装包下载（与 Android 版一致），请在面板「内核管理」页下载"
-  say "  系统架构 $(uname -m 2>/dev/null)，默认内核 $(default_core_for_arch)（jieluojun 发布页目前仅 arm 系列构建）"
-  say "  面板后续：「主页」开启总开关；「内核管理」下载加速镜像建议选「自动优选」"
+  say "  内核未下载，请在面板 「内核」页下载"
+  say "  系统架构 $(uname -m 2>/dev/null)，默认内核 $(default_core_for_arch)"
+  say "  面板后续：「主页」开启总开关；「内核」下载加速镜像建议选「自动优选」"
   if [ "$NO_START" != 1 ]; then
     _wi=$(sh "$MODSH" webui-info </dev/null 2>/dev/null)
     [ -n "$_wi" ] && printf '%s\n' "$_wi" | while IFS= read -r _l; do say "  $_l"; done
