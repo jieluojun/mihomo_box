@@ -14,7 +14,7 @@
 #   · 首次安装写默认配置 config.yaml 与模块设置；升级覆盖模块文件，用户配置保留
 #   · 不生成系统垫片：精简 busybox 的兼容（nohup / base64 / od / 小数 sleep / uhttpd）由模块层完成
 #   · 清理旧版安装器留下的垫片（只删带本脚本标记的文件）
-#   · 依赖按需安装：TUN（kmod-tun）与 Tproxy（iptables / nftables 套件），已具备则跳过
+#   · 依赖按防火墙后端安装；fw3/iptables 另需 nftables-json 供 Mihomo TUN 残留检查/清理
 # ============================================================
 
 # ---------- 可覆盖常量（测试 / 定制用） ----------
@@ -569,6 +569,22 @@ ensure_system_deps() {
   detect_firewall
   step "系统依赖检查（TUN / Tproxy · 包管理器 $PKG_MGR · 防火墙 $FIREWALL）"
 
+  # Mihomo TUN auto-redirect 使用独立的 nft inet mihomo 表。fw3/iptables 下
+  # 也需要 nft 命令检查/清理这张残留表；这里只安装 nftables-json 用户态工具，
+  # 不安装 nft TPROXY 内核模块，也不改变 Tproxy 的 iptables 后端。
+  if [ "$FIREWALL" = "iptables" ]; then
+    if command -v nft >/dev/null 2>&1; then
+      ok "nft 命令已存在（供 Mihomo TUN 残留检查/清理使用）"
+    else
+      info "iptables/fw3 后端额外安装 nftables-json（仅作 Mihomo TUN 残留检查/清理工具）"
+      if pkg_install_one nftables-json; then
+        command -v nft >/dev/null 2>&1 || warn "安装后仍未找到 nft；Mihomo TUN 残留检查/清理不可用"
+      else
+        warn "nftables-json 安装失败；Mihomo TUN 残留检查/清理不可用"
+      fi
+    fi
+  fi
+
   if [ -c /dev/net/tun ]; then
     ok "TUN: /dev/net/tun 已存在，跳过"
   else
@@ -599,7 +615,7 @@ ensure_system_deps() {
     fi
     return 0
   fi
-  # 只装当前防火墙后端的那一套：nftables 与 iptables 两套依赖互不混装。
+  # 只装当前防火墙后端的 Tproxy 能力依赖；iptables 路径的 nftables-json 仅用于上面的残留清理。
   _dp_list=""
   if [ "$FIREWALL" = "nftables" ]; then
     command -v nft >/dev/null 2>&1 || _dp_list="$_dp_list nftables-json"
