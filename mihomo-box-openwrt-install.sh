@@ -378,11 +378,57 @@ detect_pkg_mgr() {
 }
 
 detect_firewall() {
-  if command -v fw4 >/dev/null 2>&1 || [ -x /sbin/fw4 ]; then FIREWALL=nftables
-  elif command -v fw3 >/dev/null 2>&1 || [ -x /sbin/fw3 ]; then FIREWALL=iptables
-  elif command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then FIREWALL=nftables
-  elif command -v iptables >/dev/null 2>&1 && ! command -v nft >/dev/null 2>&1; then FIREWALL=iptables
-  else FIREWALL=nftables   # 22.03+ 默认 fw4，取保守值
+  # 判定顺序（从可信到兜底）：fw4/fw3 兼容二进制经常同时存在，不能只看 PATH。
+  # 1) 已生效的 fw4 表：防火墙已经按 nftables 在跑，这是最硬的证据。
+  if command -v nft >/dev/null 2>&1 && nft list table inet fw4 >/dev/null 2>&1; then
+    FIREWALL=nftables
+    return 0
+  fi
+  # 2) 防火墙 init 脚本实际调用的后端（/etc/init.d/firewall 里写的是 fw4 还是 fw3）。
+  if [ -r /etc/init.d/firewall ]; then
+    if grep -Eq '(^|[^A-Za-z0-9_])fw4([^A-Za-z0-9_]|$)' /etc/init.d/firewall 2>/dev/null; then
+      FIREWALL=nftables
+      return 0
+    fi
+    if grep -Eq '(^|[^A-Za-z0-9_])fw3([^A-Za-z0-9_]|$)' /etc/init.d/firewall 2>/dev/null; then
+      FIREWALL=iptables
+      return 0
+    fi
+  fi
+  # 3) 包数据库里装着的防火墙实现（firewall4=fw4；firewall=fw3）。
+  [ -n "$PKG_MGR" ] || detect_pkg_mgr >/dev/null 2>&1
+  if pkg_is_installed firewall4; then
+    FIREWALL=nftables
+    return 0
+  fi
+  if pkg_is_installed firewall; then
+    FIREWALL=iptables
+    return 0
+  fi
+  # 4) 只有一个后端二进制时按它走。
+  if { command -v fw4 >/dev/null 2>&1 || [ -x /sbin/fw4 ]; } && ! { command -v fw3 >/dev/null 2>&1 || [ -x /sbin/fw3 ]; }; then
+    FIREWALL=nftables
+    return 0
+  fi
+  if { command -v fw3 >/dev/null 2>&1 || [ -x /sbin/fw3 ]; } && ! { command -v fw4 >/dev/null 2>&1 || [ -x /sbin/fw4 ]; }; then
+    FIREWALL=iptables
+    return 0
+  fi
+  # 5) OpenWrt 世代兜底：22.03 起默认 fw4/nftables，更早是 fw3/iptables。
+  _df_rel=$(sed -n "s/^DISTRIB_RELEASE=['\"]\{0,1\}\([0-9][0-9]*\).*/\1/p" /etc/openwrt_release 2>/dev/null | head -1)
+  case "$_df_rel" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ "$_df_rel" -ge 22 ] 2>/dev/null; then FIREWALL=nftables; else FIREWALL=iptables; fi
+      return 0
+      ;;
+  esac
+  if command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then
+    FIREWALL=nftables
+  elif command -v iptables >/dev/null 2>&1 && ! command -v nft >/dev/null 2>&1; then
+    FIREWALL=iptables
+  else
+    FIREWALL=nftables   # 无法判定时的兜底：现行 OpenWrt 默认 fw4
   fi
 }
 
@@ -420,7 +466,7 @@ pkg_install_one() {
   return 1
 }
 
-dep_tproxy_cap_ok() {
+dep_tproxy_iptables_cap_ok() {
   _DP_MISS=""
   _DP_OPT=""
   command -v iptables >/dev/null 2>&1 || { _DP_MISS="iptables 命令"; return 1; }
@@ -439,6 +485,80 @@ dep_tproxy_cap_ok() {
   iptables -w -t mangle -F mihomo_dep_probe 2>/dev/null
   iptables -w -t mangle -X mihomo_dep_probe 2>/dev/null
   [ "$_dp_ok" = "1" ]
+}
+
+# nftables 能力探测：用 nft -c 校验表达式（只校验不下发、零流量影响），
+# 与模块运行时的 tproxy_probe_nft_caps 同口径。socket 快速通道仍是可选项。
+_dep_nft_check() {
+  cat > "$_dp_f" 2>/dev/null || return 1
+  nft -c -f "$_dp_f" >/dev/null 2>&1
+}
+
+dep_tproxy_nft_cap_ok() {
+  _DP_MISS=""
+  _DP_OPT=""
+  command -v nft >/dev/null 2>&1 || { _DP_MISS="nft 命令（nftables-json）"; return 1; }
+  command -v ip >/dev/null 2>&1 || { _DP_MISS="ip 命令（ip-full）"; return 1; }
+  _dp_f="${TMPDIR:-/tmp}/mihomo_dep_nft.$$"
+  _dp_ok=1
+  if ! _dep_nft_check <<'EOF'
+table inet mihomo_dep_probe {
+ chain prerouting {
+  type filter hook prerouting priority mangle; policy accept;
+  meta l4proto tcp tproxy ip to 127.0.0.1:1 meta mark set 0x01000000 accept
+ }
+}
+EOF
+  then
+    _dp_ok=0; _DP_MISS="$_DP_MISS nft-TPROXY"
+  fi
+  _dp_owner=0
+  if _dep_nft_check <<'EOF'
+table inet mihomo_dep_probe {
+ chain output {
+  type route hook output priority mangle; policy accept;
+  meta l4proto tcp meta skuid 0 meta skgid 3005 return
+ }
+}
+EOF
+  then
+    _dp_owner=1
+  elif _dep_nft_check <<'EOF'
+table inet mihomo_dep_probe {
+ chain output {
+  type route hook output priority mangle; policy accept;
+  meta l4proto tcp meta skuid 0 return
+ }
+}
+EOF
+  then
+    _dp_owner=1
+  fi
+  [ "$_dp_owner" = "1" ] || { _dp_ok=0; _DP_MISS="$_DP_MISS skuid/skgid旁路"; }
+  if ! _dep_nft_check <<'EOF'
+table inet mihomo_dep_probe {
+ chain prerouting {
+  type filter hook prerouting priority mangle; policy accept;
+  meta l4proto { tcp, udp } socket transparent 1 meta mark set 0x01000000 accept
+ }
+}
+EOF
+  then
+    _DP_OPT="socket快速通道"
+  fi
+  rm -f "$_dp_f" 2>/dev/null
+  [ "$_dp_ok" = "1" ]
+}
+
+# 按当前防火墙后端分发能力探测：nftables 系统只探 nft，iptables 系统只探 iptables，
+# 不再用 iptables 的结果去决定要不要给 nftables 系统装包。
+dep_tproxy_cap_ok() {
+  [ -n "$FIREWALL" ] || detect_firewall
+  if [ "$FIREWALL" = "nftables" ]; then
+    dep_tproxy_nft_cap_ok
+  else
+    dep_tproxy_iptables_cap_ok
+  fi
 }
 
 ensure_system_deps() {
@@ -472,33 +592,46 @@ ensure_system_deps() {
   fi
 
   if dep_tproxy_cap_ok && [ -z "$_DP_OPT" ]; then
-    ok "Tproxy 能力已就绪（TPROXY / socket / owner），跳过"
+    if [ "$FIREWALL" = "nftables" ]; then
+      ok "Tproxy 能力已就绪（nft TPROXY / socket / skuid·skgid），跳过"
+    else
+      ok "Tproxy 能力已就绪（TPROXY / socket / owner），跳过"
+    fi
     return 0
   fi
+  # 只装当前防火墙后端的那一套：nftables 与 iptables 两套依赖互不混装。
   _dp_list=""
-  if ! command -v iptables >/dev/null 2>&1; then
-    if [ "$FIREWALL" = "nftables" ]; then _dp_list="$_dp_list iptables-nft"
-    else _dp_list="$_dp_list iptables"; fi
+  if [ "$FIREWALL" = "nftables" ]; then
+    command -v nft >/dev/null 2>&1 || _dp_list="$_dp_list nftables-json"
+    _dp_list="$_dp_list kmod-nft-tproxy kmod-nft-socket"
+  else
+    command -v iptables >/dev/null 2>&1 || _dp_list="$_dp_list iptables"
+    command -v ip6tables >/dev/null 2>&1 || _dp_list="$_dp_list ip6tables"
+    _dp_list="$_dp_list iptables-mod-tproxy kmod-ipt-tproxy iptables-mod-extra iptables-mod-socket"
   fi
-  if ! command -v ip6tables >/dev/null 2>&1; then
-    if [ "$FIREWALL" = "nftables" ]; then _dp_list="$_dp_list ip6tables-nft"
-    else _dp_list="$_dp_list ip6tables"; fi
-  fi
-  if [ "$FIREWALL" = "nftables" ]; then _dp_list="$_dp_list kmod-nft-tproxy kmod-nft-socket"; fi
-  _dp_list="$_dp_list iptables-mod-tproxy kmod-ipt-tproxy iptables-mod-extra iptables-mod-socket"
   for _dp_p in $_dp_list; do
     pkg_install_one "$_dp_p"
   done
   if dep_tproxy_cap_ok; then
     if [ -n "$_DP_OPT" ]; then
       warn "Tproxy 就绪，但缺 ${_DP_OPT}（已建连接快速通道不可用，不影响透明代理）"
-      warn "排查：$PKG_MGR install iptables-mod-socket；确认内核含 xt_socket"
+      if [ "$FIREWALL" = "nftables" ]; then
+        warn "排查：$PKG_MGR install kmod-nft-socket；确认内核含 NFT_SOCKET"
+      else
+        warn "排查：$PKG_MGR install iptables-mod-socket；确认内核含 xt_socket"
+      fi
+    elif [ "$FIREWALL" = "nftables" ]; then
+      ok "Tproxy 能力就绪（nft TPROXY / socket / skuid·skgid）"
     else
       ok "Tproxy 能力就绪（TPROXY / socket / owner）"
     fi
   else
     warn "Tproxy 能力探测未通过（缺：${_DP_MISS:-未知}）——透明代理暂不可用，面板可正常安装"
-    warn "排查：$PKG_MGR install iptables-mod-tproxy iptables-mod-extra iptables-mod-socket；确认内核含 xt_TPROXY / xt_owner / xt_socket"
+    if [ "$FIREWALL" = "nftables" ]; then
+      warn "排查：$PKG_MGR install nftables-json kmod-nft-tproxy kmod-nft-socket；确认内核含 NFT_TPROXY / NFT_SOCKET"
+    else
+      warn "排查：$PKG_MGR install iptables-mod-tproxy iptables-mod-extra iptables-mod-socket；确认内核含 xt_TPROXY / xt_owner / xt_socket"
+    fi
   fi
   return 0
 }
