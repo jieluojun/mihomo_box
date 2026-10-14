@@ -28,8 +28,11 @@ INITD="${MIHOMO_BOX_INITD:-/etc/init.d/mihomo_box}"
 COMPAT_DIR="${MIHOMO_BOX_COMPAT:-/usr/sbin}"          # 兼容垫片落点（在 CGI / init 的 PATH 内）
 SHIM_MARKER="mihomo-box-openwrt"
 LATEST_PAGE="https://github.com/$REPO/releases/latest"
-# 加速镜像：顺序与面板「内核管理」页「自动优选」一致；直连 GitHub 殿后兜底
-MIRRORS="https://v6.gh-proxy.org/ https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/ https://github.moeyy.xyz/"
+# 加速镜像：ghfast.top 打头（网页与文件都代理）；v6.gh-proxy.org 殿后——实测它
+# 只做文件下载加速，对 github.com 网页一律回「403 Web page content is not
+# allowed」，排前面会让每次安装先白吃一个 403（拉 releases/latest 解析版本号
+# 就要抓网页）。顺序与模块 MIRROR_ALL 的自动优选序保持一致；直连 GitHub 兜底。
+MIRRORS="https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/ https://github.moeyy.xyz/ https://v6.gh-proxy.org/"
 
 PKG_MGR=""
 FIREWALL=""
