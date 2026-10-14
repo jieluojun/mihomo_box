@@ -2,8 +2,8 @@
 # ============================================================
 # Mihomo Box · OpenWrt 一键安装 / 卸载（OpenWrt 21.02+ 及 ImmortalWrt 等衍生版）
 #
-#   在线安装  curl -fsSL https://raw.githubusercontent.com/jieluojun/mihomo_box/main/mihomo-box-openwrt-install.sh | sh
-#   在线卸载  curl -fsSL https://raw.githubusercontent.com/jieluojun/mihomo_box/main/mihomo-box-openwrt-install.sh | sh -s -- uninstall
+#   在线安装  curl -fsSL --connect-timeout 10 --max-time 60 https://v6.gh-proxy.org/https://raw.githubusercontent.com/jieluojun/mihomo_box/main/mihomo-box-openwrt-install.sh | sh
+#   在线卸载  curl -fsSL --connect-timeout 10 --max-time 60 https://v6.gh-proxy.org/https://raw.githubusercontent.com/jieluojun/mihomo_box/main/mihomo-box-openwrt-install.sh | sh -s -- uninstall
 #   离线安装  sh mihomo-box-openwrt-install.sh --zip mihomo-box-<版本>.zip
 #   离线卸载  sh /etc/mihomo_box/uninstall-openwrt.sh
 #   可选参数  --no-start   安装后不启动服务
@@ -16,6 +16,9 @@
 #   · 不生成系统垫片：精简 busybox 的兼容（nohup / base64 / od / 小数 sleep / uhttpd）由模块层完成
 #   · 清理旧版安装器留下的垫片（只删带本脚本标记的文件）
 #   · 依赖按防火墙后端安装；fw3/iptables 另需 nftables-json 供 Mihomo TUN 残留检查/清理
+#   · 防卡死：所有网络请求（镜像/直连/包管理器）都有硬超时与停滞检测，慢通道
+#     每 10s 回显进度——不会再无声挂起；若仍怀疑卡住，看
+#     cat /etc/mihomo_box/run/install.trace  # 每步一行时间戳，最后一行即卡点
 # ============================================================
 
 # ---------- 可覆盖常量（测试 / 定制用） ----------
@@ -54,16 +57,83 @@ pick_http() {
   else return 1; fi
 }
 
-# $1=url $2=输出文件 $3=最长秒数
+# $1=url $2=输出文件 $3=最长秒数（硬上限）
+# 所有客户端一律「后台拉起 + 看门狗轮询」，不再依赖系统有没有 timeout 命令：
+#   · 每 10s 在终端回显一次已下载字节数——慢镜像不再「无声假死」像卡住
+#   · 到 $3 秒硬杀；连接后 60s 无首字节 / 传输中 30s 无增长（半开连接）也硬杀
+# 此前 wget 分支不带任何超时：直连被墙的 GitHub 时内核 SYN 重试要 127s 起步，
+# 多个镜像轮下来像永远挂起——「关闭代理后安装脚本卡死」的直接成因。
+# 注：不给 wget/uclient-fetch 加 -T（老 uclient-fetch 不认该选项会直接报错，
+# 反而把能用的通道全废掉）；超时保证完全交给本看门狗。
 http_get() {
   _t="${3:-300}"
-  if [ "$HTTP_CLIENT" = curl ]; then
-    curl -f -s -S -L --connect-timeout 10 --max-time "$_t" -o "$2" "$1"
-  elif command -v timeout >/dev/null 2>&1; then
-    timeout "$_t" $HTTP_CLIENT -q -O "$2" "$1"
-  else
-    $HTTP_CLIENT -q -O "$2" "$1"
+  case "$_t" in ''|*[!0-9]*) _t=300 ;; esac
+  _hg_t0=$(date +%s 2>/dev/null || echo 0)
+  _hg_deadline=$((_hg_t0 + _t))
+  case "$HTTP_CLIENT" in
+    curl)          curl -f -s -S -L --connect-timeout 10 --max-time "$_t" \
+                        --speed-limit 512 --speed-time 30 -o "$2" "$1" & ;;
+    wget)          wget -q -O "$2" "$1" & ;;
+    "busybox wget") busybox wget -q -O "$2" "$1" & ;;
+    *)             wget -q -O "$2" "$1" & ;;
+  esac
+  _hg_p=$!
+  _hg_last=0; _hg_stall=$_hg_t0; _hg_next=$((_hg_t0 + 10)); _hg_kill=""; _hg_printed=""
+  while kill -0 "$_hg_p" 2>/dev/null; do
+    sleep 2
+    kill -0 "$_hg_p" 2>/dev/null || break
+    _hg_sz=0
+    [ -f "$2" ] && _hg_sz=$(wc -c < "$2" 2>/dev/null | tr -d ' ')
+    case "$_hg_sz" in ''|*[!0-9]*) _hg_sz=0 ;; esac
+    _hg_now=$(date +%s 2>/dev/null || echo 0)
+    if [ -z "$_hg_kill" ]; then
+      if [ "$_hg_now" -ge "$_hg_deadline" ]; then
+        _hg_kill="超过 ${_t}s 硬超时"
+      elif [ "$_hg_sz" -gt "$_hg_last" ]; then
+        _hg_last=$_hg_sz; _hg_stall=$_hg_now
+      else
+        # 已有首字节：30s 无增长判停滞；尚无首字节：60s 判连接无响应
+        _hg_stall_sec=60; [ "$_hg_last" -gt 0 ] && _hg_stall_sec=30
+        [ $((_hg_now - _hg_stall)) -ge "$_hg_stall_sec" ] && _hg_kill="下载停滞 ${_hg_stall_sec}s，疑似半开连接"
+      fi
+    fi
+    if [ -n "$_hg_kill" ]; then
+      kill "$_hg_p" 2>/dev/null; sleep 1; kill -9 "$_hg_p" 2>/dev/null
+      break
+    fi
+    if [ "$_hg_now" -ge "$_hg_next" ]; then
+      printf '\r    … 已下载 %s KB / %s s ' "$((_hg_sz / 1024))" "$((_hg_now - _hg_t0))" >&2
+      _hg_next=$((_hg_now + 10)); _hg_printed=1
+    fi
+  done
+  wait "$_hg_p" 2>/dev/null
+  _hg_rc=$?
+  [ -n "$_hg_printed" ] && printf '\r%46s\r' '' >&2
+  [ -n "$_hg_kill" ] && printf '  ⚠ %s\n' "$_hg_kill" >&2
+  return $_hg_rc
+}
+
+# 有界执行（包管理器等可能死等的命令）：优先系统 timeout，没有则看门狗兜底
+# bounded_run <最长秒数> <命令…>
+bounded_run() {
+  _br_t="$1"; shift
+  case "$_br_t" in ''|*[!0-9]*) _br_t=300 ;; esac
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_br_t" "$@" </dev/null
+    return $?
   fi
+  "$@" </dev/null &
+  _br_p=$!
+  _br_deadline=$(( $(date +%s 2>/dev/null || echo 0) + _br_t ))
+  while kill -0 "$_br_p" 2>/dev/null; do
+    _br_now=$(date +%s 2>/dev/null || echo 0)
+    if [ "$_br_now" -ge "$_br_deadline" ]; then
+      kill "$_br_p" 2>/dev/null; sleep 1; kill -9 "$_br_p" 2>/dev/null
+      break
+    fi
+    sleep 2
+  done
+  wait "$_br_p" 2>/dev/null
 }
 
 # 镜像可能对不存在的路径回 200 + 错误页，只看非空会把垃圾当成功，按类型验真：
@@ -93,10 +163,14 @@ fetch_via_mirror() {
     https://github.com/*|http://github.com/*|https://raw.githubusercontent.com/*|https://codeload.github.com/*)
       for _m in $MIRRORS; do
         info "尝试加速镜像 $_m"
-        _try "$_m$_u" && { echo "加速镜像 $_m" > "$_o.used"; return 0; }
+        _fm_t0=$(date +%s 2>/dev/null || echo 0)
+        if _try "$_m$_u"; then echo "加速镜像 $_m" > "$_o.used"; return 0; fi
+        warn "镜像 $_m 失败（$(( $(date +%s 2>/dev/null || echo 0) - _fm_t0 ))s），换下一条"
       done
       info "镜像均不可用，兜底直连 GitHub"
-      _try "$_u" && { echo "直连 GitHub" > "$_o.used"; return 0; }
+      _fm_t0=$(date +%s 2>/dev/null || echo 0)
+      if _try "$_u"; then echo "直连 GitHub" > "$_o.used"; return 0; fi
+      warn "直连 GitHub 失败（$(( $(date +%s 2>/dev/null || echo 0) - _fm_t0 ))s）"
       ;;
     *)
       info "直连下载 $_u"
@@ -448,20 +522,22 @@ pkg_install_one() {
   info "安装 $1 …"
   case "$PKG_MGR" in
     opkg)
-      opkg install "$1" </dev/null >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
+      # opkg update/install 遇到死软件源会无限期等（尤其关代理直连的网络），
+      # 一律 bounded_run 限死：install 180s、update 300s
+      bounded_run 180 opkg install "$1" >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
       if [ "$_pkg_updated" != "1" ]; then
         _pkg_updated=1
         info "软件源索引可能过期，opkg update 后重试"
-        opkg update </dev/null >/dev/null 2>&1
-        opkg install "$1" </dev/null >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
+        bounded_run 300 opkg update >/dev/null 2>&1
+        bounded_run 180 opkg install "$1" >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
       fi ;;
     apk)
-      apk add "$1" </dev/null >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
+      bounded_run 180 apk add "$1" >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
       if [ "$_pkg_updated" != "1" ]; then
         _pkg_updated=1
         info "软件源索引可能过期，apk update 后重试"
-        apk update </dev/null >/dev/null 2>&1
-        apk add "$1" </dev/null >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
+        bounded_run 300 apk update >/dev/null 2>&1
+        bounded_run 180 apk add "$1" >/dev/null 2>&1 && { ok "$1 安装完成"; return 0; }
       fi ;;
     *) return 1 ;;
   esac
