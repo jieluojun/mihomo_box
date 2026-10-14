@@ -24,7 +24,6 @@ INSTALL_DIR="${MIHOMO_BOX_DIR:-/etc/mihomo_box}"
 INITD="${MIHOMO_BOX_INITD:-/etc/init.d/mihomo_box}"
 COMPAT_DIR="${MIHOMO_BOX_COMPAT:-/usr/sbin}"          # 兼容垫片落点（在 CGI / init 的 PATH 内）
 SHIM_MARKER="mihomo-box-openwrt"
-UPDATE_JSON_URL="https://raw.githubusercontent.com/$REPO/main/update.json"
 LATEST_PAGE="https://github.com/$REPO/releases/latest"
 # 加速镜像：顺序与面板「内核管理」页「自动优选」一致；直连 GitHub 殿后兜底
 MIRRORS="https://v6.gh-proxy.org/ https://ghfast.top/ https://gh-proxy.com/ https://ghproxy.net/ https://github.moeyy.xyz/"
@@ -107,9 +106,15 @@ fetch_via_mirror() {
   return 1
 }
 
-# ---------- 安装包获取（Release zip）----------
-# 路线：update.json 的 zipUrl → 按 version 拼的 latest/download 地址 → releases/latest 页面解析资产名
+# ---------- 安装包获取（Release zip，直接走 GitHub，不依赖 update.json）----------
+# 路线：releases/latest 页面（GitHub 会跳到最新 Release）→ 解析资产名 mihomo-box-<版本>.zip
+#       与 tag 链接 → 依次尝试 latest/download 直链、按版本拼的 releases/download 地址。
+# 不再读取 update.json：它要等发布提交推到 main 才更新，可能滞后于最新 Release。
 # 结果：PKG_FILE 指向本地 zip；--zip 指定时直接使用
+parse_latest_tag() {
+  grep -o "/$REPO/releases/tag/[^\"'?#<> ]*" 2>/dev/null | sed 's|.*/tag/||' | head -1
+}
+
 obtain_package() {
   if [ -n "$ARG_ZIP" ]; then
     [ -f "$ARG_ZIP" ] || die "本地安装包不存在: $ARG_ZIP"
@@ -118,20 +123,29 @@ obtain_package() {
     return 0
   fi
   PKG_FILE="$STAGE/pkg.zip"
-  PKG_VER=""; ZIP_URL=""
+  PKG_VER=""; PKG_ASSET=""; PKG_TAG=""
 
-  step "获取版本信息（update.json）"
-  if fetch_via_mirror "$UPDATE_JSON_URL" "$STAGE/update.json" 20 json; then
-    PKG_VER=$(json_str_field "$STAGE/update.json" version)
-    ZIP_URL=$(canonical_github_url "$(json_str_field "$STAGE/update.json" zipUrl)")
-    ok "最新版本: ${PKG_VER:-未知}（$(cat "$STAGE/update.json.used" 2>/dev/null)）"
+  step "获取最新版本（GitHub Release）"
+  if fetch_via_mirror "$LATEST_PAGE" "$STAGE/releases.html" 30; then
+    PKG_ASSET=$(parse_asset_name < "$STAGE/releases.html")
+    PKG_TAG=$(parse_latest_tag < "$STAGE/releases.html")
+    if [ -n "$PKG_ASSET" ]; then
+      PKG_VER=${PKG_ASSET#mihomo-box-}; PKG_VER=${PKG_VER%.zip}
+    elif [ -n "$PKG_TAG" ]; then
+      PKG_VER=${PKG_TAG#v}
+    fi
+    ok "最新版本: ${PKG_VER:-未知}（$(cat "$STAGE/releases.html.used" 2>/dev/null)）"
   else
-    warn "update.json 获取失败，改从 Release 页面解析"
+    warn "Release 页面获取失败，改用 latest 直链"
   fi
 
   step "下载 Mihomo Box 发布包（Release zip）"
-  for _u in "$ZIP_URL" "$( [ -n "$PKG_VER" ] && echo "https://github.com/$REPO/releases/latest/download/mihomo-box-$PKG_VER.zip")"; do
-    [ -n "$_u" ] || continue
+  _cands=""
+  [ -n "$PKG_ASSET" ] && _cands="$_cands https://github.com/$REPO/releases/latest/download/$PKG_ASSET"
+  [ -n "$PKG_TAG" ] && [ -n "$PKG_VER" ] && _cands="$_cands https://github.com/$REPO/releases/download/$PKG_TAG/mihomo-box-$PKG_VER.zip"
+  [ -n "$PKG_VER" ] && _cands="$_cands https://github.com/$REPO/releases/latest/download/mihomo-box-$PKG_VER.zip"
+  [ -n "$_cands" ] || _cands="https://github.com/$REPO/releases/latest/download/mihomo-box.zip"
+  for _u in $_cands; do
     info "地址: $_u"
     if fetch_via_mirror "$_u" "$PKG_FILE" 300 zip; then
       ok "下载完成（$(wc -c < "$PKG_FILE" | tr -d ' ') 字节，$(cat "$PKG_FILE.used")）"
@@ -139,18 +153,6 @@ obtain_package() {
     fi
     warn "该地址失败，换下一个"
   done
-
-  if fetch_via_mirror "$LATEST_PAGE" "$STAGE/releases.html" 30; then
-    _a=$(parse_asset_name < "$STAGE/releases.html")
-    if [ -n "$_a" ]; then
-      _u="https://github.com/$REPO/releases/latest/download/$_a"
-      info "地址: $_u"
-      if fetch_via_mirror "$_u" "$PKG_FILE" 300 zip; then
-        ok "下载完成（$(wc -c < "$PKG_FILE" | tr -d ' ') 字节，$(cat "$PKG_FILE.used")）"
-        return 0
-      fi
-    fi
-  fi
   die "Release 安装包下载失败（镜像与直连均不可用）。可稍后重试；或在能下载的机器上取 mihomo-box-*.zip，传到路由器后用 --zip 离线安装"
 }
 
