@@ -5,6 +5,7 @@
 #   在线安装  curl -fsSL https://raw.githubusercontent.com/jieluojun/mihomo_box/main/mihomo-box-openwrt-install.sh | sh
 #   在线卸载  curl -fsSL https://raw.githubusercontent.com/jieluojun/mihomo_box/main/mihomo-box-openwrt-install.sh | sh -s -- uninstall
 #   离线安装  sh mihomo-box-openwrt-install.sh --zip mihomo-box-<版本>.zip
+#   离线卸载  sh /etc/mihomo_box/uninstall-openwrt.sh
 #   可选参数  --no-start   安装后不启动服务
 #
 # 要点（与 Android 版一致）：
