@@ -1,0 +1,331 @@
+# ============================================================
+# Mihomo Box · 模块构建与发布
+#
+#   打 tag（vYYYYMMDD-HHMM）→ 构建 → 创建 Release 并挂 zip
+#   push / PR              → 构建 → 上传 Actions 产物（不发布）
+#   手动触发（Actions 页面）→ 可指定版本戳 / 更新说明 / 是否发布 Release
+#
+# 构建完全复用仓库根的 build.sh（版本戳、versionCode、缓存戳烘焙、语法检查、
+# update.json 生成都在那里），本工作流只负责：定版本号 → 跑脚本 → 校验产物
+# → 上传/发布。本地打包与 CI 打包因此走同一条代码路径，不会各跑一套逻辑。
+#
+# 注意：module.prop 的 version/versionCode 由 build.sh 就地改写（CI 里是
+# 一次性的检出副本），所以仓库里的 module.prop 不需要为发版手工改号。
+# ============================================================
+name: Build module
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version_stamp:
+        description: '版本戳 YYYYMMDD-HHMM（留空 = 当前北京时间）'
+        required: false
+        default: ''
+      version_code:
+        description: 'versionCode（留空 = module.prop 现有值 +1；keep = 沿用现有值）'
+        required: false
+        default: ''
+      changelog:
+        description: '本版本更新说明（会前插到 CHANGELOG.md 作为 Release 说明）'
+        required: false
+        default: ''
+      release:
+        description: '构建后创建 GitHub Release（tag v<版本戳>）'
+        type: boolean
+        default: false
+
+# 发布需要写权限（创建 Release / 回写 update.json）
+permissions:
+  contents: write
+
+# 同一分支/tag 连续推送时取消上一轮，避免发两次 Release
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 构建机时区固定北京时间：build.sh 内部虽已 TZ='CST-8'，这里再兜一层
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: 构建模块 zip
+    runs-on: ubuntu-latest
+    outputs:
+      stamp: ${{ steps.ver.outputs.stamp }}
+      code: ${{ steps.ver.outputs.code }}
+      zip: ${{ steps.ver.outputs.zip }}
+      publish: ${{ steps.ver.outputs.publish }}
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 需要完整历史/tag 供 CHANGELOG 与发布使用
+
+      - name: 安装 Node.js（build.sh 用它做 JS 语法检查）
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 确保 zip 可用（打模块包必需）
+        run: |
+          set -e
+          if command -v zip >/dev/null 2>&1; then
+            zip -v | head -n 1
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq zip
+          fi
+
+      # ---- 版本号与发布意图 ----------------------------------------------
+      #   tag 推送      : 版本戳 = tag 去掉前导 v；本次要发布 Release
+      #   手动触发      : 版本戳 = 输入值（留空取北京时间）；按 release 开关决定
+      #   push / PR     : 版本戳 = 当前北京时间；只产物件不发布
+      - name: 确定版本戳与发布意图
+        id: ver
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          IN_STAMP: ${{ inputs.version_stamp }}
+          IN_CODE: ${{ inputs.version_code }}
+          IN_RELEASE: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          stamp=""
+          publish="false"
+
+          if [ "$REF_TYPE" = "tag" ]; then
+            stamp="${REF_NAME#v}"
+            publish="true"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "${IN_STAMP:-}" ]; then
+            stamp="$IN_STAMP"
+          else
+            stamp="$(TZ='CST-8' date '+%Y%m%d-%H%M')"
+          fi
+
+          # 校验形状，早失败（build.sh 里也校验一遍，这里给出更直白的报错）
+          case "$stamp" in
+            [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]) : ;;
+            *) echo "::error::版本戳格式应为 YYYYMMDD-HHMM，当前为「$stamp」"; exit 1 ;;
+          esac
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${IN_RELEASE:-false}" = "true" ]; then
+            publish="true"
+          fi
+          # PR / 普通分支推送永不发布
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            publish="false"
+          fi
+          if [ "$REF_TYPE" != "tag" ] && [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            publish="false"
+          fi
+
+          # versionCode 策略：空 → build.sh 按 module.prop +1；
+          # 版本戳与 module.prop 里现有一致（重新打包同一版本）→ keep，不跳号。
+          code="${IN_CODE:-}"
+          if [ -z "$code" ]; then
+            cur="$(sed -n 's/^version=//p' module.prop | head -1 | tr -d '\r')"
+            if [ "$cur" = "$stamp" ]; then
+              code="keep"
+            fi
+          fi
+
+          echo "版本戳: $stamp    versionCode 策略: ${code:-自动+1}    发布: $publish"
+          {
+            echo "stamp=$stamp"
+            echo "code=$code"
+            echo "publish=$publish"
+            echo "zip=mihomo-box-$stamp.zip"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---- 构建 -----------------------------------------------------------
+      # SKIP_TESTS 不设：仓库里存在 tests/ 时 build.sh 会自动跑回归；
+      # 不存在时它会明确打印「未执行回归测试」，不会假装成功。
+      # OUTDIR 指到 runner 临时目录：产物不能落在源码树内（build.sh 会拒绝）。
+      - name: 运行 build.sh 打包
+        id: build
+        shell: bash
+        env:
+          VERSION_STAMP: ${{ steps.ver.outputs.stamp }}
+          VERSION_CODE: ${{ steps.ver.outputs.code }}
+          OUTDIR: ${{ runner.temp }}/out
+          # 手动触发的更新说明走环境变量传入，不拼进 shell 脚本（避免注入）
+          CHANGELOG_INPUT: ${{ inputs.changelog }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUTDIR"
+          if [ -n "${CHANGELOG_INPUT:-}" ]; then
+            sh build.sh "$CHANGELOG_INPUT"
+          else
+            sh build.sh
+          fi
+          ls -la "$OUTDIR"
+
+      # ---- 产物校验：包内版本号/缓存戳/结构必须与本次构建一致 ----------
+      - name: 校验构建产物
+        shell: bash
+        env:
+          STAMP: ${{ steps.ver.outputs.stamp }}
+          OUTDIR: ${{ runner.temp }}/out
+        run: |
+          set -euo pipefail
+          ZIP="$OUTDIR/mihomo-box-$STAMP.zip"
+          [ -s "$ZIP" ] || { echo "::error::未生成 $ZIP"; exit 1; }
+
+          LIST="$(unzip -Z1 "$ZIP")"
+          echo "$LIST" | head -n 40
+
+          # 必需条目
+          for f in module.prop customize.sh service.sh post-fs-data.sh uninstall.sh \
+                   scripts/mihomo.sh data/config.yaml webroot/index.html \
+                   webroot/ui/index.html webroot/ui/cgi-bin/exec.sh \
+                   META-INF/com/google/android/update-binary; do
+            echo "$LIST" | grep -qx "$f" || { echo "::error::模块包缺少 $f"; exit 1; }
+          done
+
+          # 不该被打进包的（CI 配置 / 测试 / 发布描述 / 运行残留）
+          if echo "$LIST" | grep -Eq '^(\.github/|tests/|update\.json$|CHANGELOG\.md$|core/|run/)'; then
+            echo "::error::模块包里混入了非模块文件："
+            echo "$LIST" | grep -E '^(\.github/|tests/|update\.json$|CHANGELOG\.md$|core/|run/)'
+            exit 1
+          fi
+
+          # module.prop 的 version 必须等于本次版本戳
+          mkdir -p "$RUNNER_TEMP/x"
+          rm -rf "$RUNNER_TEMP/x"/*
+          unzip -q -o "$ZIP" module.prop -d "$RUNNER_TEMP/x"
+          v="$(sed -n 's/^version=//p' "$RUNNER_TEMP/x/module.prop" | tr -d '\r')"
+          c="$(sed -n 's/^versionCode=//p' "$RUNNER_TEMP/x/module.prop" | tr -d '\r')"
+          [ "$v" = "$STAMP" ] || { echo "::error::包内 version=$v 与版本戳 $STAMP 不一致"; exit 1; }
+          case "$c" in ''|*[!0-9]*) echo "::error::包内 versionCode 非法：$c"; exit 1 ;; esac
+          # 管理器用 org.json optInt 解析，必须落在 Int32 内
+          [ "$c" -le 2147483647 ] || { echo "::error::versionCode 超出 Int32：$c"; exit 1; }
+          echo "包内版本: $v (versionCode=$c)"
+
+          # 面板资源戳必须已烘焙成本次戳（源码里是 __PANEL_VER__ 占位）
+          unzip -q -o "$ZIP" webroot/ui/index.html -d "$RUNNER_TEMP/x"
+          if grep -q '__PANEL_VER__' "$RUNNER_TEMP/x/webroot/ui/index.html"; then
+            echo "::error::index.html 的 __PANEL_VER__ 占位未被烘焙，面板会带旧缓存"
+            exit 1
+          fi
+          grep -q "?v=$STAMP" "$RUNNER_TEMP/x/webroot/ui/index.html" || {
+            echo "::error::index.html 资源戳不是本次版本戳 $STAMP"; exit 1; }
+
+          # 源码树的占位必须已还原，下一次构建才能继续烘焙新戳
+          grep -q '?v=__PANEL_VER__' webroot/ui/index.html || {
+            echo "::error::构建后源码 index.html 未还原 __PANEL_VER__ 占位"; exit 1; }
+
+          # 同一批文件同时给出校验和，便于下载后核对
+          ( cd "$OUTDIR" && sha256sum "mihomo-box-$STAMP.zip" | tee mihomo-box-"$STAMP".zip.sha256 )
+          wc -c "$ZIP"
+
+      - name: 上传模块包（Actions 产物）
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-box-${{ steps.ver.outputs.stamp }}
+          path: |
+            ${{ runner.temp }}/out/mihomo-box-${{ steps.ver.outputs.stamp }}.zip
+            ${{ runner.temp }}/out/mihomo-box-${{ steps.ver.outputs.stamp }}.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      # ---- 发布 Release（tag 或手动勾选）--------------------------------
+      # Release 说明取 CHANGELOG.md 里本版本的条目（build.sh 已按需前插）。
+      - name: 创建 GitHub Release
+        if: steps.ver.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAMP: ${{ steps.ver.outputs.stamp }}
+          OUTDIR: ${{ runner.temp }}/out
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="v$STAMP"
+          ZIP="$OUTDIR/mihomo-box-$STAMP.zip"
+          SUM="$ZIP.sha256"
+
+          NOTES="$(sed -n "/^## $STAMP /,/^## /{/^## $STAMP /d;/^## /q;p;}" CHANGELOG.md 2>/dev/null || true)"
+          [ -n "${NOTES// /}" ] || NOTES="详见 CHANGELOG.md"
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，覆盖资产"
+            gh release upload "$TAG" "$ZIP" "$SUM" --clobber --repo "$REPO"
+            gh release edit "$TAG" --notes "$NOTES" --repo "$REPO"
+          else
+            gh release create "$TAG" "$ZIP" "$SUM" \
+              --repo "$REPO" \
+              --title "Mihomo Box $STAMP" \
+              --notes "$NOTES" \
+              --target "$GITHUB_SHA"
+          fi
+          echo "✅ Release: $(gh release view "$TAG" --repo "$REPO" --json url -q .url)"
+
+      # ---- 回写 update.json / module.prop（管理器在线更新入口）----------
+      # 管理器读的是默认分支上的 update.json：不回写的话，Release 发了但
+      # 模块页永远看不到「更新」。tag 发布与「勾选发布」的手动触发都会走到这里。
+      # 如需关闭（例如只想手工发版），把仓库变量 SKIP_UPDATE_COMMIT 设为 true。
+      - name: 回写 update.json 到默认分支
+        if: steps.ver.outputs.publish == 'true' && github.event_name != 'pull_request'
+        # 默认分支若开了保护规则（必须走 PR），这一步会失败，但不该把已经成功的
+        # Release 标红：置 continue-on-error，日志里仍有明确提示。
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAMP: ${{ steps.ver.outputs.stamp }}
+          REPO: ${{ github.repository }}
+          SKIP_UPDATE_COMMIT: ${{ vars.SKIP_UPDATE_COMMIT }}
+        run: |
+          set -euo pipefail
+          if [ "${SKIP_UPDATE_COMMIT:-false}" = "true" ]; then
+            echo "SKIP_UPDATE_COMMIT=true，跳过回写"
+            exit 0
+          fi
+          BRANCH="${{ github.event.repository.default_branch }}"
+
+          # build.sh 已在工作区生成 update.json 并改写 module.prop 的版本行
+          [ -f update.json ] || { echo "::error::缺少 update.json"; exit 1; }
+          grep -q "\"version\": \"$STAMP\"" update.json || {
+            echo "::error::update.json 版本与 $STAMP 不一致，拒绝回写"; exit 1; }
+
+          # 先把本次构建产出的三份文件挪到临时区：下面切到默认分支最新提交时
+          # 工作区会被覆盖，不能让它们被一起丢掉。
+          mkdir -p "$RUNNER_TEMP/release-files"
+          cp update.json CHANGELOG.md module.prop "$RUNNER_TEMP/release-files/" 2>/dev/null || true
+          [ -f CHANGELOG.md ] || : > "$RUNNER_TEMP/release-files/CHANGELOG.md"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "$BRANCH" --depth=1
+          # 以远端默认分支最新提交为基底，避免覆盖掉 tag 之后的新提交
+          git checkout -B "$BRANCH" "origin/$BRANCH"
+          cp "$RUNNER_TEMP/release-files/"* .
+
+          git add update.json CHANGELOG.md module.prop
+          if git diff --cached --quiet; then
+            echo "默认分支上的发布描述已是最新，无需提交"
+            exit 0
+          fi
+          git commit -m "release: $STAMP"
+          git push origin "HEAD:$BRANCH"
+          echo "✅ 已回写 update.json / CHANGELOG.md / module.prop 到 $BRANCH"
+
+      - name: 汇总
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Mihomo Box 构建结果"
+            echo ""
+            echo "- 版本戳：\`${{ steps.ver.outputs.stamp }}\`"
+            echo "- 发布 Release：\`${{ steps.ver.outputs.publish }}\`"
+            echo "- 产物：\`${{ steps.ver.outputs.zip }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

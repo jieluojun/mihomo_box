@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>Mihomo Box</title>
+<style>
+html,body{margin:0;padding:0;min-height:100vh}
+body{display:flex;align-items:center;justify-content:center;background:#F5F6FA;color:#222;font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+@media (prefers-color-scheme:dark){body{background:#0C0C0F;color:#E8E8EA}}
+.card{width:min(420px,88vw);text-align:center;padding:32px 24px;border-radius:20px;background:rgba(127,127,127,.08)}
+.t{font-size:16px;font-weight:700;margin-bottom:8px}
+.d{font-size:13px;opacity:.72;line-height:1.7}
+a.go{display:inline-block;margin-top:16px;font-size:14px;color:#3B82F6;text-decoration:none}
+.btn{display:inline-block;margin-top:18px;padding:10px 26px;font-size:15px;border:0;border-radius:12px;background:#3B82F6;color:#fff}
+</style>
+</head>
+<body>
+<noscript><div class="card"><div class="t">Mihomo Box</div><div><a class="go" href="http://127.0.0.1:55555/">点这里进入面板</a></div></div></noscript>
+<script>
+(function () {
+  var TARGET = 'http://127.0.0.1:55555/';
+  function go() {
+    try { window.location.replace(TARGET); }
+    catch (e) { window.location.href = TARGET; }
+  }
+  function showErr() {
+    document.body.innerHTML = '<div class="card"><div class="t">面板服务未就绪</div>' +
+      '<div class="d">没有连上本机面板服务（' + TARGET + '）。<br>请确认模块已启用；刚开机时服务需要几秒启动。<br>也可点下面按钮重试一次，或直接进入。</div>' +
+      '<div><button class="btn" id="retry" type="button">重试</button></div>' +
+      '<div><a class="go" href="' + TARGET + '">直接进入</a></div></div>';
+    document.getElementById('retry').onclick = function () {
+      document.body.innerHTML = '';
+      go();
+      setTimeout(showErr, 2500);
+    };
+  }
+  // 零延迟瞬间直跳，不等待网络探活往返
+  go();
+  setTimeout(showErr, 2500);
+})();
+</script>
+</body>
+</html>
