@@ -1,0 +1,294 @@
+mixed-port: 7890
+tproxy-port: 7893
+bind-address: "*"
+mode: rule
+log-level: silent
+find-process-mode: strict
+ipv6: false
+allow-lan: true
+unified-delay: true
+tcp-concurrent: true
+
+keep-alive-interval: 30
+keep-alive-idle: 15
+disable-keep-alive: false
+
+external-controller: 0.0.0.0:9090
+secret: ""
+external-ui: ui
+external-ui-url: "https://v6.gh-proxy.org/https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages-no-fonts.zip"
+
+lgbm-auto-update: true
+lgbm-update-interval: 72
+lgbm-url: "https://v6.gh-proxy.org/https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model-large.bin"
+
+geo-auto-update: true
+geo-update-interval: 24
+geox-url:
+  geoip: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"
+  geosite: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"
+  mmdb: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb"
+  asn: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb"
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+sniffer:
+  enable: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+
+tun:
+  enable: true
+  mtu: 9000
+  device: mihomo
+  stack: mips
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+  auto-route: true
+  strict-route: true
+  auto-redirect: false
+  auto-detect-interface: true
+
+listeners:
+  - name: ebpf-in
+    type: ebpf
+    local:
+      enable: false
+      ipv6: false
+      bypass-private-address: false
+    shared:
+      enable: false
+      interface:
+        - wlan2
+        - br-lan
+        - br0
+      ipv6: false
+      bypass-private-address: false
+
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: false
+  respect-rules: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - rule-set:排除域名
+    - rule-set:大陆域名
+  nameserver-policy:
+    rule-set:海外域名: 
+      - https://8.8.8.8/dns-query
+    rule-set:大陆域名:
+      - https://223.5.5.5/dns-query
+  nameserver:
+    - https://1.1.1.1/dns-query
+  proxy-server-nameserver:
+    - https://1.12.12.12/dns-query#DNS出口
+  direct-nameserver:
+    - https://223.5.5.5/dns-query
+
+hosts:
+  # 将国内镜像域名 CNAME 到 googleapis.com，修复 Google Play 下载失败问题
+  services.googleapis.cn: [services.googleapis.com]
+
+proxies:
+  - { name: DNS_Hijack, type: dns }
+  - { name: 直连出口, type: direct }
+
+代理合集: &providers { interval: 3600, proxy: 订阅更新, health-check: { enable: true, url: https://www.gstatic.com/generate_204, interval: 86400, timeout: 2000 } }
+混淆覆写: &host { override-expr: ['.servername = "v.qq.com"', '.sni = .servername', '(select(.network == "ws") | .["ws-opts"].headers.Host) = .servername', '(select(.network == "http") | .["http-opts"].headers.Host) = [.servername]', '(select(.network == "h2") | .["h2-opts"].headers.Host) = [.servername]', '(select(.network == "xhttp") | .["xhttp-opts"].headers.Host) = .servername', '(select(.type == "cns") | .headers.Host) = .servername'] }
+proxy-providers:
+  百度直连:
+    type: http
+    <<: *providers
+    url: "https://gist.githubusercontent.com/jieluojun/d4b528ee3418740112357a80e940d912/raw/BaiduDirect"
+    override: { additional-prefix: "百度直连/" }
+  钉钉直连:
+    type: http
+    <<: *providers
+    url: "https://gist.githubusercontent.com/jieluojun/d4b528ee3418740112357a80e940d912/raw/DingTalkDirect"
+    override: { additional-prefix: "钉钉直连/", override-expr: ['.path = "gw.alicdn.com"', '(select(.type == "http") | .path) = ("@" + .path)'] }
+  CNS订阅:
+    type: http
+    <<: *providers
+    url: "https://gist.githubusercontent.com/jieluojun/d4b528ee3418740112357a80e940d912/raw/cns"
+    override: { additional-prefix: "CNS订阅/", <<: *host }
+  免流订阅:
+    type: http
+    <<: *providers
+    url: "https://gist.githubusercontent.com/jieluojun/d4b528ee3418740112357a80e940d912/raw/MLSub"
+    override: { additional-prefix: "免流订阅/", <<: *host }
+  免流节点:
+    type: file
+    <<: *providers
+    path: ./proxies/免流节点.yaml
+    override: { additional-prefix: "免流节点/", <<: *host }
+  非免订阅:
+    type: http
+    <<: *providers
+    url: http://127.0.0.1
+    override: { additional-prefix: "非免订阅/", dialer-proxy: 链式代理 }
+  非免节点:
+    type: file
+    <<: *providers
+    path: ./proxies/非免节点.txt
+    override: { additional-prefix: "非免节点/", dialer-proxy: 链式代理 }
+
+proxy-groups:
+  - name: 国外出口
+    type: select
+    proxies: [香港, 台湾, 日本, 韩国, 新加坡, 美国, 其它]
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/Global.png
+
+  - name: 国内出口
+    type: select
+    proxies: [百度直连, 钉钉直连, 中国, 直连出口]
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/China.png
+
+  - name: 百度直连
+    type: select
+    use: [百度直连]
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/baidu.png
+
+  - name: 钉钉直连
+    type: select
+    use: [钉钉直连]
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/dingtalk.png
+
+  - name: 游戏UDP
+    type: select
+    proxies: [中国, 直连出口]
+    use: [CNS订阅]
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/GAME.png
+
+  - name: 全部UDP
+    type: select
+    proxies: [PASS, 中国, 直连出口]
+    use: [CNS订阅]
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/Kache.png
+
+  - name: 链式代理
+    type: select
+    use: [免流订阅]
+    proxies: [百度直连,钉钉直连]
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/Final.png
+
+  - name: 订阅更新
+    type: select
+    proxies: [国外出口, 国内出口, 直连出口]
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/Skicat.png
+
+  - name: DNS出口
+    type: select
+    proxies: [百度直连, 钉钉直连]
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/Static.png
+
+  - name: 广告出口
+    type: select
+    proxies: [PASS, REJECT]
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/Adblock.png
+
+  - name: 中国
+    type: select
+    include-all: true
+    exclude-type: direct|Http
+    filter: "江苏|浙江|杭州|常州|南京|北京|上海|广东|广州|苏州|杭州|福州|扬州|贵州|兰州|徐州|郑州|广西|河南|河北|重庆|南宁|宿迁|沈阳|四川|安徽|深圳|辽宁|济南|九江|长沙|昆明|武汉|陕西|西宁|芜湖|天津|南昌|成都|山西|太原|保定|湖南|湖北|德阳|山东|十堰|青岛|合肥|云南|西安|内蒙古"
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/CN.png
+
+  - name: 香港
+    type: select
+    include-all: true
+    exclude-type: direct
+    filter: "(?i)港|hk|hongkong|hong kong"
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/HK.png
+
+  - name: 台湾
+    type: select
+    include-all: true
+    exclude-type: direct
+    filter: "(?i)台|tw|taiwan"
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/TW.png
+
+  - name: 日本
+    type: select
+    include-all: true
+    exclude-type: direct
+    filter: "(?i)日|jp|japan"
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/JP.png
+
+  - name: 韩国
+    type: select
+    include-all: true
+    exclude-type: direct
+    filter: "(?i)韩|kr|korea"
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/KR.png
+
+  - name: 新加坡
+    type: select
+    include-all: true
+    exclude-type: direct
+    filter: "(?i)(新|sg|singapore)"
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/SG.png
+
+  - name: 美国
+    type: select
+    include-all: true
+    exclude-type: direct
+    filter: "(?i)美|us|unitedstates|united states"
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/US.png
+
+  - name: 其它
+    type: select
+    include-all: true
+    exclude-type: direct|dns
+    filter: "(?i)^(?!.*(?:🇭🇰|🇨🇳|🇯🇵|🇰🇷|🇸🇬|🇺🇸|港|hk|hongkong|台|tw|taiwan|日|jp|japan|韩|kr|korea|新|sg|singapore|美|us|unitedstates)).*"
+    exclude-filter: "官网|剩余|到期|江苏|浙江|杭州|常州|南京|北京|上海|广东|广州|苏州|杭州|福州|扬州|贵州|兰州|徐州|郑州|广西|河南|河北|重庆|南宁|宿迁|沈阳|四川|安徽|深圳|辽宁|济南|九江|长沙|昆明|武汉|陕西|西宁|芜湖|天津|南昌|成都|山西|太原|保定|湖南|湖北|德阳|山东|十堰|青岛|合肥|云南|西安|内蒙古"
+    icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/XD.png
+
+域名集: &domain { type: http, interval: 86400, proxy: 订阅更新, behavior: domain, format: mrs }
+地址集: &ipcidr { type: http, interval: 86400, proxy: 订阅更新, behavior: ipcidr, format: mrs }
+
+rule-providers:
+  排除域名:
+    <<: *domain
+    url: "https://v6.gh-proxy.org/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/fakeip-filter.mrs"
+  广告域名:
+    <<: *domain
+    url: "https://v6.gh-proxy.org/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/ads.mrs"
+  谷歌FCM:
+    <<: *domain
+    url: "https://v6.gh-proxy.org/https://github.com/MetaCubeX/meta-rules-dat/raw/meta/geo/geosite/googlefcm.mrs"
+  海外域名:
+    <<: *domain
+    url: "https://v6.gh-proxy.org/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/proxy.mrs"
+  大陆域名:
+    <<: *domain
+    url: "https://v6.gh-proxy.org/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/cn.mrs"
+  本机地址:
+    <<: *ipcidr
+    url: "https://v6.gh-proxy.org/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/privateip.mrs"
+  大陆地址:
+    <<: *ipcidr
+    url: "https://v6.gh-proxy.org/https://github.com/DustinWin/ruleset_geodata/releases/download/mihomo-ruleset/cnip.mrs"
+
+rules:
+  - DST-PORT,53,DNS_Hijack
+  - AND,(NETWORK,UDP),(OR,(DST-PORT,443/3478/5349/19302),(RULE-SET,本机地址)),REJECT
+  - DOMAIN-REGEX,(wswup.cdn.huya.com)|(cdnws.api.huya.com)|(p2p)|(stun)|(pcdn)|(mcdn)|(torrent)|(tracker)|(httpdns),REJECT-DROP
+  - RULE-SET,广告域名,广告出口
+  - RULE-SET,海外域名,国外出口 
+  - AND,(NETWORK,UDP),(PROCESS-NAME-REGEX,(com.tencent.tmgp.sgame)|(com.tencent.tmgp.cf)),游戏UDP
+  - NETWORK,UDP,全部UDP
+  - RULE-SET,大陆域名,国内出口
+  - RULE-SET,大陆地址,国内出口
+  - RULE-SET,本机地址,直连出口
+  - MATCH,国外出口
+  - MATCH,REJECT

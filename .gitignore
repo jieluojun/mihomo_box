@@ -1,0 +1,18 @@
+# —— 构建产物 ——
+# build.sh 默认把 zip 打在仓库的上一级；万一在仓库内构建，也不要提交
+*.zip
+*.zip.sha256
+
+# build.sh 渲染 webroot/index.html 时，scripts/mihomo.sh 会在源码树里创建
+# run/ 与 core/（模块运行时目录），本地打包会临时出现，不要提交
+/run/
+/core/
+
+# 回归测试依赖（tests/ 目录若存在）
+node_modules/
+tests/node_modules/
+
+# 编辑器 / 系统垃圾
+.DS_Store
+*.swp
+*~
