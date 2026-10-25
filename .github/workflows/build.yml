@@ -247,12 +247,14 @@ jobs:
             echo "$LIST" | grep -qx "$f" || { echo "::error::模块包缺少 $f"; exit 1; }
           done
 
-          # 不该被打进包的（CI 配置 / 测试 / 发布描述 / 运行残留）
-          if echo "$LIST" | grep -Eq '^(\.github/|tests/|update\.json$|CHANGELOG\.md$|core/|run/)'; then
+          # 不该被打进包的（CI 配置 / 测试 / 发布描述 / 构建脚本 / 运行残留）
+          JUNK_RE='^(\.github/|tests/|update\.json$|CHANGELOG\.md$|build\.sh$|core/|run/)'
+          if echo "$LIST" | grep -Eq "$JUNK_RE"; then
             echo "::error::模块包里混入了非模块文件："
-            echo "$LIST" | grep -E '^(\.github/|tests/|update\.json$|CHANGELOG\.md$|core/|run/)'
+            echo "$LIST" | grep -E "$JUNK_RE"
             exit 1
           fi
+          echo "已确认包内不含 .github / tests / update.json / CHANGELOG.md / build.sh / core / run"
 
           # module.prop 的 version 必须等于本次版本戳
           mkdir -p "$RUNNER_TEMP/x"

@@ -223,15 +223,18 @@ OUT="$OUTDIR/mihomo-box-$STAMP.zip"
 sed -i "s/?v=__PANEL_VER__/?v=$STAMP/g; s/?v=[0-9]\{8\}-[0-9]\{4\}/?v=$STAMP/g" webroot/ui/index.html
 
 rm -f "$OUT"
-# 打包排除：CI 配置、依赖与缓存、回归测试、发布描述文件，以及本地/CI 运行残留
-# （core/ run/ 是 scripts/mihomo.sh 在源码树上跑一次就会 mkdir 出来的空目录，
-#  打进包里会变成模块目录中的空壳，刷入日志看着像缺文件）。
+# 打包排除：CI 配置、依赖与缓存、回归测试、发布描述文件、构建脚本自身，
+# 以及本地/CI 运行残留（core/ run/ 是 scripts/mihomo.sh 在源码树上跑一次就会
+# mkdir 出来的空目录，打进包里会变成模块目录中的空壳，刷入日志看着像缺文件）。
+# build.sh 是开发机的打包脚本（依赖 sh/node/zip），设备上永远用不到，
+# 留在包里只会被误当模块组件；发版走 CI 时同样靠这条排除。
 rm -rf core run 2>/dev/null
 zip -r -q "$OUT" . \
   -x '*.zip' 'node_modules/*' '*/node_modules/*' '.git/*' '*/.git/*' \
      '.github/*' '*/__pycache__/*' '*.pyc' \
      'tests/*' 'tests/node_modules/*' \
      'update.json' 'CHANGELOG.md' 'UPDATE.md' \
+     'build.sh' \
      'core/*' 'run/*' '.DS_Store' '*.swp'
 echo "产物: $OUT"
 
