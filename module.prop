@@ -1,7 +1,7 @@
 id=mihomo_box
 name=Mihomo Box
-version=20261026-0128
-versionCode=210
+version=20261026-0401
+versionCode=211
 updateJson=https://raw.githubusercontent.com/jieluojun/mihomo_box/main/update.json
 author=tg@jieluojun
 description=Mihomo 可视化内核模块 for KernelSU。默认使用 jieluojun/mihomo 分支内核（Smart 策略组 + eBPF 透明代理入站 + 钉钉直连 + cns 出站），可在 WebUI 中切换官方 MetaCubeX 内核
