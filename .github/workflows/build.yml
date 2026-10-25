@@ -30,7 +30,9 @@ on:
         required: false
         default: ''
       changelog:
-        description: '本版本更新说明（会前插到 CHANGELOG.md 作为 Release 说明）'
+        # 该输入框是单行的（回车即提交），多条说明用 \n 或 | 分隔，
+        # 构建前由「转换更新说明换行标记」步骤还原成真正的多行。
+        description: '本版本更新说明，多条用 \n 或 | 分隔（会前插到 CHANGELOG.md，并作为 Release 说明）'
         required: false
         default: ''
       release:
@@ -145,6 +147,59 @@ jobs:
             echo "zip=mihomo-box-$stamp.zip"
           } >> "$GITHUB_OUTPUT"
 
+      # ---- 更新说明换行：单行输入框敲不了回车 -----------------------------
+      # workflow_dispatch 的 input 是单行文本框（回车 = 提交），所以约定：
+      #   字面 \n   或   |    → 换行
+      # 例：- 代理页新增双排布局\n- 修复展开逻辑|- 更新默认配置
+      # 用户若通过别的工具真塞进了换行，也原样保留（两种都支持）。
+      # 结果写进 GITHUB_OUTPUT 的多行输出（随机定界符），再作为环境变量交给 build.sh。
+      - name: 转换更新说明换行标记
+        id: notes
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          RAW_NOTES: ${{ inputs.changelog }}
+        run: |
+          set -euo pipefail
+          notes="${RAW_NOTES:-}"
+
+          # 占位符替换：\n → 换行，| → 换行（| 常用于一条一条地写）
+          notes="${notes//\\n/$'\n'}"
+          notes="${notes//|/$'\n'}"
+
+          # 顺手裁掉尾随空格与空行：否则 CHANGELOG 里会多出空段落，
+          # Release 说明抓取（sed 到下一个 ^## 为止）也会带上一串空行。
+          while [ "${notes%$'\n'}" != "$notes" ]; do notes="${notes%$'\n'}"; done
+          while [ "${notes% }"  != "$notes" ]; do notes="${notes% }";  done
+          while [ "${notes%$'\t'}" != "$notes" ]; do notes="${notes%$'\t'}"; done
+
+          # 规范化：每行行首的 \r 去掉（手机输入法/复制粘贴可能带 CRLF）
+          notes="$(printf '%s' "$notes" | tr -d '\r')"
+
+          if [ -z "$notes" ]; then
+            echo "未填写更新说明，CHANGELOG 保持原样（Release 说明取 CHANGELOG 里本版本条目，没有则用兜底文案）"
+            echo "text=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "---- 更新说明（换行已还原）----"
+          printf '%s\n' "$notes"
+          echo "------------------------------"
+
+          DELIM="NOTES_EOF_${RANDOM}${RANDOM}"
+          {
+            echo "text<<$DELIM"
+            printf '%s\n' "$notes"
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+          # 同时写到 Step Summary，运行结束后能直接核对排版
+          {
+            echo "### 本版本更新说明"
+            echo ""
+            printf '%s\n' "$notes"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # ---- 构建 -----------------------------------------------------------
       # SKIP_TESTS 不设：仓库里存在 tests/ 时 build.sh 会自动跑回归；
       # 不存在时它会明确打印「未执行回归测试」，不会假装成功。
@@ -156,12 +211,14 @@ jobs:
           VERSION_STAMP: ${{ steps.ver.outputs.stamp }}
           VERSION_CODE: ${{ steps.ver.outputs.code }}
           OUTDIR: ${{ runner.temp }}/out
-          # 手动触发的更新说明走环境变量传入，不拼进 shell 脚本（避免注入）
-          CHANGELOG_INPUT: ${{ inputs.changelog }}
+          # 手动触发的更新说明：取上一步还原换行后的多行文本；
+          # 非手动触发时该步骤被跳过，输出为空，build.sh 不带更新说明。
+          CHANGELOG_INPUT: ${{ steps.notes.outputs.text }}
         run: |
           set -euo pipefail
           mkdir -p "$OUTDIR"
           if [ -n "${CHANGELOG_INPUT:-}" ]; then
+            # 多行说明整体作为一个参数传入，不做词分裂
             sh build.sh "$CHANGELOG_INPUT"
           else
             sh build.sh
@@ -190,12 +247,14 @@ jobs:
             echo "$LIST" | grep -qx "$f" || { echo "::error::模块包缺少 $f"; exit 1; }
           done
 
-          # 不该被打进包的（CI 配置 / 测试 / 发布描述 / 运行残留）
-          if echo "$LIST" | grep -Eq '^(\.github/|tests/|update\.json$|CHANGELOG\.md$|core/|run/)'; then
+          # 不该被打进包的（CI 配置 / 测试 / 发布描述 / 构建脚本 / 运行残留）
+          JUNK_RE='^(\.github/|tests/|update\.json$|CHANGELOG\.md$|build\.sh$|core/|run/)'
+          if echo "$LIST" | grep -Eq "$JUNK_RE"; then
             echo "::error::模块包里混入了非模块文件："
-            echo "$LIST" | grep -E '^(\.github/|tests/|update\.json$|CHANGELOG\.md$|core/|run/)'
+            echo "$LIST" | grep -E "$JUNK_RE"
             exit 1
           fi
+          echo "已确认包内不含 .github / tests / update.json / CHANGELOG.md / build.sh / core / run"
 
           # module.prop 的 version 必须等于本次版本戳
           mkdir -p "$RUNNER_TEMP/x"
@@ -261,6 +320,8 @@ jobs:
           SUM="$ZIP.sha256"
 
           NOTES="$(sed -n "/^## $STAMP /,/^## /{/^## $STAMP /d;/^## /q;p;}" CHANGELOG.md 2>/dev/null || true)"
+          # 去掉标题与正文之间的前导空行、以及结尾的多余空行（多行说明常见）
+          NOTES="$(printf '%s\n' "$NOTES" | sed -e '/./,$!d' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')"
           [ -n "${NOTES// /}" ] || NOTES="详见 CHANGELOG.md"
 
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
