@@ -4625,6 +4625,38 @@ EOF
   return 0
 }
 
+# WebUI「模块设置」用：TProxy / ipv6 行下方要显示各卡首选 APN 的协议与漫游协议。
+# JSON 而不是解析 apn4-status 的文本：前端零猜测，字段名就是 content 的列名。
+#   {"ok":1,"content":1,"taken":0|1,"items":[{"id","apn","protocol","roaming","type","managed"}]}
+# 只给弹层打开 / 切换系统 IPv6 后按需调用一次——content 每次都要拉起一个 JVM，
+# 不能塞进 1.5 秒一次的 mod-state 轮询里。
+_apn4_json_esc() {
+  printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+apn4_json() {
+  _aj_cmd=1; command -v content >/dev/null 2>&1 || _aj_cmd=0
+  _aj_taken=0; [ -f "$APN4_STATE" ] && _aj_taken=1
+  printf '{"ok":1,"content":%s,"taken":%s,"items":[' "$_aj_cmd" "$_aj_taken"
+  _aj_first=1
+  if [ "$_aj_cmd" = "1" ]; then
+    while IFS='|' read -r _aj_id _aj_apn _aj_p _aj_r _aj_t; do
+      [ -n "$_aj_id" ] || continue
+      _aj_m=0
+      grep -q "^$_aj_id|" "$APN4_STATE" 2>/dev/null && _aj_m=1
+      [ "$_aj_first" = "1" ] || printf ','
+      _aj_first=0
+      printf '{"id":"%s","apn":"%s","protocol":"%s","roaming":"%s","type":"%s","managed":%s}' \
+        "$(_apn4_json_esc "$_aj_id")" "$(_apn4_json_esc "$_aj_apn")" \
+        "$(_apn4_json_esc "$_aj_p")" "$(_apn4_json_esc "$_aj_r")" \
+        "$(_apn4_json_esc "$_aj_t")" "$_aj_m"
+    done <<EOF
+$(apn4_rows)
+EOF
+  fi
+  printf ']}\n'
+  return 0
+}
+
 system_ipv6_sync() {
   _si_dir=${IPV6_CONF:-/proc/sys/net/ipv6/conf}
   [ -d "$_si_dir" ] || return 0
@@ -6782,9 +6814,35 @@ _tproxy_apply_body() {
     fi
     # 2) 能力探测：不通过同样拒绝，防止装上无法旁路内核自身的回环规则导致断网
     tproxy_probe || return 1
-    # 3) 写设置 + 配置手术（关 TUN；首次开启记录原值，关闭开关时据此还原）
+    # 3) 配置手术（关 TUN；首次开启记录原值，关闭开关时据此还原）
+    #    ★顺序必须与主页「代理模式 → Tproxy」（restart-json tproxy）一致：
+    #      先手术、再校验、再落设置、最后停/启内核。
+    #      以前这里先 `set_setting tproxy true` 再做手术：从设置落盘到内核重启之间
+    #      有几百毫秒到数秒的空档，此时「开关监听循环」的 net-sync 已经看到
+    #      「tproxy=开 + 内核在跑 + 端口在听」，于是按**旧内核身份 / 旧配置**抢先
+    #      算出期望态并装好 TPROXY 规则；紧接着 stop/start 让内核换成 root:3005 的
+    #      新实例，规则与内核身份/配置对不上，规则又指向一个正在重启的端口 ——
+    #      表现就是「设置里开 Tproxy 大概率整机没网，主页切 Tproxy 却正常」。
+    _ta_keep_cfg=0
+    if [ "$(get_setting tproxy false)" = "true" ] && [ -f "$TP_CFG" ] \
+       && [ "$(config_fingerprint)" = "$(cat "$RUNDIR/tproxy.config.fp" 2>/dev/null)" ]; then
+      _ta_keep_cfg=1
+    fi
+    prepare_proxy_mode tproxy || return 1
+    # 3b) 新配置先校验（与重启路径一致）：不通过就原样退出——不落设置、不动旧内核，
+    #     用户看到一句 ERR 即可，绝不会出现「设置已开、配置是坏的、内核还没换」的
+    #     半成品状态。
+    if [ "${MH_SKIP_VERIFY:-0}" != "1" ]; then
+      verify_config || return 1
+    fi
+    # 3c) 记录还原点（首次开启时的 tun_before / 被注释的 TUN 监听器条数）
+    if [ "$_ta_keep_cfg" != 1 ]; then
+      printf 'tun_before=%s\nlistener_marked=%s\nport=%s\n' \
+        "$_pm_tp_before" "$_pm_tp_marked" "$_pm_port" > "$TP_CFG" || return 1
+    fi
+    config_fingerprint > "$RUNDIR/tproxy.config.fp" || return 1
+    # 3d) 设置最后才置位：此时配置已就绪，watcher 任何时刻对账都算出同一份期望态
     set_setting tproxy true
-    prepare_proxy_mode || return 1
     _ta_spec=$(tproxy_app_spec)
     _ta_mode=$(printf '%s\n' "$_ta_spec" | awk '{print $1}')
     _ta_cnt=$(printf '%s\n' "$_ta_spec" | awk '{print $2}')
@@ -6800,7 +6858,11 @@ _tproxy_apply_body() {
     if running; then
       stop_core keep >/dev/null 2>&1
       if ! start_core; then
-        echo "ERR: 内核重启失败，规则未安装（开关保持开启，修正配置后会自动生效；关闭开关可还原）"
+        # 启动失败时绝不能把规则留在原地：TPROXY 跳转指向死端口等于整机断网
+        # （与 _restart_core_body 的失败收尾同款——先摘跳转，再后台全量清理）。
+        tproxy_unhook_quick 2>/dev/null
+        ( tproxy_sync ) </dev/null >/dev/null 2>&1 &
+        echo "ERR: 内核重启失败，已拆除 Tproxy 规则（开关保持开启，修正配置后会自动生效；关闭开关可还原）"
         return 1
       fi
     fi
@@ -9612,6 +9674,7 @@ case "$cmd" in
   ipv6-status)   ipv6_status ;;
   # APN 协议接管（等效「APN 协议=IPv4」防蜂窝 v6 泄漏，不碰 IMS）：
   apn4-status)   apn4_status ;;
+  apn4-json)     apn4_json ;;
   apn4-apply)    apn4_apply  && echo "OK: APN 已按 IPv4 接管（详见 $APN4_LOG）" ;;
   apn4-restore)  apn4_restore && echo "OK: APN 协议已还原（详见 $APN4_LOG）" ;;
   # Tproxy 透明代理：开关主流程 / 手动对账 / 查看状态

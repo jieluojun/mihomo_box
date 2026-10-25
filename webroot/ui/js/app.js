@@ -97,7 +97,14 @@ function rerenderCurrentDeferred() {
     // 入站页的 TUN 卡片有「默认收起」的进入态；再次进入时必须重建，
     // 不能复用上次离开时已经展开的 DOM。
     if (pageIsFresh(current) && current !== 'page-c-inbound') {
-      if (current === 'page-dashboard') { startDashLogLoop(); refreshDashboardConnectionMode(); }   // 热缓存落地也立即采样
+      if (current === 'page-dashboard') {
+        startDashLogLoop(); refreshDashboardConnectionMode();   // 热缓存落地也立即采样
+        // 复用旧 DOM 时按钮态是上一次渲染时的快照：每次落地都按当前护栏重算一次，
+        // 别让「保存/重启期间渲染出来的禁用态」跟着缓存一起被复用。
+        paintDashboardProxyModeSelection();
+        syncServiceRestartButtons();
+        syncConfigTestButtons();
+      }
       afterRenderSettle();
       return;
     }
@@ -391,6 +398,32 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   const tpOn = st.tproxy === 'true';           // 默认关闭
   const hsStatus = h('div', { style: 'font-size:12.5px;color:var(--text-3);margin-top:10px;line-height:1.5', text: tunHsStatusText() });
   const tpStatus = h('div', { style: 'font-size:12.5px;color:var(--text-3);margin-top:10px;line-height:1.5', text: tproxyStatusText() });
+  // APN 协议 / APN 漫游协议状态（挂在「系统 IPv6」下方）：系统 IPv6=关 时后端会把
+  // 各卡首选上网 APN 的 protocol / roaming_protocol 改成 IP 防蜂窝 v6 泄漏，这里把
+  // 「现在到底是不是 IPv4、有没有被本模块接管」直接摆出来，不用再跑诊断。
+  // content 查询每次要拉起一个 JVM（几百毫秒），所以只在弹层打开与切换 IPv6 后各取
+  // 一次，绝不放进 1.5 秒一次的 mod-state 轮询。
+  const apnStatus = h('div', { style: 'font-size:12.5px;color:var(--text-3);margin-top:10px;line-height:1.5', text: 'APN 协议：读取中…' });
+  const apnProtocolText = (j) => {
+    if (!j) return 'APN 协议：读取失败';
+    if (!j.content) return 'APN 协议：系统缺少 content 命令，无法读取';
+    const items = Array.isArray(j.items) ? j.items : [];
+    if (!items.length) return 'APN 协议：未查询到首选 APN（多卡/定制 ROM 可能如此）';
+    return items.map(it => {
+      const name = String(it.apn || ('id=' + (it.id || '?')));
+      const p = String(it.protocol || '?'), r = String(it.roaming || '?');
+      return name + '：APN 协议 ' + p + ' · APN 漫游协议 ' + r + (it.managed ? '（已接管，切回 IPv6 会还原）' : '');
+    }).join('；');
+  };
+  const refreshApnStatus = async () => {
+    if (DEMO) { apnStatus.textContent = 'APN 协议：演示模式下不可读取'; return; }
+    try {
+      const r = await cmdline('apn4-json', { timeout: 20000 });
+      apnStatus.textContent = apnProtocolText(parseJsonLoose(r && r.stdout));
+    } catch (e) {
+      apnStatus.textContent = 'APN 协议：读取失败';
+    }
+  };
   // 诊断按钮工厂（Tproxy / TUN 热点各一个）：与配置源码弹窗一致的圆形诊断
   // 按钮（btn sm circle + 脉搏图标），放在各自开关的左旁。不生效时靠人猜很
   // 慢，一键跑后端诊断，把关键状态全部打出来，可直接复制给开发者。以前
@@ -537,7 +570,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
       }))),
     // Tproxy 代理：开启→识别端口+关 TUN+装 TPROXY 规则；关闭→拆规则+还原 TUN 配置
     h('div', { class: 'f-row' },
-      h('div', { class: 'f-label' }, 'Tproxy 代理', h('div', { class: 'f-desc', text: '开启后自动识别配置里的 TProxy 端口（tproxy-port 或 tproxy 监听器），关闭配置里的 TUN 并把 eBPF 入站的 local/shared.enable 置为 false（参数原样保留），安装 TPROXY 转发规则接管系统流量（内核会重启）；关闭则拆除规则并还原本次自动修改的 TUN 配置。应用黑白名单直接复用 TUN 页「仅代理以下应用」／「排除以下应用」（前者优先），改完保存配置自动生效' }), tpStatus),
+      h('div', { class: 'f-label' }, 'Tproxy 代理', h('div', { class: 'f-desc', text: '开启后接管系统流量：自动关闭配置里的 TUN / eBPF 并安装 TPROXY 规则（内核会重启）；关闭则拆除规则、还原被改动的 TUN 配置。应用黑白名单复用 TUN 页的「仅代理以下应用」／「排除以下应用」' }), tpStatus),
       h('div', { class: 'f-ctl' }, tpDiagBtn, (() => {
         let sw;
         sw = switchCtl(tpOn, async (v) => {
@@ -567,11 +600,18 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
               if (!DEMO && dEl) quickResPaint(dEl, { oldPid: tPrevPid, stillActive: () => tpBusy, reanchor: true, onReady: () => toastUpDone('✅ Tproxy 已开启') }).catch(() => {});
             }
             // 关闭时先还原配置但暂不重启，等用户选择 TUN/eBPF 后由保存流程统一重启。
-            const r = await cmdline(v ? 'tproxy-set true' : 'tproxy-set false defer');
+            // 开启这条链和主页「代理模式 → Tproxy」一样要跑「配置手术 + 校验 + 重启内核
+            // + 装规则」，慢设备上远超通道默认的 15s。以前用默认超时，前端先判超时、
+            // 弹出「请求超时」并把开关弹回去，后端却还在继续跑——界面与设备状态从此
+            // 对不上（再点一次就是两条链打架）。这里与 restart-json 同档放宽到 90s。
+            const r = await cmdline(v ? 'tproxy-set true' : 'tproxy-set false defer', { timeout: 90000 });
             const out = ((r && r.stdout) || '').trim();
             const ok = !!r && r.errno === 0 && !/(^|\n)ERR/.test(out);
             if (ok) {
               if (state.status) state.status.tproxy = v ? 'true' : 'false';
+              // 开启会重启内核（换 root:3005 身份、换配置）：代理页按旧配置缓存的出站/
+              // 节点数据整体作废，否则切到代理页看到的是上一个内核的残影。
+              if (v) { try { emitCoreConfigApplied(); invalidateProxyData(); } catch (e) { } }
               refreshModState(true);   // 命令一返回就刷新文案，不等下面的配置重载和完整 status
               toastDoneFallback(v ? '✅ Tproxy 已开启' : '✅ 已还原默认状态');
               // 后端改过 config.yaml（TUN 开关/监听器注释）：重载草稿，
@@ -606,7 +646,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
     // IPv6 相关开关（顶层 ipv6 / dns.ipv6 / eBPF 入站 local·shared.ipv6）并重启服务，
     // 手术与重启都由后端 set system_ipv6 一次完成（见 cfg_ipv6_set_all）。
     h('div', { class: 'f-row' },
-      h('div', { class: 'f-label' }, '系统 IPv6', h('div', { class: 'f-desc', text: 'IPv6 总开关。开启＝系统 IPv6 保持可用，并把配置里的 IPv6 相关开关（IPv6 总开关 ipv6、解析 AAAA dns.ipv6、eBPF 入站 local/shared 的接管 IPv6）一并置为开启；关闭（默认）＝上述开关一并置为关闭，并在内核协议栈层面禁用各网卡 IPv6，防止 v6 流量绕过代理直连。每次切换都会同步配置并重启服务（含 eBPF 入站重建）；关闭期间每约 5 秒自动对账一次，飞行模式/切换网络后被系统放回来的 IPv6 会被自动收回' })),
+      h('div', { class: 'f-label' }, '系统 IPv6', h('div', { class: 'f-desc', text: 'IPv6 总开关。开启＝系统 IPv6 可用（配置里的 ipv6 / dns.ipv6 / eBPF 接管 IPv6 一并打开）；关闭（默认）＝在内核协议栈禁用各网卡 IPv6 并同步关闭上述开关，防止 v6 流量绕过代理直连。切换会重启服务；关闭期间自动对账，飞行模式/切网后被系统放回来的 IPv6 会被收回' }), apnStatus),
       h('div', { class: 'f-ctl' }, (() => {
         let sw;
         sw = switchCtl(v6On, async (v) => {
@@ -638,7 +678,9 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             }).catch(() => {});
           }
           try {
-            const r = await cmdline(`set system_ipv6 ${v}`);
+            // 与 Tproxy / 重启同档放宽超时：这条链含配置手术 + 重启内核，慢设备上
+            // 远超通道默认 15s，超时只会让前端误判失败（后端仍在跑）。
+            const r = await cmdline(`set system_ipv6 ${v}`, { timeout: 90000 });
             const out = ((r && r.stdout) || '').trim();
             const ok = !!r && r.errno === 0 && !/(^|\n)ERR/.test(out);
             if (state.status) state.status.system_ipv6 = v ? 'true' : 'false';
@@ -659,6 +701,8 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             // 收尾只留 2.5s 补读短窗。Math.min：把本次 20s 长窗收回，避免一直挂着盖住
             // 之后真实的「已停止」显示；也不挤掉别处刚按下的更长静默窗。
             if (v6Quiet) restartQuietUntil = Math.min(restartQuietUntil, Date.now() + 2500);
+            // APN 协议可能刚被改写/还原（系统 IPv6 关→协议改 IP，开→按记录还原）
+            if (sheetClose && sheetClose.isCurrent()) void refreshApnStatus();
           }
         });
         return sw;
@@ -673,6 +717,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   }));
   // 打开弹层时异步刷一次最新状态，确保 Tproxy 与热点对账状态实时呈现
   startModPoll();   // 立即取一次轻量状态（不等完整 status），之后每 1.5 秒一次，关闭即停
+  void refreshApnStatus();   // APN 协议/漫游协议：打开弹层取一次（content 要拉 JVM，不进轮询）
   refreshStatus().then(async () => {
     if (sheetClose && sheetClose.isCurrent()) await refreshModState();   // status 带回的可能是旧值，文案以轻量状态为准
   }).catch(() => {});
@@ -1448,16 +1493,24 @@ window.__mbBeginOpToast = beginOpToast;
 window.__mbToastUpDone = toastUpDone;
 window.__mbToastDoneFallback = toastDoneFallback;
 async function restartDashboardService() {
-  if (serviceRestartBusy || serviceRestartChain || svcBusy) { uiToast('服务操作正在进行，请稍候'); return; }
+  // state.saveBusy 也要算进来：入站页启用 TUN/eBPF 后的「保存并重启」在途时再点重启，
+  // 两条链会抢同一把生命周期锁，且先跑完的那条会被后一条的启动空窗盖掉。
+  if (serviceRestartBusy || serviceRestartChain || svcBusy || state.saveBusy) {
+    uiToast(serviceRestartChain || serviceRestartBusy ? '服务正在重启，请稍候'
+      : state.saveBusy ? '正在保存配置，完成后再重启服务' : '服务操作正在进行，请稍候', 2600);
+    return;
+  }
   if (!state.status?.running) { uiToast('服务未运行，请使用总开关启动'); return; }
   serviceRestartBusy = true;
   serviceRestartChain = true;
-  syncServiceRestartButtons();
-  uiToast('正在重启服务…');
-  // 即时绘制新 PID；可再次操作的时点以已释放后端锁的轻量 ACK 为准。
-  cueServiceRestartUI();
   let acknowledged = false;
+  // 护栏置起后的一切都在 try 里（含首帧按钮态/提示）：任何一处抛异常都必须走到
+  // finally 复位，不能让 serviceRestartChain 永久停在 true 把主页所有点击挡住。
   try {
+    syncServiceRestartButtons();
+    uiToast('正在重启服务…');
+    // 即时绘制新 PID；可再次操作的时点以已释放后端锁的轻量 ACK 为准。
+    cueServiceRestartUI();
     await waitForConfigTestPaint();
     const restarted = await restartService();
     acknowledged = true;
@@ -1780,9 +1833,36 @@ function proxyModeLabel(st) {
   if (st && on(st.tproxy)) return 'tproxy';
   return configuredProxyModeLabel(state.cfg);
 }
+// 主页「代理模式」卡的按钮态必须随时可从当前护栏重算：
+// 卡片是在某一次渲染时按当时的 svcBusy / serviceRestartBusy / serviceRestartChain /
+// state.saveBusy 算出 disabled 的，而这些标志位可能在「别处」（入站页启用 TUN/eBPF →
+// 保存 → 重启）被置起，随后又在一次不触发状态签名变化的收尾里清除。此时页面里留着
+// 一批 disabled 的按钮，点上去连 click 都不会派发 —— 用户看到的就是「点了没有任何反应」。
+// 所以：① 只有本卡自己的切换在途（proxyModeBusy）才禁用，其它在途一律允许点击并给出
+// 明确提示；② 任何护栏释放时（mihomo-service-idle、草稿变更、重启收尾）都重算一次。
+function dashboardProxyModeBlocked() {
+  return proxyModeBusy || svcBusy || serviceRestartBusy || serviceRestartChain || state.saveBusy;
+}
+// 具体到「卡在哪一步」的提示文案：分不清原因的「请稍候」等于没说。
+function dashboardProxyModeGuardMessage() {
+  if (proxyModeBusy) return '正在切换代理模式，请稍候';
+  if (state.saveBusy) return '正在保存配置，完成后再切换代理模式';
+  if (serviceRestartBusy || serviceRestartChain) return '服务正在重启，完成后再切换代理模式';
+  if (svcBusy) return '服务启停进行中，完成后再切换代理模式';
+  return '';
+}
+function syncDashboardProxyModeButtons() {
+  document.querySelectorAll('#page-dashboard [data-proxy-mode]').forEach(button => {
+    button.disabled = !!proxyModeBusy;
+    button.setAttribute('aria-busy', String(!!proxyModeBusy));
+    // 其它在途只做视觉弱化，不禁用：点了会走护栏 toast，不再出现「静默无反应」。
+    button.classList.toggle('busy-blocked', !proxyModeBusy && !!dashboardProxyModeBlocked());
+  });
+}
 function paintDashboardProxyModeSelection() {
   const switching = proxyModeBusy && !!proxyModeTarget;
   const selected = proxyModeLabel(state.status);
+  syncDashboardProxyModeButtons();
   document.querySelectorAll('#page-dashboard [data-proxy-mode]').forEach(button => {
     const on = button.dataset.proxyMode === selected;
     button.classList.toggle('on', on); button.setAttribute('aria-pressed', String(on));
@@ -1800,25 +1880,39 @@ window.addEventListener('mihomo-service-idle', () => {
 
 async function switchDashboardProxyMode(mode) {
   if (!['tun', 'ebpf', 'tproxy'].includes(mode)) return;
-  if (proxyModeBusy || svcBusy || serviceRestartBusy || serviceRestartChain || state.saveBusy) {
-    uiToast('服务操作正在进行，请稍候'); return;
+  // 被护栏挡下时必须说清「为什么」，绝不静默 return：入站页启用 TUN/eBPF 会留下
+  // 保存/重启链，用户随后回主页点其它模式，以前只会得到一句笼统的「请稍候」，
+  // 慢设备上看起来就跟没反应一样。
+  const blocked = dashboardProxyModeGuardMessage();
+  if (blocked) { uiToast(blocked, 2800); return; }
+  let token;
+  try {
+    // 捕获快照会 flush 焦点里的输入框；任何一处抛异常都不能让点击静默失效。
+    token = captureServiceConfigToken();
+  } catch (e) {
+    uiToast('代理模式切换失败：' + ((e && e.message) || e) + '；可先保存或放弃未保存的配置再试', 4600);
+    return;
   }
-  const token = captureServiceConfigToken();
   if (token.dirty || token.pending || state.cfgError) {
     uiToast('请先保存或放弃未保存的配置，再切换代理模式', 3800); return;
   }
   if (mode === 'ebpf' && state.status?.core === 'official') {
     uiToast('官方内核不支持 eBPF，请先切换到 jieluojun 或 liuran001 内核', 3800); return;
   }
-  if (proxyModeLabel(state.status) === mode && state.status?.running) return;
+  if (proxyModeLabel(state.status) === mode && state.status?.running) {
+    uiToast('当前已是 ' + ({ tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy' }[mode]) + ' 模式', 1600); return;
+  }
   if (DEMO) { uiToast('演示模式无法切换设备代理方式'); return; }
   proxyModeTarget = mode;
   proxyModeBusy = true;
   serviceRestartChain = true;
-  setSaveBarSuppressed(true);
-  syncServiceRestartButtons();
-  rerenderCurrent();
+  // 护栏置起之后的每一步都放在 try 里：以前首帧重绘在 try 之外，一旦它抛异常，
+  // proxyModeBusy / serviceRestartChain 就永远停在 true —— 主页所有代理模式、
+  // 运行模式、重启服务的点击从此全被挡住，只能重进面板，看起来就是「点了没反应」。
   try {
+    setSaveBarSuppressed(true);
+    syncServiceRestartButtons();
+    rerenderCurrent();
     if (mode !== 'tproxy') {
       if (!setEbpfEnabled(mode === 'ebpf', { bothRoles: mode === 'ebpf' })
         || !setTunListenerEnabled(mode === 'tun')
@@ -1849,10 +1943,14 @@ function dashboardProxyModeCard(st) {
   box.append(h('div', { class: 'card-head' }, h('h3', { text: '代理模式' }),
     h('span', { class: 'badge b', text: switching ? '切换中…' : '草稿 · 未应用', hidden: !state.dirty && !switching, dataset: { proxyModeDraft: '1' } })));
   const selected = proxyModeLabel(st);
-  const busy = proxyModeBusy || svcBusy || serviceRestartBusy || serviceRestartChain || state.saveBusy;
+  const blockedNow = !proxyModeBusy && !!dashboardProxyModeBlocked();
   const buttons = [['tun', 'TUN'], ['ebpf', 'eBPF'], ['tproxy', 'Tproxy']].map(([value, label]) => {
-    const button = h('button', { type: 'button', text: label, class: selected === value ? 'on' : '',
-      style: 'flex:1', disabled: !!busy, 'aria-pressed': String(selected === value),
+    const button = h('button', { type: 'button', text: label,
+      class: (selected === value ? 'on' : '') + (blockedNow ? ' busy-blocked' : ''),
+      style: 'flex:1',
+      // 只有本卡的切换在途才禁用：其它在途（保存/重启）允许点击，由护栏给出具体提示，
+      // 避免出现「按钮看着能点、点了什么都没有」的死区。
+      disabled: !!proxyModeBusy, 'aria-pressed': String(selected === value),
       'aria-busy': String(proxyModeBusy), dataset: { proxyMode: value } });
     button.addEventListener('click', () => switchDashboardProxyMode(value));
     return button;
@@ -2039,7 +2137,12 @@ function renderDashboard(el) {
   let curMode = st.mode || state.cfg.mode || 'rule';
   if (running && modeOverride && String(modeOverride.pid) === String(st.pid)) curMode = modeOverride.mode;
   const doSwitchMode = async (v, b) => {
-    if (modeBusy || proxyModeBusy || svcBusy || serviceRestartBusy || serviceRestartChain || state.saveBusy || v === curMode) return;
+    // v === curMode 是「点当前模式」：无动作也不提示。其余在途状态必须给一句原因，
+    // 否则用户只感到「点不动」——与代理模式卡同一个坑。
+    if (v === curMode) return;
+    if (modeBusy || state.saveBusy || serviceRestartBusy || serviceRestartChain || svcBusy || proxyModeBusy) {
+      uiToast(dashboardProxyModeGuardMessage() || '模式切换正在进行，请稍候', 2800); return;
+    }
     modeBusy = true;
     let id = ++modeRequestId;
     b.setAttribute('aria-busy', 'true');
