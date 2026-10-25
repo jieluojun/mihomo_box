@@ -577,7 +577,15 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
           if (tpBusy) { sw.querySelector('input').checked = !v; return; }
           tpBusy = true;
           const wasDirty = state.dirty;
-          if (state.status) state.status.tproxy = v ? 'true' : 'false';
+          const prevProxyMode = state.status ? state.status.proxy_mode : undefined;
+          if (state.status) {
+            state.status.tproxy = v ? 'true' : 'false';
+            // 乐观切换主页「代理模式」的选中态：开启 Tproxy 要重启内核，权威
+            // proxy_mode 得等重启完成 + 下一次 status 往返才变；不在这里先切，
+            // 用户看到的就是「开关已打开、主页还高亮 TUN」好几秒。
+            if (v) state.status.proxy_mode = 'tproxy';
+          }
+          paintDashboardProxyModeSelection();
           tpStatus.textContent = v ? '当前状态：正在应用 Tproxy 规则并重启内核…' : '当前状态：正在关闭 Tproxy 规则…';
           uiToast(v ? '正在开启 Tproxy…' : '正在关闭 Tproxy…', 1600);
           beginOpToast();
@@ -618,12 +626,24 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
               // 避免旧草稿在下次保存时把手术结果覆盖回去
               let reloaded = false;
               try { await loadConfig(); rerenderCurrent(); reloaded = true; } catch (e) { /* 重载失败不影响开关 */ }
+              // 关闭 Tproxy 时后端会把被改动的 TUN 配置还原，而 status.proxy_mode 还停在
+              // 关闭前的 tproxy：用刚重载的磁盘配置就地校正，别让主页高亮着一个已经关掉的模式。
+              if (!v && reloaded && state.status) {
+                const shown = configuredProxyModeLabel(state.cfg);
+                state.status.proxy_mode = shown === '无' ? 'none' : shown === 'tun/ebpf' ? 'tun' : shown;
+                paintDashboardProxyModeSelection();
+              }
               if (wasDirty) uiToast('⚠️ 配置已由模块修改并重新载入，先前未保存的编辑已丢弃', 4200);
               // TProxy 关闭后不再静默恢复 TUN；让用户明确选择 TUN 或 eBPF，避免两种
               // 透明接管方式同时生效。选择结果作为普通配置草稿等待顶部保存。
               if (!v && reloaded) showTransparentModePicker();
             } else {
-              if (state.status) state.status.tproxy = (!v) ? 'true' : 'false';
+              if (state.status) {
+                state.status.tproxy = (!v) ? 'true' : 'false';
+                // 乐观值回滚：失败就当没点过，等状态心跳带回真值
+                if (v) state.status.proxy_mode = prevProxyMode === undefined ? 'none' : prevProxyMode;
+              }
+              paintDashboardProxyModeSelection();
               sw.querySelector('input').checked = !v;   // 回弹开关显示
               uiToast('⚠️ ' + (out || (r && r.stderr) || '操作失败'), 5000);
             }
@@ -1829,8 +1849,13 @@ function proxyModeLabel(st) {
     // must not erase that selection when neither TUN nor eBPF was requested.
     return draft === '无' && (on(st?.tproxy) || st?.proxy_mode === 'tproxy') ? 'tproxy' : draft;
   }
-  if (['tun', 'ebpf', 'tproxy', 'none'].includes(st?.proxy_mode)) return st.proxy_mode === 'none' ? '无' : st.proxy_mode;
+  // TProxy 先判：它是模块设置（run/ 里的 setting 文件），后端 config_proxy_mode
+  // 也以它为准。status.proxy_mode 是后端按**磁盘配置 + 该设置**现算的，要等内核
+  // 重启完、下一次 status 往返才变；而 tproxy 这个布尔在「设置」弹层按下的瞬间
+  // 就已经写进本地 state.status。先判它，主页的选中态才能立刻跟上，而不是干等
+  // 几秒后的状态心跳（用户看到的就是「开了 Tproxy，主页还高亮着 TUN」）。
   if (st && on(st.tproxy)) return 'tproxy';
+  if (['tun', 'ebpf', 'tproxy', 'none'].includes(st?.proxy_mode)) return st.proxy_mode === 'none' ? '无' : st.proxy_mode;
   return configuredProxyModeLabel(state.cfg);
 }
 // 主页「代理模式」卡的按钮态必须随时可从当前护栏重算：
