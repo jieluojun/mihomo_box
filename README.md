@@ -67,3 +67,32 @@ VERSION_STAMP=20261026-0128 sh build.sh "本版本更新说明"
 > 仓库里只有 `build.sh` 一个打包实现，CI 直接调用它；原先的 `scripts/publish-release.sh`
 > 已删除 —— 它推送当前分支，而 `updateJson` 固定指向 `main` 的 raw 链接，在特性分支上发版
 > 管理器模块页看不到更新。
+
+## 启停性能基准
+
+`bench/` 下是一套可复现的启停基准（**开发用，不进模块包**：`build.sh` 与 CI 的产物校验
+都已把 `bench/` 排除）。它把模块脚本摆进一个临时沙盒，换上 `bench/fake-core.c` 编出来的
+假内核 —— `-t` 校验耗时、从 exec 到控制器端口 LISTEN 的耗时都能用环境变量摆成任意值，
+因此「脚本这一层到底花了多少」可以单独量出来，不用靠真机上手点。
+
+```bash
+sh bench/bench-startup.sh                     # 基准本仓库的 scripts/mihomo.sh
+sh bench/bench-startup.sh /path/to/old.sh     # 与另一份脚本对照（例如 git show 出来的旧版）
+FAKE_TEST_MS=0 FAKE_LISTEN_MS=0 sh bench/bench-startup.sh   # 只量脚本自身开销
+VERBOSE=1 ROUNDS=5 sh bench/bench-startup.sh  # 打印分段 trace，每场景 5 轮取中位
+```
+
+| 变量 | 作用 |
+| --- | --- |
+| `FAKE_TEST_MS` | 假内核 `-t` 耗时（默认 1500，模拟大配置） |
+| `FAKE_LISTEN_MS` | 假内核开监听端口的延迟（默认 400，真机 0.3~0.6s） |
+| `FAKE_TEST_FAIL=1` | 让 `-t` 失败，测「配置非法」的失败路径 |
+| `ROUNDS` | 每个场景的轮数（默认 3，取中位数） |
+| `VERBOSE=1` | 打印每场景的 `action` 分段耗时 |
+
+每个场景跑完都会断言内核真的起来了（否则判为环境问题直接报错退出），跑之前先预热一次，
+把「装机后第一次才付」的开销（系统 IPv6 首次接管等）排除在计时之外。真机上的等价物是：
+
+```bash
+sh scripts/mihomo.sh action-trace   # 最近一次启停的分段耗时
+```

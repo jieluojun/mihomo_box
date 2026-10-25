@@ -5,7 +5,7 @@ import { showUpdateAllProviders } from './subscription-actions.js';
 // ============================================================
 // Mihomo Box WebUI — 主程序
 // ============================================================
-import { h, state, DEMO, REMOTE, shell, cmdline, loadConfig, saveConfig, ntoast, selectCtl, segCtl, scanAnchorGraph, entryFieldAnchors, uiToast, confirmSheet, openSheet, openChildSheet, closeSheet, setSheetFooter, badge, note, groupTitle, card, chev, switchCtl, clearEl, readText, writeText, pickFileWithFeedback, copyText, hasSelectionIn, CONFIG_PATH, WORKDIR, MODDIR, set, unset, get, subsSheet, shq, parseJsonLoose, lastJsonRepair, execBrief, uiLog, uiLogBuffer, uiLogDiskFailed, flushUiLogNow, clearUiLog, isInteracting, setBackgroundWorkPaused, bumpUiRev, uiRev, deepClone, anchorDefBlock, patchAnchorDefBlock, applyConfigDraft, commitConfigEdit, editConfigSource, flushConfigSource, parseConfigText, tidyMihomoConfig, onConfigDraftChange, onCoreConfigApplied, emitCoreConfigApplied, renderKeepScroll, setSaveBarSuppressed, b64ToUtf8, applyConfigText, captureServiceConfigToken, applyServiceConfigSnapshot, requestTransparentModeOnSave } from './core.js';
+import { h, state, DEMO, REMOTE, shell, cmdline, loadConfig, saveConfig, ntoast, selectCtl, segCtl, scanAnchorGraph, entryFieldAnchors, uiToast, confirmSheet, openSheet, openChildSheet, closeSheet, setSheetFooter, badge, note, groupTitle, card, chev, switchCtl, clearEl, readText, writeText, pickFileWithFeedback, copyText, hasSelectionIn, CONFIG_PATH, WORKDIR, MODDIR, RUNDIR, set, unset, get, subsSheet, shq, parseJsonLoose, lastJsonRepair, execBrief, uiLog, uiLogBuffer, uiLogDiskFailed, flushUiLogNow, clearUiLog, isInteracting, setBackgroundWorkPaused, bumpUiRev, uiRev, deepClone, anchorDefBlock, patchAnchorDefBlock, applyConfigDraft, commitConfigEdit, editConfigSource, flushConfigSource, parseConfigText, tidyMihomoConfig, onConfigDraftChange, onCoreConfigApplied, emitCoreConfigApplied, renderKeepScroll, setSaveBarSuppressed, b64ToUtf8, applyConfigText, captureServiceConfigToken, applyServiceConfigSnapshot, requestTransparentModeOnSave } from './core.js';
 import { mountSaveBar, focusTextInput, installTextInputHandling, installCloseOnEscape } from './core.js';
 import { renderConfigHub, renderGeneral, renderDns, renderInbound, renderSniff, renderNtp, renderTunnels, renderExperimental, policyNames, setEbpfEnabled, setTunListenerEnabled, ebpfRoles } from './pages-config.js';
 import { renderProxies, renderSubs, renderGroups, renderRules, renderRuleProviders, renderSubRules } from './pages-flow.js';
@@ -2056,7 +2056,17 @@ function renderDashboard(el) {
       // zashboard: PATCH /configs, acknowledge first, then refresh runtime config.
       await patchMode(v);
       id = ++modeRequestId;
-      cmdline('live-refresh').catch(() => {});   // B 方案：模式已变，热缓存先作废再重算（不等待）
+      // 首屏快照（run/boot_data.json，内嵌整份 status）里还是旧 mode：作废即可。
+      // 这里特别不能用 live-refresh —— 它会整份重算 status（API 回读 + iptables
+      // 状态检查），慢设备上一次就要 1 秒多；切模式这么高频的操作每次白付一个
+      // 重进程，还会和状态轮询抢 CPU，主页反而更卡。一条 fire-and-forget 的 rm
+      // 就够，而且不等它返回。
+      // 走执行桥时脚本已经在同一次调用里顺手作废了（见 mihomo-api.js 的 MH_API_MODE）。
+      const viaBridge = controller.transport === 'bridge';
+      if (!viaBridge) shell(`rm -f "${RUNDIR}/boot_data.json"`).catch(() => {});
+      // 回读校正：直连 HTTP 时很便宜（本机一次往返），照旧做；走执行桥时再回读
+      // 就是又一整个 shell 进程，而状态轮询本来就会带回权威 mode，跳过即可。
+      if (viaBridge) return;
       getConfigs().then(config => {
         if (id !== modeRequestId || !config?.mode || String(state.status?.pid || '') !== String(st.pid || '')) return;
         curMode = config.mode;

@@ -236,7 +236,7 @@ rm -rf core run 2>/dev/null
 zip -r -q "$OUT" . \
   -x '*.zip' 'node_modules/*' '*/node_modules/*' '.git/*' '*/.git/*' \
      '.github/*' '*/__pycache__/*' '*.pyc' \
-     'tests/*' 'tests/node_modules/*' \
+     'tests/*' 'tests/node_modules/*' 'bench/*' \
      'update.json' 'CHANGELOG.md' 'UPDATE.md' \
      'build.sh' 'mihomo-box-openwrt-install.sh' 'README.md' '.gitignore' '.gitattributes' \
      'core/*' 'run/*' '.DS_Store' '*.swp'

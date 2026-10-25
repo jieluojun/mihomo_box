@@ -23,11 +23,11 @@ const GROUP_DELAY_BUDGET = 7000;
 // 立刻刷文字会闪一下，所以慢到这个阈值才给反馈。
 const PENDING_HINT_MS = 400;
 // mihomo 内置策略与配置页的 BUILTIN_POLICIES 保持一致；这些不是普通节点，
-// 「隐藏不可用」不能把它们误删。
+// 「隐藏不可用节点」不能把它们误删。
 
 let liveData = null;
 let loadedOnce = false;   // 首次 /proxies 往返是否结束（决定要不要画骨架屏）
-let deadCountEl = null;   // 「隐藏不可用」菜单项上的数量标签（renderShell 创建）
+let deadCountEl = null;   // 「隐藏不可用节点」菜单项上的数量标签（renderShell 创建）
 // ⋯ 菜单的收起句柄（renderShell 每轮重建时更新）：菜单按钮挂在跨页常驻的顶栏里，
 // 离开代理页 / 重挂 shell 前用它把还开着的菜单收起，摘掉 document 级监听。
 let proxyMenuCloser = null;
@@ -687,8 +687,8 @@ function renderShell(el) {
   // 摘掉它挂在 document 上的 pointerdown/keydown 监听。
   closeProxyMenu();
   el.innerHTML = '';
-  // 「显示图标 / 隐藏不可用」等筛选收进一个 ⋯ 按钮：点按钮弹出可勾选菜单
-  //（形态参考截图：单按钮 + 打勾的选项列表），再加「双排布局」「切换节点断开连接」。
+  // 「显示图标 / 隐藏不可用节点」等筛选收进一个 ⋯ 按钮：点按钮弹出可勾选菜单
+  //（形态参考截图：单按钮 + 打勾的选项列表），再加「双列代理组」「切换节点断开连接」。
   // ⋯ 菜单与「测速所有节点」「节点匹配诊断」三个按钮挂在顶栏（appbar）的
   // 专用容器 #appbarProxyActions 里，仅停留在代理页时显示（app.js showPage 控制）。
   deadCountEl = h('span', { class: 'badge proxy-filter-count', text: '0', hidden: true });
@@ -755,22 +755,24 @@ function renderShell(el) {
     sync();
     menu.append(item);
   };
-  // 双排布局：zashboard 同款「双列显示代理组」。组卡按左右两列交错排布，
-  // 展开的组进居中浮层（zashboard 移动端 modal 同款），收起后原位放回。
-  // 从单列切到双排时同理清掉展开记录（见模块顶部注释）：单列的「内联展开」
-  // 和双排的「弹浮层」不是一回事，切过去不该让浮层凭空弹出来。
-  addMenuItem('twoColumn', '双排布局', null, () => {
-    if (proxyPrefs.twoColumn && openGroups.size) { openGroups.clear(); saveState('open-groups', []); }
-    renderProxyData(el);
-  });
   addMenuItem('showIcons', '显示图标', null, () => renderProxyData(el));
   // zashboard 同款「显示最终出站」：组头「当前：A」后面再跟「→ 叶子节点」，
   // 组里套组时一眼看出真正从哪个节点出去。
   addMenuItem('showFinalOutbound', '显示最终出站', null, () => renderProxyData(el));
-  // 不可用节点数挂在「隐藏不可用」项上：勾上后被筛掉多少节点一眼可见。
+  // 不可用节点数挂在「隐藏不可用节点」项上：勾上后被筛掉多少节点一眼可见。
   // 始终统计全部展示组，跨组/别名按既有节点身份去重。
-  addMenuItem('hideDead', '隐藏不可用', deadCountEl, () => renderProxyData(el));
+  addMenuItem('hideDead', '隐藏不可用节点', deadCountEl, () => renderProxyData(el));
   addMenuItem('groupByProvider', '按提供商分组', null, () => renderProxyData(el));
+  // 双列代理组：zashboard 同款「双列显示代理组」。组卡按左右两列交错排布，
+  // 展开的组进居中浮层（zashboard 移动端 modal 同款），收起后原位放回。
+  // 从单列切到双列时同理清掉展开记录（见模块顶部注释）：单列的「内联展开」
+  // 和双列的「弹浮层」不是一回事，切过去不该让浮层凭空弹出来。
+  // 排在「按提供商分组」下面：它只改组卡的摆法，跟着分组项一起属于「布局」，
+  // 与上面几项「显示什么」的筛选类选项分开。
+  addMenuItem('twoColumn', '双列代理组', null, () => {
+    if (proxyPrefs.twoColumn && openGroups.size) { openGroups.clear(); saveState('open-groups', []); }
+    renderProxyData(el);
+  });
   addMenuItem('disconnectOnSwitch', '切换节点断开连接', null, null);
   menuWrap.append(menuBtn, menu);
   // 三个功能按钮不再占页面工具栏，统一挂到顶栏的代理页专用容器；
@@ -1076,7 +1078,7 @@ async function refreshSelectionAfterTest() {
 
 // 代理页的三处「一眼可见」统计，统一从这里出：
 //   1) 顶部导航栏副标题：代理组 N · 节点 M
-//   2) 「隐藏不可用」开关上的数字标签：当前不可用的节点数
+//   2) 「隐藏不可用节点」开关上的数字标签：当前不可用的节点数
 //   3) 工具栏统计行的状态提示（延迟来源 / 类型未知 / 配置预览 / 暂无代理组）
 // 口径只有这一份：测速、切页、provider 更新后三处不会互相打架。
 function proxyStats(groups, dict, pIndex) {
@@ -1303,7 +1305,7 @@ function nodeUnavailable(name, meta) {
   return !retainedByZashboard(meta) && delayValue(name, meta) <= 0;
 }
 
-// 「隐藏不可用」的保留规则：开关关着一律保留。
+// 「隐藏不可用节点」的保留规则：开关关着一律保留。
 // 计数一定要用 nodeUnavailable，不能用这个 —— 开关关着时它对所有节点都返回 true。
 function keepWhenHidingDead(name, meta) {
   if (!proxyPrefs.hideDead) return true;
@@ -1685,7 +1687,7 @@ function flushPendingNodesSync(grid) {
 // 按当前筛选就地增删一个代理组里的节点卡。
 //
 // 为什么需要：可用性会变（一次组测速可能让一批节点从不通过变可用，也可能反过来），
-// 而卡片是渲染时按当时的可用性建好的。不重新对齐的话，被「隐藏不可用」筛掉的节点
+// 而卡片是渲染时按当时的可用性建好的。不重新对齐的话，被「隐藏不可用节点」筛掉的节点
 // 即使已经恢复也不会出现 —— 用户看到的就是「测速当前代理组后可用节点没显示出来」。
 // 只动这一个组里变化的那几张卡：整页重绘会丢掉懒挂载进度、展开状态和滚动位置。
 function syncGroupCardNodes(groupName) {
@@ -2183,7 +2185,7 @@ async function testOne(group, name, testKey, delayEl, button, target) {
       pill.classList.remove('is-testing');
       pill.removeAttribute('aria-busy');
     }
-    // 可用性有结论就立刻对齐卡片：勾着「隐藏不可用」时测不通的节点马上消失，
+    // 可用性有结论就立刻对齐卡片：勾着「隐藏不可用节点」时测不通的节点马上消失，
     // 组兜底里顺带复测恢复的其它节点也会自己出现。
     syncProxyAvailability();
     // 走组测速接口、或所在组会自动改选时，回读一次刷新「当前选中」标记
@@ -2487,7 +2489,7 @@ async function testGroupAll(group, dict, pIndex, batchBtn, options = {}) {
     });
   }
 
-  // 与外部面板一样先过滤不可测速项目，但「隐藏不可用」筛掉的节点照样要测：
+  // 与外部面板一样先过滤不可测速项目，但「隐藏不可用节点」筛掉的节点照样要测：
   // 它们当初就是因为不通才被藏起来的，不测就永远不知道它已经恢复，
   // 于是「测速当前代理组后可用节点一直不回来」。它们没有卡片，
   // 结果只更新健康状态与缓存，收尾时再由 syncGroupCardNodes 决定要不要显示。
@@ -2578,7 +2580,7 @@ async function testGroupAll(group, dict, pIndex, batchBtn, options = {}) {
     const settleJob = (job, verdict) => {
       if (!current()) return;
       if (verdict && verdict.dead) {
-        // 内核明确判不通 → 记成不可用：勾着「隐藏不可用」时卡片立刻消失
+        // 内核明确判不通 → 记成不可用：勾着「隐藏不可用节点」时卡片立刻消失
         job.items.forEach(item => { record(item.name, 0); paint(item, 0, { fail: true }); });
       } else if (verdict && Number.isFinite(verdict.delay) && verdict.delay > 0) {
         job.items.forEach(item => {

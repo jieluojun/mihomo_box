@@ -22,6 +22,8 @@ PIDFILE=$RUNDIR/core.pid
 LOGFILE=$RUNDIR/core.log
 SAVE_FALLBACK_LOG=$RUNDIR/save-fallback.log   # 前端保存走全量重排时的诊断，由 WebUI 服务生命周期管理
 TESTED=$RUNDIR/tested.fp     # 上次校验通过的配置指纹
+VERIFY_PENDING=$RUNDIR/verify.pending   # 正在跑的配置校验：「<指纹> <pid>」；并发调用据此合并
+VERIFY_FAIL=$RUNDIR/verify.fail         # 失败缓存：第一行指纹，其余是 -t 的输出摘要
 VERCACHE=$RUNDIR/vercache    # 内核 `-v` 的结果缓存（路径+size+mtime 为 key）
 
 CORE_LIURAN001=$COREDIR/mihomo-liuran001
@@ -195,8 +197,15 @@ nap_load_mode() {
   [ -n "$_nl_boot" ] || { nap_probe; return 0; }
   _nl_cached=""
   if [ -r "$RUNDIR/nap.mode" ]; then
-    IFS= read -r _nl_cboot _nl_cmode < "$RUNDIR/nap.mode" 2>/dev/null
-    if [ "$_nl_cboot" = "$_nl_boot" ]; then
+    # ⚠ 不能用 `IFS= read -r a b` 分两列：IFS 置空即禁用字段分割，
+    # 整行会全落进第一个变量、第二个永远是空 —— 缓存因此从不命中，
+    # 每条命令都要白付一次 nap_probe（sleep 0.2 + 建 FIFO，实测 200~250ms）。
+    # 这是每个用 nap 的命令（启停/重启/面板/监听）都要付的固定开销。
+    _nl_line=""
+    IFS= read -r _nl_line < "$RUNDIR/nap.mode" 2>/dev/null
+    _nl_cboot=${_nl_line%% *}
+    _nl_cmode=${_nl_line##* }
+    if [ -n "$_nl_cboot" ] && [ "$_nl_cboot" = "$_nl_boot" ]; then
       case "$_nl_cmode" in frac|read|ceil) NAP_MODE=$_nl_cmode; return 0 ;; esac
     fi
   fi
@@ -802,6 +811,48 @@ run_timeout() {
 # 对「当前选定的内核」校验配置；通过则写入指纹缓存，失败输出错误原因。
 # 切换内核时先跑这一步：能在停掉正在跑的内核之前就发现不兼容，
 # 避免「停了 → 起不来 → 干等一轮启动超时」这种最耗时的失败路径。
+#
+# mihomo -t 是整条启停链上唯一的重活（大配置 + 远程 provider 1~3 秒起步），
+# 所以这里照 Mishka 启动链的思路给它加了三道闸，绝不让同一个成本重复支付：
+#   1) 成功缓存：指纹命中 tested.fp → 秒过（原有逻辑）；
+#   2) 失败缓存：同一份配置刚校验失败过 → 直接回放错误，不再白跑（原来每次重试
+#      都要重付一遍 -t，开机保障那边最多要重试 4 轮 = 4 次完整校验）；
+#   3) 并发合并（single-flight）：同一指纹已有校验在跑时（面板保存后立刻重载、
+#      后台预热、开机重试撞在一起），后来者等结论而不重复跑第二遍。
+# 真正的预热入口见 verify-prewarm（配置落盘后在后台跑，把 -t 挪出关键路径）。
+verify_fail_cached() {
+  # $1=指纹；命中失败缓存则回放原因并返回 0
+  _vfc_fp=""
+  [ -r "$VERIFY_FAIL" ] && IFS= read -r _vfc_fp < "$VERIFY_FAIL" 2>/dev/null
+  [ -n "$_vfc_fp" ] && [ "$_vfc_fp" = "$1" ] || return 1
+  echo "ERR_CONFIG: 配置校验失败（该内核无法使用当前配置；结果来自最近一次校验）:"
+  sed -n '2,6p' "$VERIFY_FAIL" 2>/dev/null
+  return 0
+}
+
+# 等同一指纹的在跑校验结束（最多约 30s）。0=等到了结论（看 tested.fp / verify.fail），
+# 1=没人可等或持锁者已死（调用方自己跑）。
+verify_join() {
+  _vj_fp=$1
+  [ -r "$VERIFY_PENDING" ] || return 1
+  _vj_seen=0; _vj_rounds=0
+  while :; do
+    _vj_f=""; _vj_pid=""
+    if [ -r "$VERIFY_PENDING" ]; then
+      IFS=' ' read -r _vj_f _vj_pid _ 2>/dev/null < "$VERIFY_PENDING"
+    fi
+    [ -n "$_vj_f" ] || break                 # 文件已清：校验跑完了
+    [ "$_vj_f" = "$_vj_fp" ] || return 1     # 别人在验别的配置：自己跑
+    pid_is_live "$_vj_pid" || break          # 持有者已死：残留文件，自己跑
+    _vj_seen=1
+    _vj_rounds=$((_vj_rounds + 1))
+    [ "$_vj_rounds" -ge 600 ] && break       # 兜底上限（0.05s × 600 ≈ 30s）
+    nap 0.05
+  done
+  [ "$_vj_seen" = "1" ] || return 1
+  return 0
+}
+
 verify_config() {
   _vc_core=$(core_path)
   if [ ! -x "$_vc_core" ]; then
@@ -809,17 +860,59 @@ verify_config() {
     return 1
   fi
   _vc_fp=$(config_fingerprint)
-  if [ "$_vc_fp" = "$(cat "$TESTED" 2>/dev/null)" ]; then
-    echo "配置未变更，跳过校验"
-    return 0
-  fi
+  _vc_waited=0
+  _vc_claimed=0
+  while :; do
+    if [ "$_vc_fp" = "$(cat "$TESTED" 2>/dev/null)" ]; then
+      echo "配置未变更，跳过校验"
+      return 0
+    fi
+    if verify_fail_cached "$_vc_fp"; then return 1; fi
+    # 原子抢占「正在校验」标记：`set -C`（noclobber）让「确认不存在 + 创建」变成
+    # 一次 O_EXCL 打开。保存后的后台预热与紧随其后的重载/重启几乎同时进来，
+    # 若两边都只看到「还没人校验」就各跑一遍 mihomo -t，两份 -t 抢 CPU，
+    # 实测比单独跑一遍更慢 —— 单飞（single-flight）必须真的只有一份。
+    if ( set -C; printf '%s %s\n' "$_vc_fp" "$$" > "$VERIFY_PENDING" ) 2>/dev/null; then
+      _vc_claimed=1
+      break
+    fi
+    [ "$_vc_waited" = "1" ] && break         # 合并过一次仍无结论：自己跑
+    _vc_waited=1
+    verify_join "$_vc_fp" || break           # 等持有者的结论；持有者已死则自己跑
+  done
+  # 没抢到标记（残留文件 / 等不到结论）也要把自己的 pid 写上，让后来者能 join 我们。
+  [ "$_vc_claimed" = "1" ] || printf '%s %s\n' "$_vc_fp" "$$" > "$VERIFY_PENDING" 2>/dev/null
   if ! run_timeout "${MH_VERIFY_TIMEOUT:-30}" "$_vc_core" -t -d "$WORKDIR" -f "$CONFIG" > "$RUNDIR/test.log" 2>&1; then
+    rm -f "$VERIFY_PENDING" 2>/dev/null
+    { printf '%s\n' "$_vc_fp"; tail -6 "$RUNDIR/test.log" 2>/dev/null; } > "$VERIFY_FAIL" 2>/dev/null
     echo "ERR_CONFIG: 配置校验失败（该内核无法使用当前配置）:"
     tail -5 "$RUNDIR/test.log" 2>/dev/null
     return 1
   fi
+  rm -f "$VERIFY_PENDING" "$VERIFY_FAIL" 2>/dev/null
   echo "$_vc_fp" > "$TESTED"
   echo "配置校验通过"
+  return 0
+}
+
+# 预热：配置一落盘就在后台把 mihomo -t 跑掉，用户随后点「重载/启动」时命中缓存。
+# 不取生命周期锁——它不启停任何进程，只是算一个缓存；占着锁反而会让紧随其后的
+# 重载命令撞 ERR_BUSY。并发由 verify_join 的 single-flight 保证只跑一份。
+verify_prewarm() {
+  mkdir -p "$RUNDIR" 2>/dev/null
+  [ -x "$(core_path)" ] || return 0
+  verify_config >/dev/null 2>&1
+  return 0
+}
+
+# 后台预热（脱离调用方会话，不阻塞返回）
+verify_prewarm_async() {
+  [ "${MH_NO_PREWARM:-0}" = "1" ] && return 0
+  if command -v setsid >/dev/null 2>&1; then
+    setsid sh "$0" verify-prewarm </dev/null >/dev/null 2>&1 &
+  else
+    nohup sh "$0" verify-prewarm </dev/null >/dev/null 2>&1 &
+  fi
   return 0
 }
 
@@ -2133,32 +2226,61 @@ detach_pid() {
   return 0
 }
 
-# 端口监听判定（复用 tproxy 的 /proc/net 扫描逻辑，轻量，零外部依赖）
-# $1=端口数字 → 0=已监听（TCP LISTEN 0A 或 UDP 已绑定 07）
+# 端口 → 四位大写十六进制（零 fork）。
+# /proc/net/tcp 里的端口就是这种大写形式；以前每轮轮询都 printf 两次，
+# 启动等待环 12 跳 = 24 次 fork，慢设备上白付小半秒。现在一次算好反复用。
+_hex4() {
+  HEX4=""
+  _h4_n=$1
+  _h4_i=0
+  while [ "$_h4_i" -lt 4 ]; do
+    case $(( ( _h4_n >> (12 - _h4_i * 4) ) & 15 )) in
+      0) _h4_c=0 ;; 1) _h4_c=1 ;; 2) _h4_c=2 ;; 3) _h4_c=3 ;;
+      4) _h4_c=4 ;; 5) _h4_c=5 ;; 6) _h4_c=6 ;; 7) _h4_c=7 ;;
+      8) _h4_c=8 ;; 9) _h4_c=9 ;; 10) _h4_c=A ;; 11) _h4_c=B ;;
+      12) _h4_c=C ;; 13) _h4_c=D ;; 14) _h4_c=E ;; 15) _h4_c=F ;;
+    esac
+    HEX4="$HEX4$_h4_c"
+    _h4_i=$((_h4_i + 1))
+  done
+}
+
+# /proc/net/tcp{,6} 扫描（纯内建读，零 fork）。$1=四位大写十六进制端口，
+# $2 为空 → 0=该端口已监听/已绑定；$2=inode → 把命中条目的 socket inode 放进
+# _SPS_INODE（空格分隔），能命中返回 0。语义与旧 awk 版逐条对齐：跳表头；状态取
+# 末两位（8x 归一成 0x）后命中 0A（LISTEN）/07（UDP 已绑定）即算「端口在用」。
+# 内核输出恒为大写十六进制（Android / OpenWrt 同），不再做小写兜底。
+_sc_port_scan() {
+  _sps_hex=$1; _sps_want=${2:-}
+  _SPS_INODE=""
+  for _sps_n in /proc/net/tcp /proc/net/tcp6; do
+    [ -r "$_sps_n" ] || continue
+    while read -r _sps_a _sps_b _sps_c _sps_st _sps_q _sps_tm _sps_rt _sps_uid _sps_to _sps_ino _sps_rest; do
+      case "$_sps_a" in sl|Sl|Sl:) continue ;; esac
+      case "$_sps_b" in *":$_sps_hex") ;; *) continue ;; esac
+      _sps_s=$_sps_st
+      while [ ${#_sps_s} -gt 2 ]; do _sps_s=${_sps_s#?}; done   # 取末两位（防御异常长字段）
+      case "$_sps_s" in 8*) _sps_s=0${_sps_s#?} ;; esac
+      case "$_sps_s" in
+        0A|07)
+          if [ "$_sps_want" = inode ]; then
+            _SPS_INODE="$_SPS_INODE $_sps_ino"
+          else
+            return 0
+          fi ;;
+      esac
+    done < "$_sps_n"
+  done
+  [ "$_sps_want" = inode ] || return 1
+  _SPS_INODE=${_SPS_INODE# }
+  [ -n "$_SPS_INODE" ]
+}
+
+# 端口监听判定。$1=端口数字 → 0=已监听（TCP LISTEN 0A 或 UDP 已绑定 07）
 _sc_port_listening() {
   case "$1" in ''|*[!0-9]*) return 1 ;; esac
-  _spl_hx=$(printf '%04X' "$1" 2>/dev/null)
-  _spl_lo=$(printf '%04x' "$1" 2>/dev/null)
-  [ -n "$_spl_hx" ] || return 1
-  # 纯内建读 /proc/net/tcp{,6}，零 fork：本函数在启动等待环里每 0.1s 就调一次，
-  # 每次 fork 一个 awk 在慢设备上白付 20~50ms/跳（12 跳就是小半秒）。语义与旧
-  # awk 版逐条对齐：跳表头；端口十六进制忽略大小写命中；状态取末两位（8x 归一
-  # 成 0x）后命中 0A（LISTEN）/07 即认为端口在用。
-  for _spl_n in /proc/net/tcp /proc/net/tcp6; do
-    [ -r "$_spl_n" ] || continue
-    while read -r _spl_a _spl_b _spl_c _spl_st _spl_rest; do
-      case "$_spl_a" in sl|Sl|Sl:) continue ;; esac
-      case "$_spl_b" in
-        *":$_spl_hx"|*":$_spl_lo") ;;
-        *) continue ;;
-      esac
-      _spl_s=$_spl_st
-      while [ ${#_spl_s} -gt 2 ]; do _spl_s=${_spl_s#?}; done   # 取末两位（防御异常长字段）
-      case "$_spl_s" in 8*) _spl_s=0${_spl_s#?} ;; esac
-      case "$_spl_s" in 0A|07) return 0 ;; esac
-    done < "$_spl_n"
-  done
-  return 1
+  _hex4 "$1"
+  _sc_port_scan "$HEX4"
 }
 
 # 从 config.yaml 解析 external-controller 端口（兼容 0.0.0.0:9090 / :9090 / [::]:9090 / http://...）
@@ -2325,23 +2447,33 @@ prepare_proxy_mode() {
 # 路径开头（setsid exec 后的裸启动形态），或含「setuidgid <uid:gid> 内核路径」
 # （Tproxy 模式的 busybox 包装形态，个别 busybox 版本 setuidgid 不 exec、路径
 # 留在参数里）。仅是「参数文本里引用了内核路径」的无关进程不会被误杀。
-# 优先用 pgrep 一次完成（可用时零逐进程 fork）；系统缺 pgrep 时回退 /proc 全扫。
+# 实现：纯内建读 /proc（零 fork）。
+#   · 先读 comm（<=15 字节，内核只保留文件名前缀）：三种内核名都以 mihomo- 开头，
+#     一次读就能筛掉 99% 的无关进程，且不需要 pgrep；
+#   · comm 命中后再读 cmdline 核对 $COREDIR 路径，避免误杀同名无关进程；
+#   · 每种内核名长度不同，comm 被截断也没关系（只看前缀）。
+# 为什么不用 pgrep：Android 的 toybox pgrep -f 要对每个进程做完整 cmdline 匹配，
+# 慢设备上单次 30~80ms，而这段代码在每次 start/stop 的关键路径上；系统缺 pgrep
+# 时的旧兜底更是逐进程 fork 一个 tr（300+ 次 fork，秒级）。全内建扫一遍约 300 次
+# read，通常 <20ms。
 core_stale_pids() {
   _csp_out=""
-  if command -v pgrep >/dev/null 2>&1; then
-    _csp_out=$( { pgrep -f "^$COREDIR/mihomo-" 2>/dev/null;
-                  pgrep -f "setuidgid [0-9:]+ $COREDIR/mihomo-" 2>/dev/null; } | tr '\n' ' ')
-    _csp_out=${_csp_out% }
-  else
-    for _csp_p in /proc/[0-9]*; do
-      _csp_n=${_csp_p#/proc/}
-      [ "$_csp_n" = "$$" ] && continue
-      case "$(tr '\0' ' ' < "$_csp_p/cmdline" 2>/dev/null)" in
-        "$COREDIR/mihomo-"*|*setuidgid\ *"$COREDIR/mihomo-"*) _csp_out="$_csp_out $_csp_n" ;;
-      esac
-    done
-    _csp_out=${_csp_out# }
-  fi
+  for _csp_p in /proc/[0-9]*; do
+    _csp_n=${_csp_p#/proc/}
+    [ "$_csp_n" = "$$" ] && continue
+    _csp_comm=""
+    IFS= read -r _csp_comm 2>/dev/null < "$_csp_p/comm" || continue
+    case "$_csp_comm" in mihomo-*) ;; *) continue ;; esac
+    _csp_cmd=""
+    IFS= read -r _csp_cmd 2>/dev/null < "$_csp_p/cmdline" || continue
+    case "$_csp_cmd" in
+      "$COREDIR/mihomo-"*) ;;
+      *"setuidgid"*"$COREDIR/mihomo-"*) ;;
+      *) continue ;;
+    esac
+    _csp_out="$_csp_out $_csp_n"
+  done
+  _csp_out=${_csp_out# }
   [ -n "$_csp_out" ] && printf '%s\n' "$_csp_out"
   return 0
 }
@@ -2457,8 +2589,16 @@ _start_core_body() {
     #     不可用（/proc 格式差异等），不再干等 4s 上限，1.2s 活着就按成功返回——
     #     与老判据同等置信度。总开关最坏 1.2s 就能看到结果；期间进程一退出立刻判失败。
   _sc_port=$(_sc_ctl_port)
-  _sc_port_free=0
-  if [ -n "$_sc_port" ] && ! _sc_port_listening "$_sc_port" 2>/dev/null; then _sc_port_free=1; fi
+  # 就绪判据（照 Mishka 的思路：「便宜的本机事实」当判据，昂贵的判活尽量少做）：
+  #   拉起前记下该端口上所有 LISTEN 条目的 socket inode（一次 /proc 扫描，零 fork），
+  #   拉起后一旦出现「不属于这批旧 inode」的 LISTEN 条目，就一定是本次内核开的端口
+  #   —— 立刻判就绪。以前只要「拉起前端口已在监听」就整轮退回「存活 ≥1.2s」的
+  #   粗判据（重载时旧内核刚退出、端口处于半关状态就会命中这条路径），白白多等
+  #   1.2 秒；现在端口被谁占着都不影响判断。
+  _sc_hx=""
+  [ -n "$_sc_port" ] && { _hex4 "$_sc_port"; _sc_hx=$HEX4; }
+  _sc_ino_before=""
+  if [ -n "$_sc_hx" ] && _sc_port_scan "$_sc_hx" inode; then _sc_ino_before=" $_SPS_INODE "; fi
   # setsid 让内核脱离 WebUI 的会话/进程组（管理器被系统回收时不会连带杀掉），不存在时回退 nohup
   if command -v setsid >/dev/null 2>&1; then
     setsid $_sc_pre "$core" -d "$WORKDIR" -f "$CONFIG" </dev/null >> "$LOGFILE" 2>&1 &
@@ -2474,25 +2614,38 @@ _start_core_body() {
   if [ "${MH_QUICK_START:-0}" = "1" ]; then
     kill -0 "$pid" 2>/dev/null && alive=1
   fi
-  # 4 秒上限以 now_cs 真实时钟为准（nap 取整成 1s 时轮数与时长解耦）
+  # 时限全部以 now_cs 真实时钟为准（nap 取整成 1s 时轮数与时长解耦）。
+  # 轮询节奏：前 600ms 用 20ms 细粒度，之后退到 100ms 直到兜底上限。
+  # 600ms 而不是更短，是因为真机上内核开控制器端口通常落在 0.3~0.6s：
+  # 细粒度的每次探测只是读 /proc/net/tcp（纯内建、约 2ms、零 fork），
+  # 拿它换「就绪判定不多等半个 100ms 间隔」是稳赚的；超过 600ms 仍没就绪
+  # 说明是慢启动（大配置/拉 provider），这时再把节奏放粗，别空转烧 CPU。
   if now_cs; then
-    _sc_dl=$((NOW_CS + 400))
+    _sc_dl=$((NOW_CS + 400))          # 4s 绝对上限
+    _sc_dl12=$((NOW_CS + 120))        # 1.2s 存活兜底（端口判定不可用时）
   else
-    _sc_dl=0
+    _sc_dl=0; _sc_dl12=0
   fi
   while [ "$alive" != "1" ]; do
     kill -0 "$pid" 2>/dev/null || break                   # 进程已退出：立即判失败
-    if [ "$_sc_port_free" = "1" ]; then
-      _sc_port_listening "$_sc_port" 2>/dev/null && { alive=1; break; }
+    if [ -n "$_sc_hx" ] && _sc_port_scan "$_sc_hx" inode; then
+      # 新出现的 inode = 本次内核的 listener
+      for _sc_i in $_SPS_INODE; do
+        case "$_sc_ino_before" in
+          *" $_sc_i "*) ;;                                # 拉起前就有的旧 listener，不是我们的
+          *) alive=1; break ;;
+        esac
+      done
+      [ "$alive" = "1" ] && break
     fi
     if [ "$_sc_dl" = "0" ]; then
       [ $t -ge 12 ] && { alive=1; break; }                # 无时钟兜底：存活 ≥1.2s（旧判据）
     else
       now_cs
       [ "$NOW_CS" -ge "$_sc_dl" ] && { alive=1; break; }   # 存活 ≥4s：无条件兜底判成功
-      [ $t -ge 12 ] && { alive=1; break; }                 # 存活 ≥1.2s：无条件兜底判成功（含端口判定不可用的场景）
+      [ "$NOW_CS" -ge "$_sc_dl12" ] && { alive=1; break; } # 存活 ≥1.2s：无条件兜底判成功（含端口判定不可用的场景）
     fi
-    nap 0.1; t=$((t + 1))
+    if [ $t -lt 30 ]; then nap 0.02; else nap 0.1; fi; t=$((t + 1))
   done
   # 到达上限仍存活：视为启动成功（配置特别大/首次拉取 provider 的慢启动场景）
   [ "$alive" = "0" ] && kill -0 "$pid" 2>/dev/null && alive=1
@@ -2579,7 +2732,10 @@ _stop_core_body() {
         now_cs
         [ "$NOW_CS" -ge "$_st_dl" ] && break
       fi
-      nap 0.05; _st_ticks=$((_st_ticks + 1))
+      # 前 200ms 用 20ms 粒度：内核收到 SIGTERM 普遍在 0.2~0.6s 内退出，
+      # 50ms 粒度在「重载」里平均多等 25ms、最坏 50ms，白付在每一次重启上。
+      if [ "$_st_ticks" -lt 10 ]; then nap 0.02; else nap 0.05; fi
+      _st_ticks=$((_st_ticks + 1))
     done
     if pid_is_live "$pid"; then
       kill -9 "$pid" 2>/dev/null
@@ -2679,6 +2835,51 @@ _restart_core_body() {
 #   · 全部失败：摘掉接管规则，保证至少能正常上网，并留下 run/boot.log 供排查。
 _bl() { printf '%s %s\n' "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$*" >> "$RUNDIR/boot.log" 2>/dev/null; }
 
+# ---------------- 网络就绪（开机路径专用，零 fork） ----------------
+# 旧实现是 `ping -c 1 -W 2 223.5.5.5` 循环 45 次：单轮最多 2 秒 + 一次 fork，
+# 最坏要 90 秒；ICMP 被运营商/校园网拦掉时**必然**跑满 90 秒才继续开机，这段
+# 时间里内核一直不启动。现在先读内核自己的事实：
+#   · /proc/net/route       出现默认路由（Destination/Mask 全 0）
+#   · /proc/net/ipv6_route  出现 ::/0 默认路由
+# 全是内建读，出现即视为网络层就绪（毫秒级）。拿到默认路由后可选再补一次
+# ICMP 确认（MH_NET_PING=1，默认关）——它只是加分项，超时也不阻塞启动：
+# 真起不来由 boot_supervise 重试，不该让「网络静默丢 ICMP」拖住整个开机。
+net_default_route() {
+  if [ -r /proc/net/route ]; then
+    while read -r _ndr_if _ndr_dst _ndr_gw _ndr_fl _ndr_rc _ndr_us _ndr_me _ndr_mask _ndr_rest; do
+      case "$_ndr_if" in Iface|iface) continue ;; esac
+      [ -n "$_ndr_mask" ] || continue
+      case "$_ndr_dst$_ndr_mask" in 0000000000000000) return 0 ;; esac
+    done < /proc/net/route
+  fi
+  if [ -r /proc/net/ipv6_route ]; then
+    while read -r _ndr6_dst _ndr6_plen _ndr6_rest; do
+      case "$_ndr6_dst" in
+        00000000000000000000000000000000) case "$_ndr6_plen" in 00) return 0 ;; esac ;;
+      esac
+    done < /proc/net/ipv6_route
+  fi
+  return 1
+}
+
+# 等待网络就绪：$1=最长秒数（可空，默认 MH_NET_WAIT 或 20）。0=就绪，1=超时。
+# 轮询 0.2s 起，1 秒后放宽到 0.5s —— 开机时默认路由通常 1 秒内就出现。
+wait_net_ready() {
+  _wn_max=${1:-${MH_NET_WAIT:-20}}
+  case "$_wn_max" in ''|*[!0-9]*) _wn_max=20 ;; esac
+  now_cs || { _wn_max=0; }
+  _wn_dl=$((NOW_CS + _wn_max * 100))
+  _wn_i=0
+  while :; do
+    net_default_route && return 0
+    now_cs || break
+    [ "$NOW_CS" -ge "$_wn_dl" ] && break
+    if [ "$_wn_i" -lt 5 ]; then nap 0.2; else nap 0.5; fi
+    _wn_i=$((_wn_i + 1))
+  done
+  return 1
+}
+
 # 内核就绪：$1=控制器端口（可空）$2=最长等待秒数。0=就绪，1=进程已退出/超时。
 _boot_wait_ready() {
   _bw_port=$1; _bw_max=$2; _bw_t=0
@@ -2748,7 +2949,7 @@ boot_supervise() {
   if [ "$_bs_ok" = "1" ]; then
     # 内核就绪可能比 start_core 里那轮对账（约 6 秒）更晚：补一次接管规则对账
     if tunhs_tun_enabled || [ "$(get_setting tproxy false)" = "true" ] || [ -f "$TUNHS_STATE" ] || [ -f "$TP_STATE" ]; then
-      ( sh "$0" tun-hotspot-sync >/dev/null 2>&1; sh "$0" tproxy-sync >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+      sh "$0" net-sync </dev/null >/dev/null 2>&1 &
     fi
     sync_state_desc
     ( boot_data_sync ) >/dev/null 2>&1 &
@@ -8489,8 +8690,7 @@ _switch_loop() {
       _sw_netnow=""
       [ -f "$IPV6_NET" ] && _sw_netnow=$(cat "$IPV6_NET" 2>/dev/null)
       if [ "$_sw_netnow" != "$_sw_netprev" ] || [ -z "$_sw_netprev" ]; then
-        sh "$0" tun-hotspot-sync >/dev/null 2>&1
-        sh "$0" tproxy-sync >/dev/null 2>&1
+        sh "$0" net-sync >/dev/null 2>&1
         _sw_slow=0
       else
         # 稳态兜底：每 ~60s 一次快轮（_SW_QUICK=1 跳过 iptables/ip rule 抽查，
@@ -8499,8 +8699,7 @@ _switch_loop() {
         _sw_slow=$((${_sw_slow:-0} + 1))
         if [ "$_sw_slow" -ge 12 ]; then
           _sw_slow=0
-          _SW_QUICK=1 sh "$0" tun-hotspot-sync >/dev/null 2>&1
-          _SW_QUICK=1 sh "$0" tproxy-sync >/dev/null 2>&1
+          _SW_QUICK=1 sh "$0" net-sync >/dev/null 2>&1
         fi
       fi
     fi
@@ -9418,32 +9617,56 @@ case "$cmd" in
   # Tproxy 透明代理：开关主流程 / 手动对账 / 查看状态
   tproxy-set)    tproxy_apply "$1" "$2"; _tp_rc=$?; [ $_tp_rc -eq 0 ] && live_invalidate 2>/dev/null; exit $_tp_rc ;;
   tproxy-sync)   tproxy_sync && echo "OK: 已对账 $(tproxy_status_short)" ;;
+  net-sync)
+    # 一次进程内跑完两组规则对账（TUN 热点转发 + TProxy）。以前各处都是
+    # `sh $0 tun-hotspot-sync; sh $0 tproxy-sync` 连拉两次，每拉一次都要重新
+    # 解析一份 9000+ 行的脚本（慢设备 100~200ms），两者之间还白等一个进程启动。
+    # _SW_QUICK=1 由调用方通过环境变量传入，两个函数各自识别（跳过抽查的全量轮）。
+    tun_hotspot_sync >/dev/null 2>&1
+    tproxy_sync >/dev/null 2>&1
+    exit 0 ;;
   tproxy-status) tproxy_status ;;
   tproxy-diag)   tproxy_diag ;;
   boot)
-    # 无守护进程：仅按 autostart 设置决定开机是否直接启动内核
-    system_ipv6_sync >/dev/null 2>&1   # 系统 IPv6 开关开机即生效（之后由监听循环维持）
-    # 面板先于内核拉起：面板只是一个 HTTP 服务，不依赖内核或网络。内核启动
-    # （start_core 的校验与等待）可能耗时数十秒，放在它后面会让「重启后面板
-    # 打不开」。下方原位置保留一次：本次已在运行时短路返回，失败时再试一次。
+    # 无守护进程：仅按 autostart 设置决定开机是否直接启动内核。
+    # 整条开机链在这里一次跑完（面板 → 网络门槛 → 内核 → 开关监听），
+    # service.sh 只调用一次本命令：每多调一次 `sh mihomo.sh` 都要重新解析
+    # 一份 9000+ 行的脚本，慢设备上单次 100~200ms，纯属白付。
+    action_clock; MH_ACTION_BEGIN=$ACTION_MS
+    # 面板先于一切拉起：面板只是一个 HTTP 服务，不依赖内核、IPv6 或网络。
+    # 系统 IPv6 对账（含 APN 协议改写，真机上要 fork 十几次 settings/ip 命令，
+    # 首次接管可达数百毫秒）排在它后面 —— 否则开机后要多等这一整段才能打开面板。
+    # 内核启动（校验与等待）也同理，放在面板后面。
     [ -f "$MODDIR/disable" ] || web_start >/dev/null 2>&1
+    action_mark boot_web_ready
+    system_ipv6_sync >/dev/null 2>&1   # 系统 IPv6 开关开机即生效（之后由监听循环维持）
+    action_mark boot_ipv6_ready
+    setting_v autostart true; _bt_auto=$SV
     _bt_sup=0
-    if [ "$(get_setting autostart true)" = "true" ]; then
-      if [ -x "$(core_path)" ]; then
-        boot_first_start
-        _bt_sup=1
+    if [ "$_bt_auto" = "true" ] && [ -x "$(core_path)" ]; then
+      # 网络门槛：只等「默认路由出现」（/proc 内建读，通常 1 秒内），而不是
+      # ping 循环最多 90 秒。默认路由都没有时内核的订阅/provider 必然拉不动；
+      # 但也不必等 ICMP 通 —— 真起不来由 boot_supervise 退避重试兜底。
+      if wait_net_ready "${MH_BOOT_NET_WAIT:-20}"; then
+        action_mark boot_net_ready
       else
-        echo "boot: 无内核，跳过自启"
-        sync_state_desc
+        action_mark boot_net_timeout
+        echo "boot: 等待默认路由超时（继续启动内核，由其自身重试）"
       fi
+      boot_first_start
+      _bt_sup=1
+    elif [ "$_bt_auto" = "true" ]; then
+      echo "boot: 无内核，跳过自启"
+      sync_state_desc
     else
       echo "boot: 自启已关闭"
       sync_state_desc
     fi
     switch_start >/dev/null 2>&1
     # 面板 HTTP 服务：模块启用即随开机拉起（管理器界面 + 浏览器共用）。
-    # 模块被停用时 disable 标记仍在，此时不该起服务 —— 开关监听会在
-    # 用户重新启用模块后自动补起来。
+    # 上面已经起过一次（本次在运行时短路返回）；这里只兜「内核拉起期间面板
+    # 挂了」的情况。模块被停用时 disable 标记仍在，此时不该起服务 —— 开关
+    # 监听会在用户重新启用模块后自动补起来。
     if [ ! -f "$MODDIR/disable" ]; then
       web_start >/dev/null 2>&1
     fi
@@ -9544,11 +9767,19 @@ case "$cmd" in
     esac
     set_setting "$1" "$2" || exit 1
     live_invalidate 2>/dev/null
+    # 后台预热配置校验：设置改动可能连带配置文件变化，随后的「重载/启动」就不必
+    # 在关键路径上再跑一遍 mihomo -t（见 verify_prewarm_async）
+    verify_prewarm_async
     ( boot_data_sync ) >/dev/null 2>&1 &
     echo "OK"
     # 热点共享代理开关变化 → 立即对账装卸规则（后台执行，不阻塞返回；
     # 开关监听循环的周期对账会兜底，这里只是让切换即时生效）
     [ "$1" = "hotspot_proxy" ] && tun_hotspot_sync >/dev/null 2>&1 & ;;
+  verify-prewarm)
+    # 内部命令：配置落盘后由前端/其它命令在后台调用，把 mihomo -t 挪出关键路径。
+    # 结果只写缓存（tested.fp / verify.fail），任何时候都能安全地重复调用。
+    verify_prewarm
+    exit 0 ;;
   test)
     core=$(core_path)
     if [ ! -x "$core" ]; then echo "ERR_NO_CORE: 内核不存在"; exit 1; fi
@@ -9604,23 +9835,28 @@ case "$cmd" in
     echo "cancelled"
     ( kill_stale_fetchers ) </dev/null >/dev/null 2>&1 &
     ;;
-  import-core)   import_core "$@"; _ic_rc=$?; [ $_ic_rc -eq 0 ] && live_invalidate 2>/dev/null; exit $_ic_rc ;;
+  import-core)   import_core "$@"; _ic_rc=$?; [ $_ic_rc -eq 0 ] && live_invalidate 2>/dev/null; [ $_ic_rc -eq 0 ] && verify_prewarm_async; exit $_ic_rc ;;
   check-env)     check_env ;;
   wait-net)
-    # 等网络就绪，最多约 90 秒
-    i=0
-    while [ $i -lt 45 ]; do
-      ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1 && { echo "network ready"; exit 0; }
-      sleep 2; i=$((i+1))
-    done
+    # 等网络就绪。判据是内核路由表里的默认路由（零 fork），不再死等 ICMP：
+    # 旧实现 ping 循环 45×2s，ICMP 被拦时必然跑满 90 秒。$1 可指定上限秒数。
+    if wait_net_ready "${1:-}"; then echo "network ready"; exit 0; fi
     echo "network wait timeout"; exit 0 ;;
   api)
     api "$@"
     _api_rc=$?
+    # 切模式走执行桥时，调用方会把 MH_API_MODE 带进来：说明这次 PATCH 改的是
+    # 运行模式，首屏快照（内嵌整份 status，含旧 mode）已经过期，就地作废 ——
+    # 反正脚本已经在跑，一次 rm 等于免费；直连 HTTP 时前端用一条 fire-and-forget
+    # 的 rm 达到同样效果，都不必再为此单独拉一次 shell。
+    case "${MH_API_MODE:-}" in
+      rule|global|direct)
+        [ "$_api_rc" = "0" ] && [ "$1" = "PATCH" ] && [ "$2" = "/configs" ] && rm -f "$BOOT_DATA_CACHE" 2>/dev/null ;;
+    esac
     # 配置热重载可能切换 TUN / 改 TProxy 端口：后台延时几秒重查热点转发与
     # Tproxy 规则（TUN 网卡重建、TProxy 端口重新监听都需要一点时间）
     if [ "$1" = "PUT" ] && [ "$2" = "/configs" ]; then
-      ( sleep 3; sh "$0" tun-hotspot-sync >/dev/null 2>&1; sh "$0" tproxy-sync >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+      ( sleep 3; sh "$0" net-sync </dev/null >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
     fi
     exit $_api_rc ;;
   switch-mode)   switch_mode "$1" ;;
