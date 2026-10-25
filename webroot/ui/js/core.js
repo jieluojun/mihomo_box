@@ -169,6 +169,15 @@ export async function writeB64(path, b64) {
 }
 
 // 写文本文件（分块 base64，避免超长命令）
+// 配置写入后的后台校验预热：把 mihomo -t（大配置 1~3 秒）从「保存 → 重载/启动」
+// 的关键路径上挪走。fire-and-forget：不 await、不上报失败——它只是提前把
+// run/tested.fp 缓存算好，真失败时随后的启动会照常报错。
+export function prewarmVerify() {
+  if (DEMO) return;
+  shell(`( setsid ${SH} verify-prewarm </dev/null >/dev/null 2>&1 & ) || `
+    + `( nohup ${SH} verify-prewarm </dev/null >/dev/null 2>&1 & )`).catch(() => {});
+}
+
 export async function writeText(path, text) {
   if (DEMO) { localStorage.setItem(path === CONFIG_PATH ? 'demo-config' : 'demo-file:' + path, text); return { errno: 0 }; }
   return writeB64(path, b64encode(text));
@@ -4654,6 +4663,9 @@ export async function saveConfig({ silent, restart = false, afterWrite, requireR
     }
     const r = await writeText(CONFIG_PATH, text);
     if (r.errno !== 0) { uiToast('写入失败: ' + (r.stderr || '未知错误'), 3000); return false; }
+    // 配置刚落盘：后台预跑一次 mihomo -t，用户随后点「重载/启动」时直接命中校验
+    // 缓存（否则每次重载都要在关键路径上等 1~3 秒）。不阻塞保存。
+    prewarmVerify();
     // 写入期间若用户又修改，不可用旧快照覆盖新草稿，也不可误清「未保存」。
     const sameDraft = version === draftVersion && state.raw === text && !sourcePending;
     if (sameDraft) clearDirty();
