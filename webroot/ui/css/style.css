@@ -379,6 +379,10 @@ select { padding-right: 26px; appearance: none;
   white-space: nowrap;
 }
 .seg button.on { background: var(--card-2); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+/* 未运行 / 本卡切换在途：真正禁用（点不动）时必须看得出来，否则就是「点了没反应」 */
+.seg button:disabled { opacity: .45; }
+/* 其它操作在途（保存/重启）：只弱化，不禁用——点击会弹出具体原因 */
+.seg button.busy-blocked { opacity: .6; }
 
 /* 按钮 */
 .btn {

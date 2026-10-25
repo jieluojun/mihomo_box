@@ -97,7 +97,14 @@ function rerenderCurrentDeferred() {
     // 入站页的 TUN 卡片有「默认收起」的进入态；再次进入时必须重建，
     // 不能复用上次离开时已经展开的 DOM。
     if (pageIsFresh(current) && current !== 'page-c-inbound') {
-      if (current === 'page-dashboard') { startDashLogLoop(); refreshDashboardConnectionMode(); }   // 热缓存落地也立即采样
+      if (current === 'page-dashboard') {
+        startDashLogLoop(); refreshDashboardConnectionMode();   // 热缓存落地也立即采样
+        // 复用旧 DOM 时按钮态是上一次渲染时的快照：每次落地都按当前护栏重算一次，
+        // 别让「保存/重启期间渲染出来的禁用态」跟着缓存一起被复用。
+        paintDashboardProxyModeSelection();
+        syncServiceRestartButtons();
+        syncConfigTestButtons();
+      }
       afterRenderSettle();
       return;
     }
@@ -1448,16 +1455,24 @@ window.__mbBeginOpToast = beginOpToast;
 window.__mbToastUpDone = toastUpDone;
 window.__mbToastDoneFallback = toastDoneFallback;
 async function restartDashboardService() {
-  if (serviceRestartBusy || serviceRestartChain || svcBusy) { uiToast('服务操作正在进行，请稍候'); return; }
+  // state.saveBusy 也要算进来：入站页启用 TUN/eBPF 后的「保存并重启」在途时再点重启，
+  // 两条链会抢同一把生命周期锁，且先跑完的那条会被后一条的启动空窗盖掉。
+  if (serviceRestartBusy || serviceRestartChain || svcBusy || state.saveBusy) {
+    uiToast(serviceRestartChain || serviceRestartBusy ? '服务正在重启，请稍候'
+      : state.saveBusy ? '正在保存配置，完成后再重启服务' : '服务操作正在进行，请稍候', 2600);
+    return;
+  }
   if (!state.status?.running) { uiToast('服务未运行，请使用总开关启动'); return; }
   serviceRestartBusy = true;
   serviceRestartChain = true;
-  syncServiceRestartButtons();
-  uiToast('正在重启服务…');
-  // 即时绘制新 PID；可再次操作的时点以已释放后端锁的轻量 ACK 为准。
-  cueServiceRestartUI();
   let acknowledged = false;
+  // 护栏置起后的一切都在 try 里（含首帧按钮态/提示）：任何一处抛异常都必须走到
+  // finally 复位，不能让 serviceRestartChain 永久停在 true 把主页所有点击挡住。
   try {
+    syncServiceRestartButtons();
+    uiToast('正在重启服务…');
+    // 即时绘制新 PID；可再次操作的时点以已释放后端锁的轻量 ACK 为准。
+    cueServiceRestartUI();
     await waitForConfigTestPaint();
     const restarted = await restartService();
     acknowledged = true;
@@ -1780,9 +1795,36 @@ function proxyModeLabel(st) {
   if (st && on(st.tproxy)) return 'tproxy';
   return configuredProxyModeLabel(state.cfg);
 }
+// 主页「代理模式」卡的按钮态必须随时可从当前护栏重算：
+// 卡片是在某一次渲染时按当时的 svcBusy / serviceRestartBusy / serviceRestartChain /
+// state.saveBusy 算出 disabled 的，而这些标志位可能在「别处」（入站页启用 TUN/eBPF →
+// 保存 → 重启）被置起，随后又在一次不触发状态签名变化的收尾里清除。此时页面里留着
+// 一批 disabled 的按钮，点上去连 click 都不会派发 —— 用户看到的就是「点了没有任何反应」。
+// 所以：① 只有本卡自己的切换在途（proxyModeBusy）才禁用，其它在途一律允许点击并给出
+// 明确提示；② 任何护栏释放时（mihomo-service-idle、草稿变更、重启收尾）都重算一次。
+function dashboardProxyModeBlocked() {
+  return proxyModeBusy || svcBusy || serviceRestartBusy || serviceRestartChain || state.saveBusy;
+}
+// 具体到「卡在哪一步」的提示文案：分不清原因的「请稍候」等于没说。
+function dashboardProxyModeGuardMessage() {
+  if (proxyModeBusy) return '正在切换代理模式，请稍候';
+  if (state.saveBusy) return '正在保存配置，完成后再切换代理模式';
+  if (serviceRestartBusy || serviceRestartChain) return '服务正在重启，完成后再切换代理模式';
+  if (svcBusy) return '服务启停进行中，完成后再切换代理模式';
+  return '';
+}
+function syncDashboardProxyModeButtons() {
+  document.querySelectorAll('#page-dashboard [data-proxy-mode]').forEach(button => {
+    button.disabled = !!proxyModeBusy;
+    button.setAttribute('aria-busy', String(!!proxyModeBusy));
+    // 其它在途只做视觉弱化，不禁用：点了会走护栏 toast，不再出现「静默无反应」。
+    button.classList.toggle('busy-blocked', !proxyModeBusy && !!dashboardProxyModeBlocked());
+  });
+}
 function paintDashboardProxyModeSelection() {
   const switching = proxyModeBusy && !!proxyModeTarget;
   const selected = proxyModeLabel(state.status);
+  syncDashboardProxyModeButtons();
   document.querySelectorAll('#page-dashboard [data-proxy-mode]').forEach(button => {
     const on = button.dataset.proxyMode === selected;
     button.classList.toggle('on', on); button.setAttribute('aria-pressed', String(on));
@@ -1800,25 +1842,39 @@ window.addEventListener('mihomo-service-idle', () => {
 
 async function switchDashboardProxyMode(mode) {
   if (!['tun', 'ebpf', 'tproxy'].includes(mode)) return;
-  if (proxyModeBusy || svcBusy || serviceRestartBusy || serviceRestartChain || state.saveBusy) {
-    uiToast('服务操作正在进行，请稍候'); return;
+  // 被护栏挡下时必须说清「为什么」，绝不静默 return：入站页启用 TUN/eBPF 会留下
+  // 保存/重启链，用户随后回主页点其它模式，以前只会得到一句笼统的「请稍候」，
+  // 慢设备上看起来就跟没反应一样。
+  const blocked = dashboardProxyModeGuardMessage();
+  if (blocked) { uiToast(blocked, 2800); return; }
+  let token;
+  try {
+    // 捕获快照会 flush 焦点里的输入框；任何一处抛异常都不能让点击静默失效。
+    token = captureServiceConfigToken();
+  } catch (e) {
+    uiToast('代理模式切换失败：' + ((e && e.message) || e) + '；可先保存或放弃未保存的配置再试', 4600);
+    return;
   }
-  const token = captureServiceConfigToken();
   if (token.dirty || token.pending || state.cfgError) {
     uiToast('请先保存或放弃未保存的配置，再切换代理模式', 3800); return;
   }
   if (mode === 'ebpf' && state.status?.core === 'official') {
     uiToast('官方内核不支持 eBPF，请先切换到 jieluojun 或 liuran001 内核', 3800); return;
   }
-  if (proxyModeLabel(state.status) === mode && state.status?.running) return;
+  if (proxyModeLabel(state.status) === mode && state.status?.running) {
+    uiToast('当前已是 ' + ({ tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy' }[mode]) + ' 模式', 1600); return;
+  }
   if (DEMO) { uiToast('演示模式无法切换设备代理方式'); return; }
   proxyModeTarget = mode;
   proxyModeBusy = true;
   serviceRestartChain = true;
-  setSaveBarSuppressed(true);
-  syncServiceRestartButtons();
-  rerenderCurrent();
+  // 护栏置起之后的每一步都放在 try 里：以前首帧重绘在 try 之外，一旦它抛异常，
+  // proxyModeBusy / serviceRestartChain 就永远停在 true —— 主页所有代理模式、
+  // 运行模式、重启服务的点击从此全被挡住，只能重进面板，看起来就是「点了没反应」。
   try {
+    setSaveBarSuppressed(true);
+    syncServiceRestartButtons();
+    rerenderCurrent();
     if (mode !== 'tproxy') {
       if (!setEbpfEnabled(mode === 'ebpf', { bothRoles: mode === 'ebpf' })
         || !setTunListenerEnabled(mode === 'tun')
@@ -1849,10 +1905,14 @@ function dashboardProxyModeCard(st) {
   box.append(h('div', { class: 'card-head' }, h('h3', { text: '代理模式' }),
     h('span', { class: 'badge b', text: switching ? '切换中…' : '草稿 · 未应用', hidden: !state.dirty && !switching, dataset: { proxyModeDraft: '1' } })));
   const selected = proxyModeLabel(st);
-  const busy = proxyModeBusy || svcBusy || serviceRestartBusy || serviceRestartChain || state.saveBusy;
+  const blockedNow = !proxyModeBusy && !!dashboardProxyModeBlocked();
   const buttons = [['tun', 'TUN'], ['ebpf', 'eBPF'], ['tproxy', 'Tproxy']].map(([value, label]) => {
-    const button = h('button', { type: 'button', text: label, class: selected === value ? 'on' : '',
-      style: 'flex:1', disabled: !!busy, 'aria-pressed': String(selected === value),
+    const button = h('button', { type: 'button', text: label,
+      class: (selected === value ? 'on' : '') + (blockedNow ? ' busy-blocked' : ''),
+      style: 'flex:1',
+      // 只有本卡的切换在途才禁用：其它在途（保存/重启）允许点击，由护栏给出具体提示，
+      // 避免出现「按钮看着能点、点了什么都没有」的死区。
+      disabled: !!proxyModeBusy, 'aria-pressed': String(selected === value),
       'aria-busy': String(proxyModeBusy), dataset: { proxyMode: value } });
     button.addEventListener('click', () => switchDashboardProxyMode(value));
     return button;
@@ -2039,7 +2099,12 @@ function renderDashboard(el) {
   let curMode = st.mode || state.cfg.mode || 'rule';
   if (running && modeOverride && String(modeOverride.pid) === String(st.pid)) curMode = modeOverride.mode;
   const doSwitchMode = async (v, b) => {
-    if (modeBusy || proxyModeBusy || svcBusy || serviceRestartBusy || serviceRestartChain || state.saveBusy || v === curMode) return;
+    // v === curMode 是「点当前模式」：无动作也不提示。其余在途状态必须给一句原因，
+    // 否则用户只感到「点不动」——与代理模式卡同一个坑。
+    if (v === curMode) return;
+    if (modeBusy || state.saveBusy || serviceRestartBusy || serviceRestartChain || svcBusy || proxyModeBusy) {
+      uiToast(dashboardProxyModeGuardMessage() || '模式切换正在进行，请稍候', 2800); return;
+    }
     modeBusy = true;
     let id = ++modeRequestId;
     b.setAttribute('aria-busy', 'true');
