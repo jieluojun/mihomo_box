@@ -209,14 +209,22 @@ jobs:
           [ "$c" -le 2147483647 ] || { echo "::error::versionCode 超出 Int32：$c"; exit 1; }
           echo "包内版本: $v (versionCode=$c)"
 
-          # 面板资源戳必须已烘焙成本次戳（源码里是 __PANEL_VER__ 占位）
+          # 面板资源戳必须已烘焙成本次戳（源码里是 ?v=__PANEL_VER__ 占位）。
+          # 注意只查「?v=__PANEL_VER__」完整形式：index.html 顶部注释里出现的是
+          # 裸的占位名，按裸名查会把正常烘焙的包误判成没烘焙。
           unzip -q -o "$ZIP" webroot/ui/index.html -d "$RUNNER_TEMP/x"
-          if grep -q '__PANEL_VER__' "$RUNNER_TEMP/x/webroot/ui/index.html"; then
+          IDX="$RUNNER_TEMP/x/webroot/ui/index.html"
+          if grep -q '?v=__PANEL_VER__' "$IDX"; then
             echo "::error::index.html 的 __PANEL_VER__ 占位未被烘焙，面板会带旧缓存"
             exit 1
           fi
-          grep -q "?v=$STAMP" "$RUNNER_TEMP/x/webroot/ui/index.html" || {
-            echo "::error::index.html 资源戳不是本次版本戳 $STAMP"; exit 1; }
+          BAD_STAMPS="$(grep -oE '\?v=[A-Za-z0-9_.-]+' "$IDX" | sort -u | grep -vxF "?v=$STAMP" || true)"
+          if [ -n "$BAD_STAMPS" ]; then
+            echo "::error::index.html 中存在非本次版本戳的资源 URL："
+            echo "$BAD_STAMPS"
+            exit 1
+          fi
+          echo "面板资源戳已烘焙：$(grep -oE '\?v=[A-Za-z0-9_.-]+' "$IDX" | sort -u | tr '\n' ' ')"
 
           # 源码树的占位必须已还原，下一次构建才能继续烘焙新戳
           grep -q '?v=__PANEL_VER__' webroot/ui/index.html || {
@@ -283,13 +291,14 @@ jobs:
           STAMP: ${{ steps.ver.outputs.stamp }}
           REPO: ${{ github.repository }}
           SKIP_UPDATE_COMMIT: ${{ vars.SKIP_UPDATE_COMMIT }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           if [ "${SKIP_UPDATE_COMMIT:-false}" = "true" ]; then
             echo "SKIP_UPDATE_COMMIT=true，跳过回写"
             exit 0
           fi
-          BRANCH="${{ github.event.repository.default_branch }}"
+          BRANCH="${DEFAULT_BRANCH:-main}"
 
           # build.sh 已在工作区生成 update.json 并改写 module.prop 的版本行
           [ -f update.json ] || { echo "::error::缺少 update.json"; exit 1; }
@@ -304,9 +313,11 @@ jobs:
 
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin "$BRANCH" --depth=1
-          # 以远端默认分支最新提交为基底，避免覆盖掉 tag 之后的新提交
-          git checkout -B "$BRANCH" "origin/$BRANCH"
+          git fetch origin "$BRANCH"
+          # 以远端默认分支最新提交为基底，避免覆盖掉 tag 之后的新提交。
+          # -f：build.sh 已就地改写了 update.json / module.prop（还有 CHANGELOG），
+          # 工作区是脏的，不加 -f 会以「本地改动将被覆盖」拒绝切分支。
+          git checkout -f -B "$BRANCH" "origin/$BRANCH"
           cp "$RUNNER_TEMP/release-files/"* .
 
           git add update.json CHANGELOG.md module.prop
