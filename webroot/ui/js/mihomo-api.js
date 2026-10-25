@@ -38,7 +38,13 @@ async function bridge(method, path, body, opts) {
   // Reuse the existing large-response protection on the new API bridge path.
   // Provider history can be megabytes and exhaust a native callback's payload budget.
   const trim = method === 'GET' && (path === '/proxies' || path === '/providers/proxies');
-  const cmd = `${trim ? 'MH_API_TRIM=1 ' : ''}MH_API_FAIL=1 MH_API_TIMEOUT=${timeout} ${SH} api ${method} ${shq(path)}`
+  // 切模式（PATCH /configs {mode}）顺带把「这次改的是运行模式」告诉脚本：它在
+  // 同一次进程里发完 PATCH 就顺手作废过期的首屏快照（run/boot_data.json 内嵌整份
+  // status，含旧 mode），前端不必再为这一条 rm 多拉一次 shell —— 慢设备上多一次
+  // 就是多解析一遍 9000+ 行的脚本。
+  const modeEnv = (method === 'PATCH' && path === '/configs' && body && typeof body.mode === 'string')
+    ? `MH_API_MODE=${shq(body.mode)} ` : '';
+  const cmd = `${trim ? 'MH_API_TRIM=1 ' : ''}${modeEnv}MH_API_FAIL=1 MH_API_TIMEOUT=${timeout} ${SH} api ${method} ${shq(path)}`
     + (body !== undefined ? ' ' + shq(JSON.stringify(body)) : '');
   let timer;
   let r;

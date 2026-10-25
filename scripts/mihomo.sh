@@ -861,17 +861,27 @@ verify_config() {
   fi
   _vc_fp=$(config_fingerprint)
   _vc_waited=0
+  _vc_claimed=0
   while :; do
     if [ "$_vc_fp" = "$(cat "$TESTED" 2>/dev/null)" ]; then
       echo "配置未变更，跳过校验"
       return 0
     fi
     if verify_fail_cached "$_vc_fp"; then return 1; fi
+    # 原子抢占「正在校验」标记：`set -C`（noclobber）让「确认不存在 + 创建」变成
+    # 一次 O_EXCL 打开。保存后的后台预热与紧随其后的重载/重启几乎同时进来，
+    # 若两边都只看到「还没人校验」就各跑一遍 mihomo -t，两份 -t 抢 CPU，
+    # 实测比单独跑一遍更慢 —— 单飞（single-flight）必须真的只有一份。
+    if ( set -C; printf '%s %s\n' "$_vc_fp" "$$" > "$VERIFY_PENDING" ) 2>/dev/null; then
+      _vc_claimed=1
+      break
+    fi
     [ "$_vc_waited" = "1" ] && break         # 合并过一次仍无结论：自己跑
-    verify_join "$_vc_fp" || break
     _vc_waited=1
+    verify_join "$_vc_fp" || break           # 等持有者的结论；持有者已死则自己跑
   done
-  printf '%s %s\n' "$_vc_fp" "$$" > "$VERIFY_PENDING" 2>/dev/null
+  # 没抢到标记（残留文件 / 等不到结论）也要把自己的 pid 写上，让后来者能 join 我们。
+  [ "$_vc_claimed" = "1" ] || printf '%s %s\n' "$_vc_fp" "$$" > "$VERIFY_PENDING" 2>/dev/null
   if ! run_timeout "${MH_VERIFY_TIMEOUT:-30}" "$_vc_core" -t -d "$WORKDIR" -f "$CONFIG" > "$RUNDIR/test.log" 2>&1; then
     rm -f "$VERIFY_PENDING" 2>/dev/null
     { printf '%s\n' "$_vc_fp"; tail -6 "$RUNDIR/test.log" 2>/dev/null; } > "$VERIFY_FAIL" 2>/dev/null
@@ -9835,6 +9845,14 @@ case "$cmd" in
   api)
     api "$@"
     _api_rc=$?
+    # 切模式走执行桥时，调用方会把 MH_API_MODE 带进来：说明这次 PATCH 改的是
+    # 运行模式，首屏快照（内嵌整份 status，含旧 mode）已经过期，就地作废 ——
+    # 反正脚本已经在跑，一次 rm 等于免费；直连 HTTP 时前端用一条 fire-and-forget
+    # 的 rm 达到同样效果，都不必再为此单独拉一次 shell。
+    case "${MH_API_MODE:-}" in
+      rule|global|direct)
+        [ "$_api_rc" = "0" ] && [ "$1" = "PATCH" ] && [ "$2" = "/configs" ] && rm -f "$BOOT_DATA_CACHE" 2>/dev/null ;;
+    esac
     # 配置热重载可能切换 TUN / 改 TProxy 端口：后台延时几秒重查热点转发与
     # Tproxy 规则（TUN 网卡重建、TProxy 端口重新监听都需要一点时间）
     if [ "$1" = "PUT" ] && [ "$2" = "/configs" ]; then

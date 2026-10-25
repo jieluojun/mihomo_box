@@ -148,7 +148,12 @@ function b64encode(str) {
 }
 
 // 写 base64（支持二进制；分块避免超长命令；自动创建父目录）
-export async function writeB64(path, b64) {
+//
+// options.prelude：拼在同一个 shell 命令最前面的前置动作（用 `;` 分隔，失败也
+// 不影响写入）。保存配置时把「备份旧配置」塞进来 —— 它本来就只靠先后顺序保证
+// 语义（备份必须先于覆盖），分开调就是白多一趟执行桥往返：慢设备上每趟
+// 200~400ms（CGI fork + 解析整份 mihomo.sh），而备份+写盘+mv 合成一次就够。
+export async function writeB64(path, b64, options = {}) {
   if (DEMO) { localStorage.setItem('demo-file:' + path, 'B64:' + b64); return { errno: 0 }; }
   path = absPath(path);
   const dir = path.replace(/\/[^/]*$/, '');
@@ -156,16 +161,20 @@ export async function writeB64(path, b64) {
   // 直接写目标的话，shell 的 `>` 在命令执行前就会把目标清空（配置会被截成 0 字节）。
   const tmp = path + '.wtmp';
   const step = 40000;
-  for (let i = 0; i === 0 || i < b64.length; i += step) {   // 空内容也要建出空文件
-    const part = b64.slice(i, i + step);
-    const pre = i === 0 ? `mkdir -p "${dir}" && ` : '';
-    const redir = i === 0 ? '>' : '>>';
-    const r = await shell(`${pre}echo -n '${part}' | base64 -d ${redir} "${tmp}"`);
+  const total = Math.max(1, Math.ceil(b64.length / step));
+  // 前置动作只挂在第一块上，且用 `;` 而不是 `&&`：备份本身失败（比如没有 xargs）
+  // 不能把写盘一起带走 —— 与旧行为一致（旧代码也没检查备份的退出码）。
+  const prelude = options.prelude ? String(options.prelude).replace(/;?\s*$/, '; ') : '';
+  for (let k = 0; k < total; k++) {
+    const part = b64.slice(k * step, (k + 1) * step);
+    const head = k === 0 ? `${prelude}mkdir -p "${dir}" && ` : '';
+    const redir = k === 0 ? '>' : '>>';
+    // 最后一块顺手 mv：它必须紧跟在最后一块之后，单拎出来就是多一趟往返。
+    const tail = k === total - 1 ? ` && mv -f "${tmp}" "${path}"` : '';
+    const r = await shell(`${head}echo -n '${part}' | base64 -d ${redir} "${tmp}"${tail}`);
     if (r.errno !== 0) { await shell(`rm -f "${tmp}"`); return r; }
   }
-  const m = await shell(`mv -f "${tmp}" "${path}"`);
-  if (m.errno !== 0) await shell(`rm -f "${tmp}"`);
-  return m.errno === 0 ? { errno: 0 } : m;
+  return { errno: 0 };
 }
 
 // 写文本文件（分块 base64，避免超长命令）
@@ -178,9 +187,9 @@ export function prewarmVerify() {
     + `( nohup ${SH} verify-prewarm </dev/null >/dev/null 2>&1 & )`).catch(() => {});
 }
 
-export async function writeText(path, text) {
+export async function writeText(path, text, options = {}) {
   if (DEMO) { localStorage.setItem(path === CONFIG_PATH ? 'demo-config' : 'demo-file:' + path, text); return { errno: 0 }; }
-  return writeB64(path, b64encode(text));
+  return writeB64(path, b64encode(text), options);
 }
 
 // 追加写（不覆盖）：同样走 base64，中文/引号/换行都不会被 shell 吃掉
@@ -4656,13 +4665,26 @@ export async function saveConfig({ silent, restart = false, afterWrite, requireR
     // 保存是唯一落盘边界：此时 raw 与面板已一致，不在这里才改锚点/生成另一份不可见配置。
     const text = state.raw, version = draftVersion;
     const layer = draftLayer, debug = draftDebug;
+    let backupCmd = '';
     if (!DEMO) {
       const ts = new Date();
       const stamp = `${ts.getFullYear()}${String(ts.getMonth()+1).padStart(2,'0')}${String(ts.getDate()).padStart(2,'0')}-${String(ts.getHours()).padStart(2,'0')}${String(ts.getMinutes()).padStart(2,'0')}${String(ts.getSeconds()).padStart(2,'0')}`;
-      await shell(`mkdir -p "${WORKDIR}/backup"; cp "${CONFIG_PATH}" "${WORKDIR}/backup/config-${stamp}.yaml" 2>/dev/null; ls -1t ${WORKDIR}/backup/config-*.yaml 2>/dev/null | tail -n +8 | xargs rm -f 2>/dev/null`);
+      // 备份与写盘合成一次执行桥往返（见 writeB64 的 prelude）：
+      // 「代理模式」切换这类操作本来就要 3~4 趟桥往返，每趟慢设备 200~400ms，
+      // 能并进同一趟就别串成一趟。
+      backupCmd = `mkdir -p "${WORKDIR}/backup"; cp "${CONFIG_PATH}" "${WORKDIR}/backup/config-${stamp}.yaml" 2>/dev/null; ls -1t ${WORKDIR}/backup/config-*.yaml 2>/dev/null | tail -n +8 | xargs rm -f 2>/dev/null`;
     }
-    const r = await writeText(CONFIG_PATH, text);
+    const writeStarted = performance.now();
+    const r = await writeText(CONFIG_PATH, text, backupCmd ? { prelude: backupCmd } : {});
     if (r.errno !== 0) { uiToast('写入失败: ' + (r.stderr || '未知错误'), 3000); return false; }
+    // 写盘现在把「备份旧配置 + 分块写入 + mv 覆盖」合成一趟执行桥往返，所以这段
+    // 耗时就是「代理模式」切换里除重启之外的全部前置开销，值得留一条痕迹：
+    // 真机上排查「保存/切换怎么这么慢」时，一看日志就知道卡在写盘还是重启。
+    uiLog('debug', '配置写盘耗时', {
+      roundtrip_ms: Math.round(performance.now() - writeStarted),
+      bytes: text.length,
+      chunks: Math.max(1, Math.ceil(b64encode(text).length / 40000)),
+    });
     // 配置刚落盘：后台预跑一次 mihomo -t，用户随后点「重载/启动」时直接命中校验
     // 缓存（否则每次重载都要在关键路径上等 1~3 秒）。不阻塞保存。
     prewarmVerify();
