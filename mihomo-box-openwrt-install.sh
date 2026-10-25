@@ -256,9 +256,11 @@ extract_package() {
   # （刷机安装器 / KSU·Magisk 生命周期脚本 / Android dex 组件 / 面板 Java 工具源码）
   rm -rf "$PKG_ROOT/tests" "$PKG_ROOT/.github" "$PKG_ROOT/node_modules" \
          "$PKG_ROOT/META-INF" "$PKG_ROOT/webroot/tools" 2>/dev/null
-  rm -f "$PKG_ROOT/.gitignore" "$PKG_ROOT/.gitattributes" \
+  # 仓库文档与安装/构建脚本同样不落盘：新版包已在打包时排除（build.sh 的 -x 清单），
+  # 这里保留是为了兼容旧版本 zip（旧包里还带着这些文件）。
+  rm -f "$PKG_ROOT/.gitignore" "$PKG_ROOT/.gitattributes" "$PKG_ROOT/README.md" \
         "$PKG_ROOT/update.json" "$PKG_ROOT/CHANGELOG.md" "$PKG_ROOT/UPDATE.md" \
-        "$PKG_ROOT/build.sh" \
+        "$PKG_ROOT/build.sh" "$PKG_ROOT/mihomo-box-openwrt-install.sh" \
         "$PKG_ROOT/customize.sh" "$PKG_ROOT/post-fs-data.sh" "$PKG_ROOT/service.sh" \
         "$PKG_ROOT/action.sh" "$PKG_ROOT/uninstall.sh" "$PKG_ROOT/scripts/app-info.dex" 2>/dev/null
   find "$PKG_ROOT" \( -name '*.zip' -type f -o -name __pycache__ -o -name node_modules \) \

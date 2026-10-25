@@ -61,6 +61,9 @@ tag 名必须是 `v` + `YYYYMMDD-HHMM`。CI 会用这个版本戳构建，因此
 VERSION_STAMP=20261026-0128 sh build.sh "本版本更新说明"
 ```
 
+> 模块包只装运行时文件：`build.sh`、`mihomo-box-openwrt-install.sh`、`README.md`、`.gitignore`
+> 以及 `.github/`、`tests/`、`update.json`、`CHANGELOG.md` 都在打包时排除（`webroot/tools/` 下的模块内文档不受影响）。
+
 > 仓库里只有 `build.sh` 一个打包实现，CI 直接调用它；原先的 `scripts/publish-release.sh`
 > 已删除 —— 它推送当前分支，而 `updateJson` 固定指向 `main` 的 raw 链接，在特性分支上发版
 > 管理器模块页看不到更新。
