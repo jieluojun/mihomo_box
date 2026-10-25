@@ -755,24 +755,24 @@ function renderShell(el) {
     sync();
     menu.append(item);
   };
+  // 菜单顺序（用户指定）：显示图标 → 双列代理组 → 按提供商分组 →
+  // 显示最终出站 → 隐藏不可用节点 → 切换节点断开连接。
   addMenuItem('showIcons', '显示图标', null, () => renderProxyData(el));
+  // 双列代理组：zashboard 同款「双列显示代理组」。组卡按左右两列交错排布，
+  // 展开的组进居中浮层（zashboard 移动端 modal 同款），收起后原位放回。
+  // 从单列切到双列时同理清掉展开记录（见模块顶部注释）：单列的「内联展开」
+  // 和双列的「弹浮层」不是一回事，切过去不该让浮层凭空弹出来。
+  addMenuItem('twoColumn', '双列代理组', null, () => {
+    if (proxyPrefs.twoColumn && openGroups.size) { openGroups.clear(); saveState('open-groups', []); }
+    renderProxyData(el);
+  });
+  addMenuItem('groupByProvider', '按提供商分组', null, () => renderProxyData(el));
   // zashboard 同款「显示最终出站」：组头「当前：A」后面再跟「→ 叶子节点」，
   // 组里套组时一眼看出真正从哪个节点出去。
   addMenuItem('showFinalOutbound', '显示最终出站', null, () => renderProxyData(el));
   // 不可用节点数挂在「隐藏不可用节点」项上：勾上后被筛掉多少节点一眼可见。
   // 始终统计全部展示组，跨组/别名按既有节点身份去重。
   addMenuItem('hideDead', '隐藏不可用节点', deadCountEl, () => renderProxyData(el));
-  addMenuItem('groupByProvider', '按提供商分组', null, () => renderProxyData(el));
-  // 双列代理组：zashboard 同款「双列显示代理组」。组卡按左右两列交错排布，
-  // 展开的组进居中浮层（zashboard 移动端 modal 同款），收起后原位放回。
-  // 从单列切到双列时同理清掉展开记录（见模块顶部注释）：单列的「内联展开」
-  // 和双列的「弹浮层」不是一回事，切过去不该让浮层凭空弹出来。
-  // 排在「按提供商分组」下面：它只改组卡的摆法，跟着分组项一起属于「布局」，
-  // 与上面几项「显示什么」的筛选类选项分开。
-  addMenuItem('twoColumn', '双列代理组', null, () => {
-    if (proxyPrefs.twoColumn && openGroups.size) { openGroups.clear(); saveState('open-groups', []); }
-    renderProxyData(el);
-  });
   addMenuItem('disconnectOnSwitch', '切换节点断开连接', null, null);
   menuWrap.append(menuBtn, menu);
   // 三个功能按钮不再占页面工具栏，统一挂到顶栏的代理页专用容器；
