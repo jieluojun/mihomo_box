@@ -1670,7 +1670,7 @@ html.proxy-modal-open, html.proxy-modal-open body { overflow: hidden; }
 /* Checkbox filters should not inherit the text-input blue focus frame. */
 .proxy-switch input:focus { box-shadow: none; outline: none; }
 .proxy-switch:has(input:focus-visible) { outline: 1px dashed var(--text-3); outline-offset: 2px; }
-/* 开关里的数量标签（「隐藏不可用 7」）：开关关着时是中性数字，勾上后转强调色，
+/* 开关里的数量标签（「隐藏不可用节点 7」）：开关关着时是中性数字，勾上后转强调色，
    一眼能看出这条筛选把多少节点藏了起来。 */
 .proxy-filter-count {
   display: inline-flex; align-items: center; justify-content: center;
