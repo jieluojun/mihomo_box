@@ -6805,44 +6805,26 @@ _tproxy_apply_body() {
     *) echo "ERR: 参数只能是 true / false"; return 1 ;;
   esac
   if [ "$_ta_w" = "true" ]; then
-    # 1) 识别端口：找不到直接拒绝，不写设置、不动配置
-    _ta_det=$(tproxy_detect)
-    _ta_port=$(printf '%s\n' "$_ta_det" | awk '{print $1}')
+    # ★开启 Tproxy 与主页「代理模式 → Tproxy」用同一条后端链，不再维护第二套：
+    #   restart-json tproxy → _restart_core_body tproxy 里依次做
+    #   端口识别 → 能力探测 → 配置手术（关 TUN / 注释 TUN 监听器 / 关 eBPF 角色）
+    #   → verify_config → 写还原点与指纹 → set_setting tproxy true → 停/启内核
+    #   （新内核按 root:3005 身份拉起）→ 规则对账。
+    #   历史教训：这里原先是另一套顺序（先落设置再手术、不校验、失败不收规则），
+    #   于是同一次「开 Tproxy」在两个入口得到不同结果——设置里开经常整机断网，
+    #   主页切同一个模式却正常。现在只做转发：任何修复只改 _restart_core_body 一处。
+    _ta_port=$(tproxy_detect | awk '{print $1}')
     if [ -z "$_ta_port" ]; then
       echo "ERR: 未在配置中找到 TProxy 端口。请先在「配置 → 入站」里设置 TProxy 端口（tproxy-port）或添加 tproxy 类型监听器，保存后再开启本开关"
       return 1
     fi
-    # 2) 能力探测：不通过同样拒绝，防止装上无法旁路内核自身的回环规则导致断网
-    tproxy_probe || return 1
-    # 3) 配置手术（关 TUN；首次开启记录原值，关闭开关时据此还原）
-    #    ★顺序必须与主页「代理模式 → Tproxy」（restart-json tproxy）一致：
-    #      先手术、再校验、再落设置、最后停/启内核。
-    #      以前这里先 `set_setting tproxy true` 再做手术：从设置落盘到内核重启之间
-    #      有几百毫秒到数秒的空档，此时「开关监听循环」的 net-sync 已经看到
-    #      「tproxy=开 + 内核在跑 + 端口在听」，于是按**旧内核身份 / 旧配置**抢先
-    #      算出期望态并装好 TPROXY 规则；紧接着 stop/start 让内核换成 root:3005 的
-    #      新实例，规则与内核身份/配置对不上，规则又指向一个正在重启的端口 ——
-    #      表现就是「设置里开 Tproxy 大概率整机没网，主页切 Tproxy 却正常」。
-    _ta_keep_cfg=0
-    if [ "$(get_setting tproxy false)" = "true" ] && [ -f "$TP_CFG" ] \
-       && [ "$(config_fingerprint)" = "$(cat "$RUNDIR/tproxy.config.fp" 2>/dev/null)" ]; then
-      _ta_keep_cfg=1
+    if ! restart_core tproxy; then
+      echo "ERR: Tproxy 开启失败（配置校验未通过或内核未确认运行，已拆除转发规则）；修正配置后重试，或关闭本开关还原 TUN 配置"
+      return 1
     fi
-    prepare_proxy_mode tproxy || return 1
-    # 3b) 新配置先校验（与重启路径一致）：不通过就原样退出——不落设置、不动旧内核，
-    #     用户看到一句 ERR 即可，绝不会出现「设置已开、配置是坏的、内核还没换」的
-    #     半成品状态。
-    if [ "${MH_SKIP_VERIFY:-0}" != "1" ]; then
-      verify_config || return 1
-    fi
-    # 3c) 记录还原点（首次开启时的 tun_before / 被注释的 TUN 监听器条数）
-    if [ "$_ta_keep_cfg" != 1 ]; then
-      printf 'tun_before=%s\nlistener_marked=%s\nport=%s\n' \
-        "$_pm_tp_before" "$_pm_tp_marked" "$_pm_port" > "$TP_CFG" || return 1
-    fi
-    config_fingerprint > "$RUNDIR/tproxy.config.fp" || return 1
-    # 3d) 设置最后才置位：此时配置已就绪，watcher 任何时刻对账都算出同一份期望态
-    set_setting tproxy true
+    # 内核已就绪且端口在听：立刻对账一次，规则当场装好，不必等后台循环第一拍
+    tproxy_sync >/dev/null 2>&1
+    _ta_port=$(tproxy_detect | awk '{print $1}')
     _ta_spec=$(tproxy_app_spec)
     _ta_mode=$(printf '%s\n' "$_ta_spec" | awk '{print $1}')
     _ta_cnt=$(printf '%s\n' "$_ta_spec" | awk '{print $2}')
@@ -6852,51 +6834,7 @@ _tproxy_apply_body() {
       exclude) _ta_appmsg="名单内 $_ta_cnt 个应用直连、其余走代理" ;;
       *) _ta_appmsg="全部应用经 Tproxy" ;;
     esac
-    tp_log "enable: port=$_ta_port（配置已关 TUN，并关闭 eBPF 入站的 local/shared.enable） app=$_ta_mode:$_ta_cnt"
-    # 4) 内核在跑 → 重启：TUN 关闭要生效，且内核需以 root:net_admin 身份
-    #    重新拉起（gid 旁路依赖它）
-    if running; then
-      stop_core keep >/dev/null 2>&1
-      if ! start_core; then
-        # 启动失败时绝不能把规则留在原地：TPROXY 跳转指向死端口等于整机断网
-        # （与 _restart_core_body 的失败收尾同款——先摘跳转，再后台全量清理）。
-        tproxy_unhook_quick 2>/dev/null
-        ( tproxy_sync ) </dev/null >/dev/null 2>&1 &
-        echo "ERR: 内核重启失败，已拆除 Tproxy 规则（开关保持开启，修正配置后会自动生效；关闭开关可还原）"
-        return 1
-      fi
-    fi
-    # 5) 立即尝试同步 TProxy 规则（端口一旦监听就直接装好并生成 $TP_STATE，免除等待延迟）
-    # 等待期只做廉价端口探测（tproxy_port_listening 一次 awk 读 /proc）：旧写法每 0.1s
-    # 甩一整轮 tproxy_sync（加锁 + 全量对账 + 应用名单时还要问一遍包管理器），端口没
-    # 就绪时白跑十几轮，是「启用 Tproxy 慢」的大头之一。端口就绪后一次对账装好。
-    _i=0
-    # 3 秒上限以 now_cs 真实时钟为准（nap 取整成 1s 时轮数与时长解耦）
-    now_cs
-    if [ "$NOW_CS" -gt 0 ]; then _ta_dl=$((NOW_CS + 300)); else _ta_dl=0; fi
-    while [ $_i -lt 30 ]; do
-      tproxy_port_listening "$_ta_port" 2>/dev/null && break
-      if [ "$_ta_dl" != "0" ]; then
-        now_cs
-        [ "$NOW_CS" -ge "$_ta_dl" ] && break
-      fi
-      nap 0.1
-      _i=$((_i+1))
-    done
-    tproxy_sync >/dev/null 2>&1
-    [ -f "$TP_STATE" ] || {
-      ( _i=0
-        while [ $_i -lt 12 ]; do
-          sh "$0" tproxy-sync >/dev/null 2>&1
-          if [ -f "$TP_STATE" ]; then
-            sh "$0" boot-data-sync >/dev/null 2>&1
-            sh "$0" live-invalidate >/dev/null 2>&1
-            break
-          fi
-          nap 0.5; _i=$((_i+1))
-        done
-      ) </dev/null >/dev/null 2>&1 &
-    }
+    tp_log "enable: port=$_ta_port（与主页代理模式同源：restart_core tproxy；配置已关 TUN 并关闭 eBPF 角色） app=$_ta_mode:$_ta_cnt"
     ( boot_data_sync ) >/dev/null 2>&1 &
     live_invalidate 2>/dev/null
     echo "OK: Tproxy 已开启，流量将导入端口 $_ta_port（配置中的 TUN 已关闭；$_ta_appmsg，名单复用 TUN 页设置）"
