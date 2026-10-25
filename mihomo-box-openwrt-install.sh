@@ -258,7 +258,7 @@ extract_package() {
          "$PKG_ROOT/META-INF" "$PKG_ROOT/webroot/tools" 2>/dev/null
   rm -f "$PKG_ROOT/.gitignore" "$PKG_ROOT/.gitattributes" \
         "$PKG_ROOT/update.json" "$PKG_ROOT/CHANGELOG.md" "$PKG_ROOT/UPDATE.md" \
-        "$PKG_ROOT/build.sh" "$PKG_ROOT/scripts/publish-release.sh" \
+        "$PKG_ROOT/build.sh" \
         "$PKG_ROOT/customize.sh" "$PKG_ROOT/post-fs-data.sh" "$PKG_ROOT/service.sh" \
         "$PKG_ROOT/action.sh" "$PKG_ROOT/uninstall.sh" "$PKG_ROOT/scripts/app-info.dex" 2>/dev/null
   find "$PKG_ROOT" \( -name '*.zip' -type f -o -name __pycache__ -o -name node_modules \) \

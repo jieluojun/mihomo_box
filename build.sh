@@ -22,8 +22,12 @@
 # —— 在线更新（root 管理器模块页）——
 # KernelSU / Magisk Delta / APatch 等管理器读取 module.prop 的 updateJson 字段，
 # 拉取 update.json 比对 versionCode，有新版本即在模块页显示「更新」，下载 zipUrl
-# 指向的 Release 资产刷入。发布 = git push（update.json/CHANGELOG.md）+ Release 挂 zip。
-# 一键发布：sh scripts/publish-release.sh（需 gh CLI 已登录），详见 UPDATE.md
+# 指向的 Release 资产刷入。
+# 发布只走 CI（.github/workflows/build.yml）：本脚本只负责「打包」，
+#   git tag vYYYYMMDD-HHMM && git push origin vYYYYMMDD-HHMM
+# 由 Actions 构建、建 Release（zip + sha256）、并把 update.json / module.prop /
+# CHANGELOG.md 回写到默认分支。本地不再提供一键发布脚本：它推送的是当前分支，
+# 而 updateJson 固定指向 main 的 raw 链接，在特性分支上发版管理器看不到更新。
 # ============================================================
 set -e
 cd "$(dirname "$0")"
@@ -259,10 +263,12 @@ fi
 
 cat <<EOF
 
-—— 发布在线更新（管理器模块页出现「更新」按钮需要三步）——
-  1) 提交并推送 update.json、CHANGELOG.md、module.prop 及源码改动到 $GITHUB_BRANCH 分支
-  2) 创建 Release：tag=$TAG
-  3) 把 $OUT 挂为 Release 资产（文件名保持 mihomo-box-$STAMP.zip，与 zipUrl 一致）
-一键发布（需 gh CLI 已登录）：sh scripts/publish-release.sh "$STAMP"
+—— 发布在线更新（管理器模块页出现「更新」按钮）——
+  只在本地打了包、还没发布时，按下面一条命令交给 CI 完成剩余全部步骤：
+      git tag -a $TAG -m "Mihomo Box $STAMP" && git push origin $TAG
+  CI 会：构建同样的包 → 创建 Release $TAG 并挂 zip/sha256 → 把 update.json、
+  module.prop、CHANGELOG.md 回写到 $GITHUB_BRANCH 分支。
+  注意：本地产物 $OUT 不参与发布（CI 在自己那边重建，保证可复现）。
+  若只想在本地验证打包结果，到此为止即可。
 EOF
 ls -la "$OUT"
