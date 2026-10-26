@@ -4630,7 +4630,12 @@ apn4_apply() {
   done <<EOF
 $_aa_rows
 EOF
-  [ "$_aa_changed" = "1" ] && apn4_reattach
+  if [ "$_aa_changed" = "1" ]; then
+    # 改写过的行刚变：APN 读取缓存立刻作废，否则前端「cached 秒画」会把改动前的
+    # 协议再显示一次（用户看到的就是「明明关了 IPv6，APN 还写着 IPv4/IPv6」）
+    rm -f "$APN4_CACHE" 2>/dev/null
+    apn4_reattach
+  fi
   return 0
 }
 
@@ -4654,7 +4659,11 @@ apn4_restore() {
     esac
   done < "$APN4_STATE"
   [ "$_ar_fail" = "0" ] && rm -f "$APN4_STATE" 2>/dev/null
-  [ "$_ar_changed" = "1" ] && apn4_reattach
+  if [ "$_ar_changed" = "1" ]; then
+    # 同 apn4_apply：还原后缓存必须作废，别让前端先画出还原前的协议
+    rm -f "$APN4_CACHE" 2>/dev/null
+    apn4_reattach
+  fi
   return 0
 }
 

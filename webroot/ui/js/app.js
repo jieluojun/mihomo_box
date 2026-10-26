@@ -434,22 +434,54 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
     return items.map(it => '首选 APN「' + String(it.apn || ('id=' + (it.id || '?'))) + '」：协议 '
       + apnProtoName(it.protocol) + '，漫游 ' + apnProtoName(it.roaming)).join('；');
   };
-  // 两段式：先用后端缓存秒开（纯文件读，不起 JVM），随后再真查一次刷新。
+  // 两段式：先用后端缓存秒开（纯文件读，不起 JVM），随后再真查刷新。
   // content 查询每次都要拉起一个 JVM（0.3~1s），等它回来才显示就等于「打开设置先卡一秒」。
-  const refreshApnStatus = async () => {
+  //
+  // opts.tries / opts.gap：刚切完系统 IPv6 时用「多读几轮」。原因是 APN 协议的改写
+  // 是 content update 写库 + 重新附着数据，库写进去到 content query 读出来之间可能
+  // 还有几秒延迟（甚至重启内核期间 JVM 起得很慢、一次 20s 超时被掐掉），只读一次就
+  // 很容易把改动前的协议留在界面上——用户看到的就是「关了 IPv6，APN 还写着 IPv4/IPv6」。
+  // opts.expect(txt)：这一轮读到什么才算「已经翻篇」（例如关掉 IPv6 时期望不再出现
+  // IPv6）。没有 expect 时退化成「连续两轮读数一致即稳定」，正常打开弹层只查一次。
+  const refreshApnStatus = async (opts) => {
+    const tries = Math.max(1, (opts && opts.tries) || 1);
+    const gap = (opts && opts.gap) || 1500;
+    const expect = (opts && opts.expect) || null;
     if (DEMO) { apnStatus.textContent = '首选 APN：演示模式下不可读取'; return; }
     let painted = false;
+    let cached = null;
     try {
       const c = await cmdline('apn4-json cached', { timeout: 5000 });
       const jc = parseJsonLoose(c && c.stdout);
-      if (jc && Array.isArray(jc.items) && jc.items.length) { apnStatus.textContent = apnLineText(jc); painted = true; }
+      if (jc && Array.isArray(jc.items) && jc.items.length) {
+        cached = apnLineText(jc); apnStatus.textContent = cached; painted = true;
+      }
     } catch (e) { /* 没有缓存就走真查 */ }
-    try {
-      const r = await cmdline('apn4-json refresh', { timeout: 20000 });
-      apnStatus.textContent = apnLineText(parseJsonLoose(r && r.stdout));
-    } catch (e) {
-      if (!painted) apnStatus.textContent = '首选 APN：读取失败';
+    let prev = null;
+    for (let i = 0; i < tries; i++) {
+      if (i > 0) {
+        // 弹层被关/被换掉就别再读了（节点还在，但已经没人看）
+        if (sheetClose && !sheetClose.isCurrent()) return;
+        await new Promise(res => setTimeout(res, gap));
+      }
+      let txt = '';
+      try {
+        const r = await cmdline('apn4-json refresh', { timeout: 20000 });
+        const j = parseJsonLoose(r && r.stdout);
+        if (j && j.ok) txt = apnLineText(j);
+      } catch (e) { /* 超时/被杀：下一轮再试 */ }
+      if (!txt) continue;
+      apnStatus.textContent = txt;
+      painted = true;
+      if (expect) {
+        if (expect(txt)) return;               // 已经读到期望的读数
+      } else {
+        if (prev !== null && txt === prev) return;          // 连续两轮一致＝稳定
+        if (i === 0 && tries > 1 && txt === cached) return; // 与缓存一致＝没变化
+      }
+      prev = txt;
     }
+    if (!painted) apnStatus.textContent = '首选 APN：读取失败';
   };
   // 诊断按钮工厂（Tproxy / TUN 热点各一个）：与配置源码弹窗一致的圆形诊断
   // 按钮（btn sm circle + 脉搏图标），放在各自开关的左旁。不生效时靠人猜很
@@ -734,8 +766,20 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             // 收尾只留 2.5s 补读短窗。Math.min：把本次 20s 长窗收回，避免一直挂着盖住
             // 之后真实的「已停止」显示；也不挤掉别处刚按下的更长静默窗。
             if (v6Quiet) restartQuietUntil = Math.min(restartQuietUntil, Date.now() + 2500);
-            // APN 协议刚被改写（关）或还原（开）：APN 状态行跟着刷新，不留旧读数
-            if (sheetClose && sheetClose.isCurrent()) void refreshApnStatus();
+            // APN 协议刚被改写（关）或还原（开）：APN 状态行跟着刷新，不留旧读数。
+            // 先把这一行改成「正在重新读取」，避免在 APN 库落盘 / 内核重启的几秒里
+            // 一直挂着改动前的协议（「关了系统 IPv6，APN 还写着 IPv4/IPv6」就是这么来的）；
+            // 随后多读几轮，读数稳定即停。
+            if (sheetClose && sheetClose.isCurrent()) {
+              const apnBefore = apnStatus.textContent;
+              apnStatus.textContent = '首选 APN：正在重新读取…';
+              // 关：APN 协议应变成仅 IPv4（读到不含 IPv6 的读数才算翻篇）；
+              // 开：协议按接管前的原值还原，读数与原读数不同即算翻篇。
+              void refreshApnStatus({
+                tries: 4, gap: 1800,
+                expect: v ? (t => t !== apnBefore) : (t => !/IPv6/i.test(t)),
+              });
+            }
           }
         });
         return sw;
