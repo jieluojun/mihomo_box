@@ -66,10 +66,31 @@ function b64decodeUtf8(b64) {
   return new TextDecoder().decode(bytes);
 }
 
-async function remoteExec(command, opts) {
-  // 默认 15s；启停/重启（含配置校验，慢设备上内核 -t 可达数十秒）等长命令
-  // 由调用方显式放宽 —— 通道层超时只决定「不等了」，绝不会重发。
-  const waitMs = Math.max(1, Number(opts && opts.timeout) || 15000);
+// 执行桥「还没开始执行命令」就把请求拒掉的状态码：请求体不完整 / 空 body /
+// 面板服务正在重建 / 临时目录不可用 / 解码失败。这些情况下 CGI 一定还没跑到
+// 执行那一步（见 webroot/ui/cgi-bin/exec.sh：所有 4xx/5xx 都发生在 sh 命令之前），
+// 所以重发一次是安全的 —— 「代理模式来回互切就报服务重启失败：HTTP 400」正是
+// 这条路径：长命令（restart-json）恰逢面板服务重建/请求体被截断，一次 400 就把
+// 整个操作判成失败。
+const EXEC_RETRY_STATUS = [400, 408, 413, 429, 500, 502, 503, 504];
+
+function execRetryable(status) { return EXEC_RETRY_STATUS.indexOf(status) >= 0; }
+
+// 从 CGI 的 JSON 错误体里取出人类可读原因（exec.sh 的 fail() 会写 {"error":"..."}）
+async function execErrorDetail(res) {
+  try {
+    const t = await res.text();
+    if (!t) return "";
+    try {
+      const j = JSON.parse(t);
+      return (j && (j.error || j.message)) ? String(j.error || j.message) : "";
+    } catch (e) {
+      return /^\s*</.test(t) ? "" : String(t).trim().slice(0, 120);
+    }
+  } catch (e) { return ""; }
+}
+
+async function remoteExecOnce(command, waitMs) {
   const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
   const timer = ctrl ? setTimeout(() => ctrl.abort(), waitMs) : null;
   try {
@@ -83,16 +104,50 @@ async function remoteExec(command, opts) {
       if (onUnauthorized) onUnauthorized();
       return { errno: -1, stdout: "", stderr: "NEED_TOKEN" };
     }
-    if (!res.ok) return { errno: -1, stdout: "", stderr: "HTTP " + res.status };
-    const j = await res.json();
+    if (!res.ok) {
+      const why = await execErrorDetail(res);
+      return {
+        errno: -1, stdout: "",
+        stderr: `执行桥 HTTP ${res.status}${why ? "（" + why + "）" : ""}`,
+        status: res.status, retryable: execRetryable(res.status),
+      };
+    }
+    const text = await res.text();
+    if (!text) {
+      // 200 却没有正文：CGI 被掐死（面板服务重建 / 连接被浏览器回收），同样可重发
+      return { errno: -1, stdout: "", stderr: "执行桥返回空响应（面板服务可能正在重启）", retryable: true };
+    }
+    let j = null;
+    try { j = JSON.parse(text); } catch (e) {
+      return { errno: -1, stdout: "", stderr: "执行桥响应无法解析（面板服务可能正在重启）", retryable: true };
+    }
     if (j.error) return { errno: -1, stdout: "", stderr: j.error };
     return { errno: j.errno, stdout: b64decodeUtf8(j.stdout_b64), stderr: b64decodeUtf8(j.stderr_b64) };
   } catch (e) {
+    // 网络层失败（含超时 abort）：命令可能已经跑了，绝不自动重发
     const msg = (e && e.name === "AbortError") ? `请求超时（${Math.round(waitMs / 1000)}s），请重试` : String(e);
     return { errno: -1, stdout: "", stderr: msg };
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+async function remoteExec(command, opts) {
+  // 默认 15s；启停/重启（含配置校验，慢设备上内核 -t 可达数十秒）等长命令
+  // 由调用方显式放宽 —— 通道层超时只决定「不等了」，绝不会重发。
+  const waitMs = Math.max(1, Number(opts && opts.timeout) || 15000);
+  let r = await remoteExecOnce(command, waitMs);
+  if (r && r.retryable) {
+    // 短退让后重发一次：面板服务重建通常只要几百毫秒
+    await new Promise(res => setTimeout(res, 260));
+    const r2 = await remoteExecOnce(command, waitMs);
+    if (r2 && r2.retryable) {
+      r2.stderr = r2.stderr.replace(/）$/, "") + "；已自动重试 1 次仍失败）";
+    }
+    r = r2;
+  }
+  if (r) delete r.retryable;
+  return r;
 }
 
 // 探测桥是否需要令牌（用于首屏决定是否弹输入页）

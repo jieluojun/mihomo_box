@@ -8851,6 +8851,8 @@ _switch_loop() {
   _prev_dis=""
   _prev_run=""
   _sw_ivt=0                    # 系统 IPv6 看门狗节拍：每 IPV6_TICK 秒对账一次
+  _sw_webt=0                   # 面板看门狗节拍
+  _sw_wmiss=0                  # 面板看门狗连续判死次数（两次才动手）
   sw_log "模块开关监听启动 pid=$$"
   rmdir "$DESC_LOCK" 2>/dev/null
   while :; do
@@ -8952,13 +8954,34 @@ _switch_loop() {
       if [ "$_dis" = "0" ]; then
         _sw_wpt=$(web_port)
         if ! web_running || ! _sc_port_listening "$_sw_wpt"; then
-          sw_log "面板看门狗：httpd 未在监听（端口 ${_sw_wpt:-?}），尝试重新拉起"
-          web_start >/dev/null 2>&1
-          if web_running && _sc_port_listening "$_sw_wpt"; then
-            sw_log "面板看门狗：httpd 已恢复监听"
+          # 先别急着重启：执行桥每处理一个请求都会 touch run/webui.cgi.alive，
+          # 它很新说明 httpd 正在正常干活，只是这一刻的判活采样没命中（长请求
+          # 期间 /proc 读取抖动）。这时重启 httpd 会把正在跑的长请求连回包一起
+          # 掐掉，前端只能看到「HTTP 400 / 空响应」——「切代理模式来回互切就报
+          # 服务重启失败」正是这么来的。
+          _sw_wa=""
+          [ -f "$RUNDIR/webui.cgi.alive" ] && _sw_wa=$(stat -c %Y "$RUNDIR/webui.cgi.alive" 2>/dev/null)
+          case "$_sw_wa" in ''|*[!0-9]*) _sw_wa=0 ;; esac
+          _sw_now=$(date +%s 2>/dev/null); case "$_sw_now" in ''|*[!0-9]*) _sw_now=0 ;; esac
+          if [ "$_sw_wa" -gt 0 ] && [ "$_sw_now" -gt 0 ] && [ $((_sw_now - _sw_wa)) -lt 90 ]; then
+            _sw_wmiss=0
           else
-            sw_log "WARN 面板看门狗：httpd 仍未恢复，30 秒后重试（详见 run/httpd.log）"
+            _sw_wmiss=$((_sw_wmiss + 1))
+            if [ "$_sw_wmiss" -lt 2 ]; then
+              sw_log "面板看门狗：判活未命中（端口 ${_sw_wpt:-?}），下一轮再确认"
+            else
+              _sw_wmiss=0
+              sw_log "面板看门狗：httpd 未在监听（端口 ${_sw_wpt:-?}），尝试重新拉起"
+              web_start >/dev/null 2>&1
+              if web_running && _sc_port_listening "$_sw_wpt"; then
+                sw_log "面板看门狗：httpd 已恢复监听"
+              else
+                sw_log "WARN 面板看门狗：httpd 仍未恢复，30 秒后重试（详见 run/httpd.log）"
+              fi
+            fi
           fi
+        else
+          _sw_wmiss=0
         fi
       fi
     fi
