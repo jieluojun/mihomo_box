@@ -1,10 +1,6 @@
 // Zashboard clash driver networkType = `${metadata.type} | ${getNetwork(c)}`.
-// The dashboard 「代理模式」 statistic shows the effective takeover mode from status
-// (the same source the mode buttons and the switch toast use). What this module
-// observes — the inbound types actually carrying traffic in the current /connections
-// snapshot — is only a note attached to that value (tooltip), never the mode itself:
-// a freshly switched kernel has no connections yet, so a connection-derived value
-// would read 「暂无连接」 right when the toast says the mode has changed.
+// The dashboard mode statistic uses ONLY the first field, aggregated across the
+// current /connections snapshot. Never infer a type from switches or config.
 export function summarizeConnectionTypes(data) {
   if (!data || !Array.isArray(data.connections)) throw new Error('连接列表无效');
   if (!data.connections.length) return { label: '暂无连接', types: [], count: 0 };

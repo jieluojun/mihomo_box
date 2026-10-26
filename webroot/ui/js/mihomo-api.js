@@ -119,11 +119,6 @@ export async function restartService({ transparentMode = null } = {}) {
       if (j && j.action_rc != null) error.actionResult = result;
       throw error;
     }
-    // 后端可能压根没重启内核（Tproxy 免重启接管）：把这一事实留给调用方，
-    // 让提示文案与实际发生的事对得上（不重启就不该说「重启」）。
-    try {
-      window.__mbCoreAttachedAt = (j && Number(j.core_attached) === 1) ? Date.now() : 0;
-    } catch (e) { /* 仅用于文案，失败不影响重启结果 */ }
     applyServiceConfigSnapshot(j, configToken);
     return result;
   } finally { lifecycleBusy = false; controller.reset(); }
