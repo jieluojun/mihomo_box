@@ -5677,9 +5677,9 @@ tproxy_probe() {
 tp_bypass_rule() {
   # $1 = iptables 命令（$TP_IPT 或 $TP_IP6T）  $2 = 链名  $3 = gid|uid
   if [ "$3" = "gid" ]; then
-    $1 -w -t mangle -A "$2" -m owner --uid-owner 0 --gid-owner "$TP_CORE_GID" -j RETURN 2>>"$TP_LOG"
+    tp_b_add "$1" "$2" -m owner --uid-owner 0 --gid-owner "$TP_CORE_GID" -j RETURN
   else
-    $1 -w -t mangle -A "$2" -m owner --uid-owner 0 -j RETURN 2>>"$TP_LOG"
+    tp_b_add "$1" "$2" -m owner --uid-owner 0 -j RETURN
   fi
 }
 
@@ -5905,6 +5905,21 @@ tproxy_iprule_clear() {
 tproxy_iprule_add() {
   # $1=ip 命令  $2=pref 列表（空格分隔）  其余参数原样传给 ip
   _ta_ip=$1; _ta_list=$2; shift 2
+  # 幂等优先：本模块的规则本来就在（重装/切端口/切名单都会走到这里）时直接复用
+  # 同一个优先级。以前是先 `rule add`（撞已存在）→ `rule show` → `rule del` →
+  # 再 `rule add`，多跑四个进程，而且删除到重建之间带 mark 的包会短暂丢路由
+  # ——切换瞬间的断流就是它。
+  _ta_show=$($_ta_ip "$@" rule show 2>/dev/null)
+  if [ -n "$_ta_show" ]; then
+    _ta_hit=$(printf '%s\n' "$_ta_show" | awk -v list="$_ta_list" -v m="$TP_MARK" -v t="$TP_TABLE" '
+      BEGIN { n = split(list, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+      { p = $1; sub(/:$/, "", p)
+        if ((p in want) && index($0, m) && index($0, "lookup " t)) print p }' | head -1)
+    if [ -n "$_ta_hit" ]; then
+      echo "$_ta_hit"
+      return 0
+    fi
+  fi
   for _ta_p in $_ta_list; do
     _ta_err=$($_ta_ip "$@" rule add pref "$_ta_p" fwmark "$TP_MARK" table "$TP_TABLE" 2>&1) && { echo "$_ta_p"; return 0; }
     printf '%s\n' "$_ta_err" >> "$TP_LOG" 2>/dev/null
@@ -5927,26 +5942,31 @@ tproxy_iprule_add() {
 # ICMPv6（RS/RA/NS/NA）与 DHCPv6 必须直连，否则网卡拿不到 GUA。
 # $1=ip6tables  $2=链名
 _ti_v6_nd_bypass() {
-  $1 -w -t mangle -A "$2" -p icmpv6 -j RETURN 2>>"$TP_LOG"
-  $1 -w -t mangle -A "$2" -p udp --dport 546 -j RETURN 2>/dev/null
-  $1 -w -t mangle -A "$2" -p udp --dport 547 -j RETURN 2>/dev/null
-  $1 -w -t mangle -A "$2" -p udp --sport 546 -j RETURN 2>/dev/null
-  $1 -w -t mangle -A "$2" -p udp --sport 547 -j RETURN 2>/dev/null
+  tp_b_add "$1" "$2" -p icmpv6 -j RETURN
+  tp_b_add "$1" "$2" -p udp --dport 546 -j RETURN
+  tp_b_add "$1" "$2" -p udp --dport 547 -j RETURN
+  tp_b_add "$1" "$2" -p udp --sport 546 -j RETURN
+  tp_b_add "$1" "$2" -p udp --sport 547 -j RETURN
   return 0
 }
 
 # 本机 GUA / ULA（xt_addrtype 在部分机没有，按 ip -6 addr 逐条 RETURN）
 _ti_v6_local_return() {
   [ -n "$TP_IP" ] || return 0
-  $TP_IP -6 addr show 2>/dev/null | while IFS= read -r _lr_l; do
+  # 循环不能放进管道子 shell：批量模式下规则是攒在变量里的，子 shell 里的
+  # 追加会随子 shell 一起丢掉（表现为这几条直连规则静默消失）。
+  _lr_all=$($TP_IP -6 addr show 2>/dev/null)
+  while IFS= read -r _lr_l; do
     case "$_lr_l" in *" inet6 "*) ;; *) continue ;; esac
     _lr_a=$(printf '%s\n' "$_lr_l" | awk '{print $2}')
     _lr_a=${_lr_a%%/*}
     case "$_lr_a" in
       ""|::|::1|fe80:*) continue ;;
     esac
-    $1 -w -t mangle -A "$2" -d "$_lr_a" -j RETURN 2>/dev/null
-  done
+    tp_b_add "$1" "$2" -d "$_lr_a" -j RETURN
+  done <<EOF
+$_lr_all
+EOF
   return 0
 }
 
@@ -5967,6 +5987,13 @@ tproxy_v6_unhook() {
       $TP_IP6T -w -t mangle -X "$_tv_c" 2>/dev/null
     done
   fi
+  tproxy_v6_unhook_routes
+  return 0
+}
+
+# 只回收 v6 的策略路由（ip rule + 路由表）。v6 跳转/链的清理与它分开：
+# 批量下发路径下跳转由事务里的 -D 处理，链由声明清空，这里只剩 ip 侧要动。
+tproxy_v6_unhook_routes() {
   if [ -n "$TP_IP" ]; then
     for _tv_p in "$TP_PREF" $TP_PREF_ALT; do
       tproxy_iprule_clear "$TP_IP" "$_tv_p" -6
@@ -5986,10 +6013,10 @@ _ti_app_rules() {
     case $_ti_u in ''|*[!0-9]*) continue ;; esac
     case $_ti_mode in
       exclude)
-        $1 -w -t mangle -A "$2" -m owner --uid-owner "$_ti_u" -j RETURN 2>>"$TP_LOG" || return 1 ;;
+        tp_b_add "$1" "$2" -m owner --uid-owner "$_ti_u" -j RETURN || return 1 ;;
       include)
-        $1 -w -t mangle -A "$2" -p tcp -m owner --uid-owner "$_ti_u" -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG" || return 1
-        $1 -w -t mangle -A "$2" -p udp -m owner --uid-owner "$_ti_u" -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG" || return 1 ;;
+        tp_b_add "$1" "$2" -p tcp -m owner --uid-owner "$_ti_u" -j MARK --set-xmark "$TP_MARK" || return 1
+        tp_b_add "$1" "$2" -p udp -m owner --uid-owner "$_ti_u" -j MARK --set-xmark "$TP_MARK" || return 1 ;;
     esac
     _ti_applied=$((_ti_applied + 1))
   done
@@ -6112,6 +6139,183 @@ tproxy_nft_apply() {
   return "$_tn_rc"
 }
 
+# ---------------- 批量下发（iptables-restore） ----------------
+# iptables 后端装一次规则要几十次 fork：每次 `iptables` 都要起进程、抢 xtables 锁、
+# 走一遍 netlink，手机上单次 40~100ms，四十来次就是好几秒 —— 这正是「切到 Tproxy
+# 之后要等很久才真正生效」的主因。这里把整份规则攒成一份 ruleset，用
+# `iptables-restore --noflush` 一个事务下发：
+#   · 链声明 `:CHAIN - [0:0]` 自带建链 + 清空，等价于原来的 -N 加 -F；
+#   · -A / -I / -D 都在同一事务里，整份规则原子生效，没有「链清了、规则还没加」
+#     的空窗；
+#   · 没有 iptables-restore（精简 busybox / 老固件）或某个版本不认这些行时，事务
+#     会失败 → 整体回退到逐条下发，行为与以前一致（TP_BULK=0）。
+TP_BULK=0                 # 1=攒批量 0=逐条下发
+TP_BULK_CHAINS4=""; TP_BULK_CHAINS6=""    # 待声明（建链+清空）的链
+TP_BULK_RULES4=""; TP_BULK_RULES6=""      # 待下发的规则行
+TP_BULK_DEL=""                            # 已排队的 -D（同一条跳转只删一次）
+
+# $1=iptables/ip6tables 路径 → stdout 打印同目录（或 PATH 里）的 *-restore
+tp_restore_bin() {
+  case "$1" in
+    *ip6tables*) _trb_n=ip6tables-restore ;;
+    *) _trb_n=iptables-restore ;;
+  esac
+  case "$1" in
+    */*) [ -x "${1%/*}/$_trb_n" ] && { printf '%s\n' "${1%/*}/$_trb_n"; return 0; } ;;
+  esac
+  command -v "$_trb_n" 2>/dev/null
+}
+
+
+# --noflush 是批量下发的前提：没有它 iptables-restore 会先清空整张 mangle 表
+# （别人的规则一并没了）。只在第一次用某个 restore 命令时问一次 --help 并缓存，
+# 问不到就当作不支持、退回逐条 —— 宁慢不炸。
+TP_BULK_OK_F=""
+TP_BULK_OK_MEMO=""
+tp_bulk_noflush_ok() {   # $1=restore 命令
+  [ -n "$1" ] || return 1
+  case " $TP_BULK_OK_MEMO " in *" $1 "*) return 0 ;; esac
+  TP_BULK_OK_F=$RUNDIR/tproxy.bulk.ok
+  if grep -qxF "$1" "$TP_BULK_OK_F" 2>/dev/null; then
+    TP_BULK_OK_MEMO="$TP_BULK_OK_MEMO $1"
+    return 0
+  fi
+  "$1" --help 2>&1 | grep -q -- '--noflush' || return 1
+  printf '%s\n' "$1" >> "$TP_BULK_OK_F" 2>/dev/null
+  TP_BULK_OK_MEMO="$TP_BULK_OK_MEMO $1"
+  return 0
+}
+
+tp_bulk_begin() {
+  TP_BULK=0
+  TP_BULK_CHAINS4=""; TP_BULK_CHAINS6=""; TP_BULK_RULES4=""; TP_BULK_RULES6=""
+  TP_BULK_DEL=""
+  [ "${TP_BACKEND:-ipt}" = "ipt" ] || return 0
+  _tbb_r4=""; _tbb_r6=""
+  [ -n "$TP_IPT" ] && _tbb_r4=$(tp_restore_bin "$TP_IPT")
+  [ -n "$_tbb_r4" ] || return 0
+  if [ -n "$TP_IP6T" ]; then
+    _tbb_r6=$(tp_restore_bin "$TP_IP6T")
+    [ -n "$_tbb_r6" ] || return 0
+  fi
+  tp_bulk_noflush_ok "$_tbb_r4" || return 0
+  [ -z "$_tbb_r6" ] || tp_bulk_noflush_ok "$_tbb_r6" || return 0
+  TP_BULK=1
+  return 0
+}
+
+# 建链 + 清空。批量模式只记账，逐条模式照旧两条命令。
+tp_b_chain() {   # $1=bin $2=链
+  if [ "$TP_BULK" = "1" ]; then
+    case "$1" in
+      *ip6tables*) TP_BULK_CHAINS6="$TP_BULK_CHAINS6 $2" ;;
+      *) TP_BULK_CHAINS4="$TP_BULK_CHAINS4 $2" ;;
+    esac
+    return 0
+  fi
+  "$1" -w -t mangle -N "$2" 2>/dev/null
+  "$1" -w -t mangle -F "$2" 2>/dev/null
+  return 0
+}
+
+# -A：批量模式攒行，逐条模式真下发
+tp_b_add() {   # $1=bin $2=链 其余=规则参数
+  _tba_bin=$1; _tba_chain=$2; shift 2
+  if [ "$TP_BULK" = "1" ]; then
+    _tba_line="-A $_tba_chain"
+    for _tba_a in "$@"; do _tba_line="$_tba_line $_tba_a"; done
+    case "$_tba_bin" in
+      *ip6tables*) TP_BULK_RULES6="$TP_BULK_RULES6$_tba_line
+" ;;
+      *) TP_BULK_RULES4="$TP_BULK_RULES4$_tba_line
+" ;;
+    esac
+    return 0
+  fi
+  "$_tba_bin" -w -t mangle -A "$_tba_chain" "$@" 2>>"$TP_LOG"
+}
+
+# 排一条 -D（删跳转）。同一个事务里重复的 -D 会让整份 ruleset 被拒（第二次删
+# 时规则已经不在了），所以按「链 + 规则」去重：v6 收尾和随后的挂载想删同一条
+# 跳转时只留一条。
+tp_b_del() {   # $1=bin $2=链 其余=规则参数
+  _tbd_bin=$1; _tbd_chain=$2; shift 2
+  _tbd_key="-D $_tbd_chain"
+  for _tbd_a in "$@"; do _tbd_key="$_tbd_key $_tbd_a"; done
+  case "$TP_BULK_DEL" in *"|$_tbd_key|"*) return 0 ;; esac
+  TP_BULK_DEL="$TP_BULK_DEL|$_tbd_key|"
+  case "$_tbd_bin" in
+    *ip6tables*) TP_BULK_RULES6="$TP_BULK_RULES6$_tbd_key
+" ;;
+    *) TP_BULK_RULES4="$TP_BULK_RULES4$_tbd_key
+" ;;
+  esac
+  return 0
+}
+
+# 挂跳转：唯一且在链首。已在位时把「删一条 + 插一条」写进同一个事务，
+# 既保证顺序又不留空窗；逐条模式仍是原来「删到删不动再插」。
+tp_b_jump() {   # $1=bin $2=内置链 其余=规则参数
+  _tbj_bin=$1; _tbj_chain=$2; shift 2
+  if [ "$TP_BULK" = "1" ]; then
+    if "$_tbj_bin" -w -t mangle -C "$_tbj_chain" "$@" >/dev/null 2>&1; then
+      tp_b_del "$_tbj_bin" "$_tbj_chain" "$@"
+    fi
+    _tbj_line="-I $_tbj_chain 1"
+    for _tbj_a in "$@"; do _tbj_line="$_tbj_line $_tbj_a"; done
+    case "$_tbj_bin" in
+      *ip6tables*) TP_BULK_RULES6="$TP_BULK_RULES6$_tbj_line
+" ;;
+      *) TP_BULK_RULES4="$TP_BULK_RULES4$_tbj_line
+" ;;
+    esac
+    return 0
+  fi
+  while "$_tbj_bin" -w -t mangle -D "$_tbj_chain" "$@" 2>/dev/null; do :; done
+  "$_tbj_bin" -w -t mangle -I "$_tbj_chain" "$@" 2>>"$TP_LOG" || return 1
+  return 0
+}
+
+# 摘跳转：批量模式下 -D 不存在的规则会让整个事务失败，所以先 -C 探一次。
+tp_b_unhook() {   # $1=bin $2=内置链 其余=规则参数
+  _tbu_bin=$1; _tbu_chain=$2; shift 2
+  if [ "$TP_BULK" = "1" ]; then
+    "$_tbu_bin" -w -t mangle -C "$_tbu_chain" "$@" >/dev/null 2>&1 || return 0
+    tp_b_del "$_tbu_bin" "$_tbu_chain" "$@"
+    return 0
+  fi
+  while "$_tbu_bin" -w -t mangle -D "$_tbu_chain" "$@" 2>/dev/null; do :; done
+  return 0
+}
+
+# 提交一个家族的事务；非零 = 批量不可用/被拒，调用方须整体回退逐条
+tp_b_commit() {   # $1=bin
+  [ "$TP_BULK" = "1" ] || return 0
+  [ -n "$1" ] || return 0
+  case "$1" in
+    *ip6tables*) _tbc_ch=$TP_BULK_CHAINS6; _tbc_rules=$TP_BULK_RULES6 ;;
+    *) _tbc_ch=$TP_BULK_CHAINS4; _tbc_rules=$TP_BULK_RULES4 ;;
+  esac
+  [ -n "$_tbc_ch$_tbc_rules" ] || return 0
+  _tbc_rb=$(tp_restore_bin "$1")
+  [ -n "$_tbc_rb" ] || return 1
+  _tbc_file=$RUNDIR/_tp_bulk.$$.rules
+  {
+    printf '*mangle\n'
+    for _tbc_c in $_tbc_ch; do printf ':%s - [0:0]\n' "$_tbc_c"; done
+    printf '%s' "$_tbc_rules"
+    printf 'COMMIT\n'
+  } > "$_tbc_file" 2>/dev/null || { rm -f "$_tbc_file" 2>/dev/null; return 1; }
+  "$_tbc_rb" -w --noflush "$_tbc_file" 2>>"$TP_LOG"
+  _tbc_rc=$?
+  if [ "$_tbc_rc" != "0" ]; then
+    cp "$_tbc_file" "$RUNDIR/tproxy.bulk.reject" 2>/dev/null
+    tp_log "WARN 批量下发被拒（rc=$_tbc_rc），改逐条下发；现场见 run/tproxy.bulk.reject"
+  fi
+  rm -f "$_tbc_file" 2>/dev/null
+  return "$_tbc_rc"
+}
+
 tproxy_install() {
   # $1=port $2=v6(on|off) $3=bypass(gid|uid) $4=mode(all|include|exclude，默认 all)
   # $5=UID 列表（空格分隔，可为空）。另读全局：_ti_want（期望名单）_ti_fp（指纹）
@@ -6183,30 +6387,47 @@ tproxy_install() {
     ( boot_data_sync ) >/dev/null 2>&1 &
     return 0
   fi
-  # —— v4 mangle 链（先建链清链，再挂跳转，全程幂等）——
-  $TP_IPT -w -t mangle -N "$TP_CHAIN_DIV" 2>/dev/null; $TP_IPT -w -t mangle -F "$TP_CHAIN_DIV" 2>/dev/null
-  $TP_IPT -w -t mangle -A "$TP_CHAIN_DIV" -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG"
-  $TP_IPT -w -t mangle -A "$TP_CHAIN_DIV" -j ACCEPT 2>>"$TP_LOG"
+  # —— iptables 后端：整份规则一个事务下发；确认不支持/被拒则整套逐条重来 ——
+  # 逐条下发一次要几十次 fork（手机上单次几十毫秒），批量把「切到 Tproxy 之后
+  # 的生效等待」从数秒压到一次事务的时间。
+  tp_bulk_begin
+  _tproxy_install_ipt
+  _ti_rc=$?
+  if [ "$_ti_rc" = "2" ]; then
+    TP_BULK=0
+    _tproxy_install_ipt
+    _ti_rc=$?
+  fi
+  return "$_ti_rc"
+}
 
-  $TP_IPT -w -t mangle -N "$TP_CHAIN_PRE" 2>/dev/null; $TP_IPT -w -t mangle -F "$TP_CHAIN_PRE" 2>/dev/null
+# iptables 后端的实际下发（v4 + v6）。$TP_BULK=1 时规则只是攒起来，最后交给
+# 一个 iptables-restore 事务；返回 2 表示「批量被拒，请逐条重来」。
+_tproxy_install_ipt() {
+  # —— v4 mangle 链（先建链清链，再挂跳转，全程幂等）——
+  tp_b_chain "$TP_IPT" "$TP_CHAIN_DIV"
+  tp_b_add "$TP_IPT" "$TP_CHAIN_DIV" -j MARK --set-xmark "$TP_MARK"
+  tp_b_add "$TP_IPT" "$TP_CHAIN_DIV" -j ACCEPT
+
+  tp_b_chain "$TP_IPT" "$TP_CHAIN_PRE"
   # 已建连的 tproxy socket 走快速通道（内核不支持 socket 匹配时跳过，
   # xt_TPROXY 自身也能续接已建连接，divert 只是省一次查找）
   if [ "$_tp_cap_sockt" = "1" ]; then
-    $TP_IPT -w -t mangle -A "$TP_CHAIN_PRE" -p tcp -m socket --transparent -j "$TP_CHAIN_DIV" 2>/dev/null
-    $TP_IPT -w -t mangle -A "$TP_CHAIN_PRE" -p udp -m socket --transparent -j "$TP_CHAIN_DIV" 2>/dev/null
+    tp_b_add "$TP_IPT" "$TP_CHAIN_PRE" -p tcp -m socket --transparent -j "$TP_CHAIN_DIV" 2>/dev/null
+    tp_b_add "$TP_IPT" "$TP_CHAIN_PRE" -p udp -m socket --transparent -j "$TP_CHAIN_DIV" 2>/dev/null
   elif [ "$_tp_cap_sock" = "1" ]; then
-    $TP_IPT -w -t mangle -A "$TP_CHAIN_PRE" -p tcp -m socket -j "$TP_CHAIN_DIV" 2>/dev/null
-    $TP_IPT -w -t mangle -A "$TP_CHAIN_PRE" -p udp -m socket -j "$TP_CHAIN_DIV" 2>/dev/null
+    tp_b_add "$TP_IPT" "$TP_CHAIN_PRE" -p tcp -m socket -j "$TP_CHAIN_DIV" 2>/dev/null
+    tp_b_add "$TP_IPT" "$TP_CHAIN_PRE" -p udp -m socket -j "$TP_CHAIN_DIV" 2>/dev/null
   fi
   # 保留/内网/组播地址直连（fake-ip 198.18.0.0/16 是基准测试段，不在其中，
   # 会被正常接管——这正是 fake-ip 链路需要的）
   for _ti_c in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
-    $TP_IPT -w -t mangle -A "$TP_CHAIN_PRE" -d "$_ti_c" -j RETURN 2>>"$TP_LOG"
+    tp_b_add "$TP_IPT" "$TP_CHAIN_PRE" -d "$_ti_c" -j RETURN
   done
-  $TP_IPT -w -t mangle -A "$TP_CHAIN_PRE" -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port "$_ti_port" --tproxy-mark "$TP_MARK" 2>>"$TP_LOG" || { tp_log "WARN TPROXY(tcp) 添加失败"; tproxy_teardown; return 1; }
-  $TP_IPT -w -t mangle -A "$TP_CHAIN_PRE" -p udp -j TPROXY --on-ip 127.0.0.1 --on-port "$_ti_port" --tproxy-mark "$TP_MARK" 2>>"$TP_LOG" || { tp_log "WARN TPROXY(udp) 添加失败"; tproxy_teardown; return 1; }
+  tp_b_add "$TP_IPT" "$TP_CHAIN_PRE" -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port "$_ti_port" --tproxy-mark "$TP_MARK" 2>>"$TP_LOG" || { tp_log "WARN TPROXY(tcp) 添加失败"; tproxy_teardown; return 1; }
+  tp_b_add "$TP_IPT" "$TP_CHAIN_PRE" -p udp -j TPROXY --on-ip 127.0.0.1 --on-port "$_ti_port" --tproxy-mark "$TP_MARK" 2>>"$TP_LOG" || { tp_log "WARN TPROXY(udp) 添加失败"; tproxy_teardown; return 1; }
 
-  $TP_IPT -w -t mangle -N "$TP_CHAIN_OUT" 2>/dev/null; $TP_IPT -w -t mangle -F "$TP_CHAIN_OUT" 2>/dev/null
+  tp_b_chain "$TP_IPT" "$TP_CHAIN_OUT"
   tp_bypass_rule "$TP_IPT" "$TP_CHAIN_OUT" "$_ti_bp" || { tp_log "WARN owner 旁路添加失败"; tproxy_teardown; return 1; }
   # 应用黑白名单（UID 规则插在内核旁路之后、网段直连之前；白名单默认尾巴是直连）
   _ti_app_rules "$TP_IPT" "$TP_CHAIN_OUT" || { tp_log "WARN 应用 UID 规则添加失败"; tproxy_teardown; return 1; }
@@ -6216,27 +6437,49 @@ tproxy_install() {
     tp_log "WARN 应用名单过大（UID $_ti_total 个），仅前 $TP_APP_MAX 个生效"
   fi
   for _ti_c in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
-    $TP_IPT -w -t mangle -A "$TP_CHAIN_OUT" -d "$_ti_c" -j RETURN 2>>"$TP_LOG"
+    tp_b_add "$TP_IPT" "$TP_CHAIN_OUT" -d "$_ti_c" -j RETURN
   done
   if [ "$_ti_mode" = "include" ]; then
-    $TP_IPT -w -t mangle -A "$TP_CHAIN_OUT" -p tcp -j RETURN 2>>"$TP_LOG"
-    $TP_IPT -w -t mangle -A "$TP_CHAIN_OUT" -p udp -j RETURN 2>>"$TP_LOG"
+    tp_b_add "$TP_IPT" "$TP_CHAIN_OUT" -p tcp -j RETURN
+    tp_b_add "$TP_IPT" "$TP_CHAIN_OUT" -p udp -j RETURN
   else
-    $TP_IPT -w -t mangle -A "$TP_CHAIN_OUT" -p tcp -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG"
-    $TP_IPT -w -t mangle -A "$TP_CHAIN_OUT" -p udp -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG"
+    tp_b_add "$TP_IPT" "$TP_CHAIN_OUT" -p tcp -j MARK --set-xmark "$TP_MARK"
+    tp_b_add "$TP_IPT" "$TP_CHAIN_OUT" -p udp -j MARK --set-xmark "$TP_MARK"
   fi
 
   # 挂载（先删干净再插链首；PREROUTING 同时覆盖 lo 回注与热点转发流量）
-  while $TP_IPT -w -t mangle -D PREROUTING -j "$TP_CHAIN_PRE" 2>/dev/null; do :; done
-  $TP_IPT -w -t mangle -I PREROUTING -j "$TP_CHAIN_PRE" 2>>"$TP_LOG" || { tp_log "WARN PREROUTING 挂载失败"; tproxy_teardown; return 1; }
-  while $TP_IPT -w -t mangle -D OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
-  while $TP_IPT -w -t mangle -D OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
-  $TP_IPT -w -t mangle -I OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || { tp_log "WARN OUTPUT(tcp) 挂载失败"; tproxy_teardown; return 1; }
-  $TP_IPT -w -t mangle -I OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || { tp_log "WARN OUTPUT(udp) 挂载失败"; tproxy_teardown; return 1; }
+  tp_b_jump "$TP_IPT" PREROUTING -j "$TP_CHAIN_PRE" || { tp_log "WARN PREROUTING 挂载失败"; tproxy_teardown; return 1; }
+  tp_b_jump "$TP_IPT" OUTPUT -p tcp -j "$TP_CHAIN_OUT" || { tp_log "WARN OUTPUT(tcp) 挂载失败"; tproxy_teardown; return 1; }
+  tp_b_jump "$TP_IPT" OUTPUT -p udp -j "$TP_CHAIN_OUT" || { tp_log "WARN OUTPUT(udp) 挂载失败"; tproxy_teardown; return 1; }
 
   # —— v6：真 GUA 原生；只把 DNS fake-ip6 送进 TPROXY（对齐 IPv4 的 198.18.0.0/16）。
   # 禁止 local default + 全量 OUTPUT mark，否则系统测不到 240e: 地址。
-  tproxy_v6_unhook
+  if [ "$TP_BULK" = "1" ]; then
+    # 批量模式：v6 跳转先探再删（写进同一个 v6 事务），链由随后的声明清空，
+    # 不必再来一遍「删到删不动」。没有 v6 记录又这次也不装 v6 时连探测都省掉
+    # （稳态一次安装少三次 fork）；状态文件缺失或记着 v6=on 就照常全套清理。
+    _tp_prev_v6=""
+    if [ -f "$TP_STATE" ]; then
+      while IFS= read -r _pv_l; do
+        case "$_pv_l" in v6=on) _tp_prev_v6=on ;; v6=off) _tp_prev_v6=off ;; esac
+      done < "$TP_STATE"
+    fi
+    # 只有「v6 曾经装着、这次不装了」或「状态未知」才需要清理：v6 继续装着时
+    # 跳转会被随后的挂载原地替换、策略路由原样复用，多探一次只是白花时间。
+    _tp_v6_clean=0
+    [ -z "$_tp_prev_v6" ] && _tp_v6_clean=1
+    [ "$_tp_prev_v6" = "on" ] && [ "$_ti_v6" != "on" ] && _tp_v6_clean=1
+    if [ "$_tp_v6_clean" = "1" ]; then
+      [ -n "$TP_IP6T" ] && {
+        tp_b_unhook "$TP_IP6T" PREROUTING -j "$TP_CHAIN_PRE"
+        tp_b_unhook "$TP_IP6T" OUTPUT -p tcp -j "$TP_CHAIN_OUT"
+        tp_b_unhook "$TP_IP6T" OUTPUT -p udp -j "$TP_CHAIN_OUT"
+      }
+      [ "$_tp_prev_v6" = "on" ] && tproxy_v6_unhook_routes
+    fi
+  else
+    tproxy_v6_unhook
+  fi
   _ti_v6_ok=off
   if [ "$_ti_v6" = "on" ] && [ "$_tp_cap_v6" = "1" ] && [ -n "$TP_IP6T" ]; then
     _ti_v6ok=1
@@ -6244,34 +6487,48 @@ tproxy_install() {
     _ti_v6pref=$(tproxy_iprule_add "$TP_IP" "$TP_PREF $TP_PREF_ALT" -6)
     [ -n "$_ti_v6pref" ] || _ti_v6ok=0
     $TP_IP -6 route replace local "$_ti_f6" dev lo table "$TP_TABLE" 2>>"$TP_LOG" || _ti_v6ok=0
-    $TP_IP6T -w -t mangle -N "$TP_CHAIN_PRE" 2>/dev/null; $TP_IP6T -w -t mangle -F "$TP_CHAIN_PRE" 2>/dev/null
+    tp_b_chain "$TP_IP6T" "$TP_CHAIN_PRE"
     _ti_v6_nd_bypass "$TP_IP6T" "$TP_CHAIN_PRE"
     _ti_v6_local_return "$TP_IP6T" "$TP_CHAIN_PRE"
     # fake-ip 必须在 fc00::/7 RETURN 之前 TPROXY，否则 AAAA 假地址被放行出真实网卡。
-    $TP_IP6T -w -t mangle -A "$TP_CHAIN_PRE" -d "$_ti_f6" -p tcp -j TPROXY --on-ip :: --on-port "$_ti_port" --tproxy-mark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
-    $TP_IP6T -w -t mangle -A "$TP_CHAIN_PRE" -d "$_ti_f6" -p udp -j TPROXY --on-ip :: --on-port "$_ti_port" --tproxy-mark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
+    tp_b_add "$TP_IP6T" "$TP_CHAIN_PRE" -d "$_ti_f6" -p tcp -j TPROXY --on-ip :: --on-port "$_ti_port" --tproxy-mark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
+    tp_b_add "$TP_IP6T" "$TP_CHAIN_PRE" -d "$_ti_f6" -p udp -j TPROXY --on-ip :: --on-port "$_ti_port" --tproxy-mark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
     for _ti_c in ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8; do
-      $TP_IP6T -w -t mangle -A "$TP_CHAIN_PRE" -d "$_ti_c" -j RETURN 2>>"$TP_LOG"
+      tp_b_add "$TP_IP6T" "$TP_CHAIN_PRE" -d "$_ti_c" -j RETURN
     done
-    $TP_IP6T -w -t mangle -N "$TP_CHAIN_OUT" 2>/dev/null; $TP_IP6T -w -t mangle -F "$TP_CHAIN_OUT" 2>/dev/null
+    tp_b_chain "$TP_IP6T" "$TP_CHAIN_OUT"
     _ti_v6_nd_bypass "$TP_IP6T" "$TP_CHAIN_OUT"
     tp_bypass_rule "$TP_IP6T" "$TP_CHAIN_OUT" "$_ti_bp" || _ti_v6ok=0
-    $TP_IP6T -w -t mangle -A "$TP_CHAIN_OUT" -d "$_ti_f6" -p tcp -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
-    $TP_IP6T -w -t mangle -A "$TP_CHAIN_OUT" -d "$_ti_f6" -p udp -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
-    while $TP_IP6T -w -t mangle -D PREROUTING -j "$TP_CHAIN_PRE" 2>/dev/null; do :; done
-    while $TP_IP6T -w -t mangle -D OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
-    while $TP_IP6T -w -t mangle -D OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
-    $TP_IP6T -w -t mangle -I PREROUTING -j "$TP_CHAIN_PRE" 2>>"$TP_LOG" || _ti_v6ok=0
-    $TP_IP6T -w -t mangle -I OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || _ti_v6ok=0
-    $TP_IP6T -w -t mangle -I OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || _ti_v6ok=0
+    tp_b_add "$TP_IP6T" "$TP_CHAIN_OUT" -d "$_ti_f6" -p tcp -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
+    tp_b_add "$TP_IP6T" "$TP_CHAIN_OUT" -d "$_ti_f6" -p udp -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
+    tp_b_jump "$TP_IP6T" PREROUTING -j "$TP_CHAIN_PRE" || _ti_v6ok=0
+    tp_b_jump "$TP_IP6T" OUTPUT -p tcp -j "$TP_CHAIN_OUT" || _ti_v6ok=0
+    tp_b_jump "$TP_IP6T" OUTPUT -p udp -j "$TP_CHAIN_OUT" || _ti_v6ok=0
     if [ "$_ti_v6ok" = "1" ]; then
       _ti_v6_ok=on
       tp_log "v6 fake-ip $_ti_f6 → TPROXY，其余 IPv6 原生"
     else
-      tproxy_v6_unhook
+      if [ "$TP_BULK" = "1" ]; then
+        # 事务还没下发：把 v6 待发规则整体丢掉就等于「没装 v6」，只保留 -D 行
+        # （那是为了摘掉上一次的 v6 跳转，必须留着）。
+        _tb_keep=""
+        while IFS= read -r _tb_l; do
+          case "$_tb_l" in -D\ *) _tb_keep="$_tb_keep$_tb_l
+" ;; esac
+        done <<EOF
+$TP_BULK_RULES6
+EOF
+        TP_BULK_RULES6="$_tb_keep"
+        TP_BULK_CHAINS6=""
+      else
+        tproxy_v6_unhook
+      fi
       tp_log "WARN v6 fake-ip 规则不完整，本机 v6 仍走原生"
     fi
   fi
+  # 一个家族一个事务提交；被拒（老 iptables-restore / 精简环境）就整体逐条重来
+  tp_b_commit "$TP_IPT" || return 2
+  [ -n "$TP_IP6T" ] && { tp_b_commit "$TP_IP6T" || return 2; }
   _ti_uh=$(printf '%s' "$_ti_uids" | tp_fp_of)
   printf 'port=%s\nv6=%s\nbypass=%s\nmode=%s\nwant=%s\nfp=%s\nfb=%s\napps=%s\nuids=%s\nuh=%s\npref=%s\nver=%s\nbackend=%s\n' \
     "$_ti_port" "$_ti_v6_ok" "$_ti_bp" "$_ti_mode" "$_ti_want" "$_ti_fp" "$_ti_fb" "${_ti_apps:-0}" "${_ti_v4n:-0}" "$_ti_uh" "$_ti_pref" "$TP_STATE_VER" "ipt" > "$TP_STATE" 2>/dev/null
@@ -6501,6 +6758,14 @@ _tproxy_sync_body() {
     _ti_want=$_ps_wmode; _ti_fp=$_ps_wfp; _ti_fb=${_PU_FB:-0}; _ti_apps=$_ps_wcnt
     tproxy_install "$_ps_port" "$_ps_v6" "$_ps_bp" "$_ps_eff" "$_PU_UIDS"
     return $?
+  fi
+  # —— 参数变了、后端没变：原地重建，不「先拆后装」 ——
+  # install 会用一个事务把自己的三条链原子地换成新参数，跳转留在原处；先拆再装
+  # 的话，拆与装之间那几百毫秒到几秒里流量完全绕过内核（面板打不开、直连没网），
+  # 正是「切到 Tproxy 之后卡一阵」的另一半原因。
+  if [ "$_ps_have" = "1" ] && [ "$_ps_want" = "1" ] && [ "$_ps_backend" = "$_ps_wbackend" ]; then
+    tp_log "reinstall-in-place: port=${_ps_port:-?}→${_ps_wport:-?} v6=$_ps_v6→$_ps_wv6 mode=${_ps_mode:-all}→$_ps_wmode（不拆链）"
+    _ps_have=0
   fi
   # —— 拆旧 ——
   if [ "$_ps_have" = "1" ]; then
