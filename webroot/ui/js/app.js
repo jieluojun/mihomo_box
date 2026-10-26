@@ -347,11 +347,14 @@ function showTransparentModePicker() {
       close();
       uiToast(mode === 'tun' ? '正在保存 TUN 配置并重启服务…' : '正在保存 eBPF 配置并重启服务…', 3000);
       beginOpToast();
-      if (typeof window !== 'undefined') window.__mbRestartToastMsg = mode === 'tun' ? '✅ TUN 已启用，服务已重启' : '✅ eBPF 已启用，服务已重启';
+      const pickMsg = mode === 'tun' ? '✅ TUN 已启用，服务已重启' : '✅ eBPF 已启用，服务已重启';
+      // 保存后会重启内核：完成提示等新核起表那一帧（与 00:00 同屏）
+      armUpToast(pickMsg);
       const ok = await saveConfig({ silent: true, restart: true });
-      if (typeof window !== 'undefined') delete window.__mbRestartToastMsg;
-      if (ok) toastDoneFallback(mode === 'tun' ? '✅ TUN 已启用，服务已重启' : '✅ eBPF 已启用，服务已重启', 3200);
-      else uiToast('配置未能保存，已保留草稿，请检查后重试', 4200);
+      if (!ok) { dropPendingUpToast(); uiToast('配置未能保存，已保留草稿，请检查后重试', 4200); }
+    } catch (e) {
+      dropPendingUpToast();
+      uiToast('配置未能保存：' + ((e && e.message) || e), 4200);
     } finally {
       setSaveBarSuppressed(false);
       busy = false;
@@ -639,10 +642,13 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
           if (tpBusy) { sw.querySelector('input').checked = !v; return; }
           tpBusy = true;
           const wasDirty = state.dirty;
+          // 开启会重启内核：提示等「新核确认、时长归零」那一帧再弹（见 armUpToast）。
+          const tpWasRunning = !!(state.status && state.status.running);
           if (state.status) state.status.tproxy = v ? 'true' : 'false';
           tpStatus.textContent = v ? '当前状态：正在应用 Tproxy 规则并重启内核…' : '当前状态：正在关闭 Tproxy 规则…';
           uiToast(v ? '正在开启 Tproxy…' : '正在关闭 Tproxy…', 1600);
           beginOpToast();
+          let tpOk = false;   // 命令成功才允许把待弹提示留给起表那一帧
           try {
             // ★即时反馈（开启）：Tproxy 开启会重启内核——运行时长不在按下瞬间归零起表
             //  （旧值定格，新核确认活时才从 00:00 起表），pid/资源徽标由 quickResPaint 在
@@ -659,16 +665,20 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
                 state.status.pid = '';
                 if (current === 'page-dashboard' && dEl) renderDashboard(dEl);
               }
-              if (!DEMO && dEl) quickResPaint(dEl, { oldPid: tPrevPid, stillActive: () => tpBusy, reanchor: true, onReady: () => toastUpDone('✅ Tproxy 已开启') }).catch(() => {});
+              armUpToast('✅ Tproxy 已开启');
+              if (!DEMO && dEl) quickResPaint(dEl, { oldPid: tPrevPid, stillActive: () => tpBusy, reanchor: true, onReady: () => flushPendingUpToast() }).catch(() => {});
             }
             // 关闭时先还原配置但暂不重启，等用户选择 TUN/eBPF 后由保存流程统一重启。
             const r = await cmdline(v ? 'tproxy-set true' : 'tproxy-set false defer');
             const out = ((r && r.stdout) || '').trim();
             const ok = !!r && r.errno === 0 && !/(^|\n)ERR/.test(out);
+            tpOk = ok;
             if (ok) {
               if (state.status) state.status.tproxy = v ? 'true' : 'false';
               refreshModState(true);   // 命令一返回就刷新文案，不等下面的配置重载和完整 status
-              toastDoneFallback(v ? '✅ Tproxy 已开启' : '✅ 已还原默认状态');
+              // 开启且内核在跑＝会重启：提示交给起表那一帧弹；关闭不重启，立刻弹。
+              if (v && tpWasRunning) armUpToast('✅ Tproxy 已开启');
+              else { dropPendingUpToast(); toastDoneFallback(v ? '✅ Tproxy 已开启' : '✅ 已还原默认状态'); }
               // 后端改过 config.yaml（TUN 开关/监听器注释）：重载草稿，
               // 避免旧草稿在下次保存时把手术结果覆盖回去
               let reloaded = false;
@@ -680,6 +690,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             } else {
               if (state.status) state.status.tproxy = (!v) ? 'true' : 'false';
               sw.querySelector('input').checked = !v;   // 回弹开关显示
+              dropPendingUpToast();
               uiToast('⚠️ ' + (out || (r && r.stderr) || '操作失败'), 5000);
             }
             try { await refreshStatus(); } catch (e) { /* 状态刷新失败不影响开关 */ }
@@ -689,6 +700,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             if (ok) pollTpStatus(v, Date.now() + 14000);
           } finally {
             tpBusy = false;
+            if (!tpOk) dropPendingUpToast();   // 失败/异常：不留待弹提示
             // 同系统 IPv6：把 20s 长窗收回成 2.5s 补读短窗（Math.min 不挤掉别处的静默窗）
             if (tpQuiet) { restartQuietUntil = Math.min(restartQuietUntil, Date.now() + 2500); tpQuiet = false; }
             refreshModState(true);
@@ -734,9 +746,10 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             // 按 pid 变化归零一次、从 00:00 起表（锚定真实启动时刻）。
             state.status.pid = '';
             if (current === 'page-dashboard' && dEl) renderDashboard(dEl);
+            armUpToast(v ? '✅ 系统 IPv6 已启用' : '✅ 系统 IPv6 已禁用');
             if (!DEMO && dEl) quickResPaint(dEl, {
               oldPid: v6PrevPid, stillActive: () => busy, reanchor: true,
-              onReady: () => toastUpDone(v ? '✅ 系统 IPv6 已启用，服务已重启' : '✅ 系统 IPv6 已禁用，服务已重启'),
+              onReady: () => flushPendingUpToast(),
             }).catch(() => {});
           }
           try {
@@ -755,9 +768,13 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
               const tail = skipped ? '，本机无法在 IPv6 下接管流量，代理维持仅 IPv4'
                 : /服务已重启/.test(out) ? '，配置已同步，服务已重启'
                   : /服务未运行/.test(out) ? '，配置已同步（服务未运行，下次启动生效）' : '，配置已同步';
-              toastDoneFallback((v ? '✅ 系统 IPv6 已启用' : '✅ 系统 IPv6 已禁用') + tail, 3200);
+              // 服务确实重启了＝提示等新核起表那一帧；没重启（服务未运行等）就立刻弹。
+              const v6Msg = (v ? '✅ 系统 IPv6 已启用' : '✅ 系统 IPv6 已禁用') + tail;
+              if (/服务已重启/.test(out)) armUpToast(v6Msg);
+              else { dropPendingUpToast(); toastDoneFallback(v6Msg, 3200); }
             } else {
               v6DescMain.textContent = v6DescText(!v);   // 没成功：说明文字退回原状态
+              dropPendingUpToast();
               uiToast('⚠️ ' + (out || (r && r.stderr) || '操作失败'), 5000);
             }
             refreshStatus(false, true).catch(() => { /* 补读失败不影响开关 */ });
@@ -1045,6 +1062,7 @@ function syncUpStart(st) {
   if (upStartMs === null || pid !== upPid) {
     upStartMs = start;   // 首次 / 换 pid＝新核：必按真实启动时刻归零起表（钉锚不挡换核，反复重启都要重新计时）
     upPid = pid;
+    flushPendingUpToast();   // 计时归零这一帧，把待弹的「已开启/已重启」提示一起放出来
     return;
   }  // 首次 / 重启
   if (!pinned && Math.abs(start - upStartMs) >= 3000) { upStartMs = start; upPid = pid; }          // 大幅漂移
@@ -1306,6 +1324,43 @@ function toastDoneFallback(msg, ms) {
   uiToast(msg, ms || 2800);
 }
 
+// ---- 「已开启 / 已重启」类提示与运行时长起表对齐 ----
+// toast 要落在运行时长归零的那一帧上。判据不能是「命令返回」：tproxy-set 现在会
+// 等规则装好才返回（返回时新核往往已经跑了几秒，时长早已在轮询里归零），按下瞬间
+// 归零也不对（核心还没起）。这里登记一条待弹提示，由 anchorFresh / syncUpStart 在
+// 「确认新核、计时归零」那一刻统一弹出 —— 谁先发现新核都一样，提示与 00:00 同帧。
+// 迟迟等不到新核（服务本来没运行 / 启动失败）则由兜底定时器照实弹出，不会吞掉。
+const PENDING_UP_TOAST_MS = 10000;
+let pendingUpToast = null;
+let pendingUpToastTimer = 0;
+function armUpToast(msg) {
+  // 本次操作已经弹过完成提示了（另一个入口先到）：不再登记，免得兜底定时器补一条
+  if (typeof window !== 'undefined' && window.__mbDoneToastAt
+    && window.__mbDoneToastSeq === window.__mbOpToastSeq) return;
+  pendingUpToast = msg;
+  if (pendingUpToastTimer) clearTimeout(pendingUpToastTimer);
+  pendingUpToastTimer = setTimeout(() => {
+    pendingUpToastTimer = 0;
+    if (!pendingUpToast) return;
+    const m = pendingUpToast;
+    pendingUpToast = null;
+    toastDoneFallback(m, 3200);
+  }, PENDING_UP_TOAST_MS);
+}
+function flushPendingUpToast() {
+  if (!pendingUpToast) return;
+  const m = pendingUpToast;
+  pendingUpToast = null;
+  if (pendingUpToastTimer) { clearTimeout(pendingUpToastTimer); pendingUpToastTimer = 0; }
+  // 同帧把 00:00 画上去：只弹提示、时长还停在旧值的话，看起来就是「又不同步了」
+  try { paintUptime(); } catch (e) { /* 绘制失败不影响提示 */ }
+  toastUpDone(m);
+}
+function dropPendingUpToast() {
+  pendingUpToast = null;
+  if (pendingUpToastTimer) { clearTimeout(pendingUpToastTimer); pendingUpToastTimer = 0; }
+}
+
 // 新实例确认时的时长锚点统一处理（起表只发生在这里或 syncUpStart 的「锚空/换 pid」
 // 分支，都锚定真实启动时刻，不在按下瞬间）：换 pid＝新核，必归零起表——连按多次
 // 重启每次都必须重新计时（钉锚只让路「同实例」的权威漂移校正，绝不能挡住换核归零，
@@ -1313,12 +1368,14 @@ function toastDoneFallback(msg, ms) {
 // （否则用户看到「记一秒 → 重新开始计时」）。
 function anchorFresh(pidStr, reanchor) {
   const anchoredSamePid = !!pidStr && upPid != null && String(upPid) === String(pidStr);
-  if (upStartMs === null || (pidStr && !anchoredSamePid)) {
+  const fresh = upStartMs === null || !!(pidStr && !anchoredSamePid);
+  if (fresh) {
     upStartMs = Date.now();
     if (state.status) state.status.uptime_sec = 0;
   }
   upStartPinnedUntil = Date.now() + 15000;
   if (pidStr) upPid = String(pidStr);
+  if (fresh) flushPendingUpToast();   // 起表那一帧弹提示（与 syncUpStart 二选一，谁先到）
 }
 
 // ---------------- 启停在途的「快照补位」（总开关按下即显示 pid/时长/资源） ----------------
@@ -2020,9 +2077,13 @@ async function switchDashboardProxyMode(mode) {
     requestTransparentModeOnSave(mode);
     beginOpToast();
     uiToast('正在切换为 ' + ({ tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy' }[mode]) + '…', 2200);
+    // 切换必重启内核：完成提示押到「新核确认、时长归零」那一帧，和 00:00 同屏出现。
+    const modeMsg = '✅ 代理模式已切换为 ' + ({ tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy' }[mode]);
+    armUpToast(modeMsg);
     const ok = await saveConfig({ silent: true, restart: true, requireRestartSuccess: true });
-    if (ok) toastDoneFallback('✅ 代理模式已切换为 ' + ({ tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy' }[mode]), 3200);
+    if (!ok) dropPendingUpToast();
   } catch (e) {
+    dropPendingUpToast();
     uiToast('代理模式切换失败：' + (e?.message || String(e)), 5000);
   } finally {
     proxyModeBusy = false;
