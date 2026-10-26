@@ -2384,6 +2384,48 @@ tproxy_apply() {
   return "$_lc_apply_rc"
 }
 
+# 切到 Tproxy 之后：等内核把 TPROXY 端口挂起来、把规则装好再返回（有界）。
+#
+# 为什么需要：restart-json tproxy 以前一返回就报「已切换」，而规则是由 start_core
+# 的后台收敛循环装的；那个循环只覆盖约 6 秒，端口晚一点就绪就整段落空，下一次
+# 自动补救要等监听循环 ~60 秒的稳态兜底轮 —— 用户看到的就是「切到 Tproxy 之后
+# 很久才真正生效」，期间流量既没被接管、外部面板的连接也拿不到控制器。
+# 这里把「切换完成」和「规则已装」对齐：先等端口（≤3s）再对账一次；仍没装上就
+# 后台每 1 秒追一次（最多 30s），远比等 60 秒的兜底轮快。
+tproxy_ready_wait() {
+  _tr_port=$(tproxy_detect 2>/dev/null | awk '{print $1}')
+  _tr_i=0
+  if [ -n "$_tr_port" ]; then
+    now_cs
+    if [ "$NOW_CS" -gt 0 ]; then _tr_dl=$((NOW_CS + 300)); else _tr_dl=0; fi
+    while [ "$_tr_i" -lt 30 ]; do
+      tproxy_port_listening "$_tr_port" 2>/dev/null && break
+      if [ "$_tr_dl" != "0" ]; then now_cs; [ "$NOW_CS" -ge "$_tr_dl" ] && break; fi
+      nap 0.1
+      _tr_i=$((_tr_i + 1))
+    done
+  fi
+  tproxy_sync >/dev/null 2>&1
+  if [ -f "$TP_STATE" ]; then
+    tp_log "mode-switch: 规则已就绪 port=${_tr_port:-?}（等待 ${_tr_i} 轮）"
+    return 0
+  fi
+  tp_log "mode-switch: 端口/规则尚未就绪（port=${_tr_port:-?}），后台每秒追一次"
+  ( _tr_j=0
+    while [ "$_tr_j" -lt 30 ]; do
+      tproxy_sync >/dev/null 2>&1
+      if [ -f "$TP_STATE" ]; then
+        tp_log "mode-switch: 规则就绪（后台追上，第 $((_tr_j + 1)) 次）"
+        sh "$0" live-invalidate >/dev/null 2>&1
+        break
+      fi
+      nap 1
+      _tr_j=$((_tr_j + 1))
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  return 0
+}
+
 # 每次启动（含外部替换 config.yaml 后重启）都重放透明模式互斥。
 # TProxy 开关优先；否则只按新配置，TUN/eBPF 同开时 TUN 优先并提示。
 # 指纹变化时更新 TProxy 还原记录，不能拿旧配置的 tun_before 去修改新配置。
@@ -2821,7 +2863,12 @@ _restart_core_body() {
     action_mark tproxy_disabled
   fi
   running && stop_core keep >/dev/null
-  start_core && return 0
+  if start_core; then
+    # Tproxy 模式（含普通重启时开关本来就是开的）：等规则真正装上再报成功，
+    # 否则前端显示「已切换」但流量还没被接管，用户以为切失败/卡住了。
+    [ "$(get_setting tproxy false)" = "true" ] && tproxy_ready_wait
+    return 0
+  fi
   tproxy_unhook_quick 2>/dev/null
   tun_hotspot_sync >/dev/null 2>&1
   tproxy_sync >/dev/null 2>&1

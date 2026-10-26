@@ -1733,6 +1733,7 @@ function teardownExternalPanel() {
   clearTimeout(s.timer);
   clearTimeout(s.refreshTimer);
   clearTimeout(s.hideT);   // 进场动画后「背景页停绘制」的补挂：层都拆了就别再挂
+  clearTimeout(s.nudgeTimer);
   clearInterval(s.closeTimer);
   // 关闭时立即摘掉 iframe，停止面板脚本与在途导航，只让空壳完成退出动画。
   // 延后启动的加载也已取消，旧面板不能在退出后继续占用共享 WebView。
@@ -1802,8 +1803,27 @@ function openExternalPanel(st) {
     h('span', { text: '面板一直没出来？多半是内核未运行、外部面板尚未下载，或 WebView 拦了内嵌。' }),
     h('button', { class: 'btn xs', text: '新窗口打开', onclick: () => { window.open(url, '_blank'); } }));
   // refreshing：0 空闲 / 1 已导到 about:blank，等它落地 / 2 已 history.back()，等面板按原 hash 重新载入 / 3 兜底重载中
-  const self = { layer: null, frame, timer: 0, pushedHist: false, refreshing: 0, refreshTimer: 0, lenBefore: 0, guardUntil: 0, fallback: null, atBlank: null, closeTimer: 0, panelSeen: false, hideT: 0 };
-  const armHint = () => { self.timer = setTimeout(() => { if (pembedState === self) hint.hidden = false; }, 8000); };
+  const self = { layer: null, frame, timer: 0, pushedHist: false, refreshing: 0, refreshTimer: 0, lenBefore: 0, guardUntil: 0, fallback: null, atBlank: null, closeTimer: 0, panelSeen: false, hideT: 0, nudgeTimer: 0, nudgeTries: 0 };
+  // 内核还在重启（控制器端口没起来）时，iframe 只会一直白着；以前没有任何人替用户
+  // 重试，只能自己点刷新或退出重进 —— 「切到 Tproxy 后面板打开是空的」就是这么来的。
+  // 这里在「还没看到面板」时短暂盯一下内核：5 秒一次、最多 12 次（约 1 分钟），
+  // 内核一活过来就原地重载一次；面板一旦载入立刻停。
+  const stopNudge = () => { clearTimeout(self.nudgeTimer); self.nudgeTimer = 0; };
+  const nudge = async () => {
+    if (pembedState !== self || self.panelSeen || self.refreshing !== 0) return;
+    if (self.nudgeTries >= 12) return;
+    self.nudgeTries++;
+    let up = false;
+    try {
+      const r = await cmdline('status-fast', { timeout: 5000 });
+      const j = parseJsonLoose(r && r.stdout);
+      up = !!(j && (j.running === 1 || j.running === true || j.running === '1'));
+    } catch (e) { /* 读不到就当没起来，下一轮再看 */ }
+    if (pembedState !== self || self.panelSeen || self.refreshing !== 0) return;
+    if (up) { try { frame.contentWindow.location.replace(url); } catch (e) { frame.src = url; } }
+    self.nudgeTimer = setTimeout(nudge, 5000);
+  };
+  const armHint = () => { self.timer = setTimeout(() => { if (pembedState === self) { hint.hidden = false; void nudge(); } }, 8000); };
   armHint();
   const refreshBtn = h('button', { class: 'pembed-tool refresh', title: '刷新面板（停留在当前页）', 'aria-label': '刷新面板',
     onclick: () => refresh() }, h('span', { class: 'ico', html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66L20 9M20 4v5h-5"/></svg>' }));
@@ -1851,7 +1871,7 @@ function openExternalPanel(st) {
       // 没在刷新却落到了 about:blank：只可能是有人沿「前进」方向（桌面浏览器的前进键/触控板手势）
       // 走进了上次刷新留在前面的 blank 条目。退一步回到面板，别让人对着白屏
       if (self.panelSeen) { try { history.back(); } catch (e) { } }
-    } else self.panelSeen = true;
+    } else { self.panelSeen = true; stopNudge(); }
   });
   // 刷新：about:blank → 等它 load → history.back() 回到面板刷新前那条历史（见本节顶部注释）。
   // 不读跨域 location、不需要面板配合，任何 hash 路由的面板（zashboard / metacubexd / yacd）都适用。
