@@ -2871,8 +2871,11 @@ _restart_core_body() {
   _rc_mode=${1:-}
   _rc_keep_tp_cfg=0
   if [ "$_rc_mode" = tproxy ]; then
-    # 能力探测不通过时不写设置、不改配置，也不停止旧内核。
+    # 能力探测不通过时不写设置、不改配置，也不停止旧内核；单独记时，
+    # 诊断里可以区分「探测/等 xtables 锁」与「新核启动/规则落地」耗时。
+    action_mark tproxy_probe_begin
     tproxy_probe || return 1
+    action_mark tproxy_probe_done
     if [ "$(get_setting tproxy false)" = true ] && [ -f "$TP_CFG" ] &&
        [ "$(config_fingerprint)" = "$(cat "$RUNDIR/tproxy.config.fp" 2>/dev/null)" ]; then
       _rc_keep_tp_cfg=1
@@ -2905,7 +2908,11 @@ _restart_core_body() {
   if start_core; then
     # Tproxy 模式（含普通重启时开关本来就是开的）：等规则真正装上再报成功，
     # 否则前端显示「已切换」但流量还没被接管，用户以为切失败/卡住了。
-    [ "$(get_setting tproxy false)" = "true" ] && tproxy_ready_wait
+    if [ "$(get_setting tproxy false)" = "true" ]; then
+      action_mark tproxy_ready_wait_begin
+      tproxy_ready_wait
+      action_mark tproxy_ready_wait_done
+    fi
     return 0
   fi
   tproxy_unhook_quick 2>/dev/null
@@ -4048,6 +4055,27 @@ _tunhs_diag_config_tun() {
   )
 }
 
+# 从 Mihomo /configs JSON 中抽出 tun 对象（处理字符串转义与嵌套对象）。
+_diag_api_tun_object() {
+  awk '
+    {
+      key="\"tun\":"; p=index($0,key); if (!p) next
+      s=substr($0,p+length(key)); depth=0; quoted=0; escaped=0
+      for (i=1; i<=length(s); i++) {
+        c=substr(s,i,1)
+        if (quoted) {
+          if (escaped) escaped=0
+          else if (c=="\\") escaped=1
+          else if (c=="\"") quoted=0
+        } else if (c=="\"") quoted=1
+        else if (c=="{") depth++
+        else if (c=="}") { depth--; if (depth==0) { print substr(s,1,i); exit } }
+      }
+      exit
+    }
+  ' 2>/dev/null
+}
+
 tun_hotspot_diag() {
   _tunhs_bins
   echo "== 模块设置 =="
@@ -4067,23 +4095,7 @@ tun_hotspot_diag() {
   echo "== Mihomo API 实际 TUN 配置 =="
   if running; then
     _dg_api=$(MH_API_TIMEOUT=2 api GET /configs 2>/dev/null)
-    _dg_api_tun=$(printf '%s\n' "$_dg_api" | awk '
-      {
-        key="\"tun\":"; p=index($0,key); if (!p) next
-        s=substr($0,p+length(key)); depth=0; quoted=0; escaped=0
-        for (i=1; i<=length(s); i++) {
-          c=substr(s,i,1)
-          if (quoted) {
-            if (escaped) escaped=0
-            else if (c=="\\") escaped=1
-            else if (c=="\"") quoted=0
-          } else if (c=="\"") quoted=1
-          else if (c=="{") depth++
-          else if (c=="}") { depth--; if (depth==0) { print substr(s,1,i); exit } }
-        }
-        exit
-      }
-    ' 2>/dev/null)
+    _dg_api_tun=$(printf '%s\n' "$_dg_api" | _diag_api_tun_object)
     [ -n "$_dg_api_tun" ] && echo "tun=$_dg_api_tun" || echo "(API 不可达 / 未返回 tun 对象)"
   else
     echo "(内核未运行)"
@@ -5303,6 +5315,7 @@ TP_GRACE=3                        # 宽限轮数（对账约 5s/轮 → 约 15s�
                                   # 15s 足够覆盖内核重载配置，又不至于长时间黑洞。
 TP_CFG=$RUNDIR/tproxy.cfg         # 开启时对 config.yaml 的改动记录（关闭时据此还原）
 TP_LOG=$RUNDIR/tproxy.log
+TP_LOG_PREV=$RUNDIR/tproxy.prev.log   # 关闭时保留最近一段，便于诊断互切前后的时间线
 TP_CAP=$RUNDIR/tproxy.cap         # 已通过的内核/iptables 能力探测缓存，避免每次开关重复探测
 TP_LOCK=$RUNDIR/tproxy.lock       # 对账互斥锁（目录型，语义同 TUNHS_LOCK）
 TP_MARK="0x1000000/0x1000000"     # fwmark（bit 24，netd 不使用该位；set-xmark 保留原 mark 其余位）
@@ -7523,9 +7536,15 @@ _tproxy_apply_body() {
   rm -f "$TP_STATE" "$TP_MISS" 2>/dev/null
   live_invalidate 2>/dev/null
   tp_log "disable: 规则已拆除"
-  # 关闭后清空 tproxy 日志：开关已经关掉，上一段生命周期里的安装/对账/拆除记录
-  # 对用户不再有意义（诊断服务会现场重跑，也不依赖历史）。清空只删文件内容，
-  # 保留文件本身，后续 tp_log 追加写入不受影响。
+  # 主日志继续按原约定在关闭后清空；先留最近 80 行到独立上一段快照，
+  # 这样切到 TUN 后再打开 Tproxy 诊断，仍能看到刚才那轮拆除/互切时间线。
+  if [ -s "$TP_LOG" ]; then
+    tail -n 80 "$TP_LOG" > "$TP_LOG_PREV.tmp" 2>/dev/null &&
+      mv -f "$TP_LOG_PREV.tmp" "$TP_LOG_PREV" 2>/dev/null
+    rm -f "$TP_LOG_PREV.tmp" 2>/dev/null
+  else
+    : > "$TP_LOG_PREV" 2>/dev/null
+  fi
   : > "$TP_LOG" 2>/dev/null
   if [ -f "$TP_CFG" ] && [ -f "$RUNDIR/tproxy.config.fp" ] &&
      [ "$(config_fingerprint)" != "$(cat "$RUNDIR/tproxy.config.fp")" ]; then
@@ -7605,6 +7624,35 @@ tproxy_diag() {
     echo "防火墙后端: nftables（独立表 inet $TP_NFT_TABLE，nft=${TP_NFT:-缺失}）"
   else
     echo "防火墙后端: iptables"
+  fi
+  echo "TUN 配置（磁盘）:"
+  _tunhs_diag_config_tun "$CONFIG"
+  echo "TUN 配置（当前内核快照）:"
+  _tunhs_diag_config_tun "$RUNDIR/active-config.yaml"
+  echo "eBPF 状态: $(cat "$RUNDIR/ebpf.active" 2>/dev/null || echo '(无)')"
+  if running; then
+    _td_api_cfg=$(MH_API_TIMEOUT=2 api GET /configs 2>/dev/null)
+    _td_api_tun=$(printf '%s\n' "$_td_api_cfg" | _diag_api_tun_object)
+    echo "Mihomo API TUN: ${_td_api_tun:-不可达/无 tun 对象}"
+  fi
+  echo "TP_STATE 时间: $([ -f "$TP_STATE" ] && { _td_now=$(date +%s 2>/dev/null); _td_mt=$(stat -c %Y "$TP_STATE" 2>/dev/null || "$BUSYBOX" stat -c %Y "$TP_STATE" 2>/dev/null); case "$_td_now:$_td_mt" in *[!0-9:]*) echo '不可读' ;; *) echo "mtime=$_td_mt age=$((_td_now - _td_mt))s" ;; esac; } || echo '(无)')"
+  echo "TP_MISS: $(cat "$TP_MISS" 2>/dev/null || echo '(无)')"
+  echo "TP_LOCK:"
+  if [ -d "$TP_LOCK" ]; then
+    _td_tpid=$(cat "$TP_LOCK/pid" 2>/dev/null)
+    _td_tlock="pid=${_td_tpid:-?} age=$(tproxy_lock_age)s"
+    if tproxy_lock_stale; then _td_tlock="$_td_tlock [陈旧]"; else _td_tlock="$_td_tlock [持有中]"; fi
+    case "$_td_tpid" in ''|*[!0-9]*) ;; *)
+      [ -r "/proc/$_td_tpid/cmdline" ] && _td_tlock="$_td_tlock cmd=$(tr '\000' ' ' < "/proc/$_td_tpid/cmdline" 2>/dev/null | cut -c1-180)" ;;
+    esac
+    echo "$_td_tlock"
+  else echo "(空闲)"; fi
+  echo "iptables-restore 能力缓存: $(cat "$RUNDIR/tproxy.bulk.ok" 2>/dev/null | tr '\n' ' ' || echo '(无)')"
+  if [ -f "$RUNDIR/tproxy.bulk.reject" ]; then
+    echo "批量下发回退现场: 存在"
+    head -n 45 "$RUNDIR/tproxy.bulk.reject" 2>/dev/null
+  else
+    echo "批量下发回退现场: (无)"
   fi
 
   echo
@@ -7825,9 +7873,24 @@ fi
     else echo "  （本 ip 不支持 route get mark，请看上方 table 252）"; fi
   fi
   echo
-
-  echo "=== 日志尾部 ==="
-  tail -n 12 "$TP_LOG" 2>/dev/null | sed 's/^/  /'
+  echo "=== 生命周期分段（action-latest.trace；毫秒） ==="
+  _td_now=$(date +%s 2>/dev/null)
+  _td_trace_mt=$(stat -c %Y "$RUNDIR/action-latest.trace" 2>/dev/null || "$BUSYBOX" stat -c %Y "$RUNDIR/action-latest.trace" 2>/dev/null)
+  case "$_td_now:$_td_trace_mt" in *[!0-9:]*) echo "trace 时间: 不可读" ;;
+    *) echo "trace age=$((_td_now - _td_trace_mt))s" ;; esac
+  cat "$RUNDIR/action-latest.trace" 2>/dev/null || echo "(无)"
+  echo "=== 当前启动 core.log（LOGFILE.off 之后的增量） ==="
+  _td_off=$(cat "$LOGFILE.off" 2>/dev/null); _td_size=$(wc -c < "$LOGFILE" 2>/dev/null)
+  case "$_td_off:$_td_size" in *[!0-9:]*) tail -n 60 "$LOGFILE" 2>/dev/null ;;
+    *) if [ "$_td_size" -gt "$_td_off" ]; then tail -c +$((_td_off + 1)) "$LOGFILE" 2>/dev/null | tail -n 80
+       else echo "(当前启动后暂无 core.log 内容)"; fi ;;
+  esac
+  echo "=== 当前 tproxy.log 尾部（最近 40 行） ==="
+  tail -n 40 "$TP_LOG" 2>/dev/null || true
+  echo "=== 上一段 tproxy.log（关闭时保存，最近 80 行） ==="
+  if [ -f "$TP_LOG_PREV" ]; then tail -n 80 "$TP_LOG_PREV" 2>/dev/null; else echo "(无)"; fi
+  echo "=== tunhs.log 尾部（最近 40 行；观察 TUN↔Tproxy 清理次序） ==="
+  tail -n 40 "$TUNHS_LOG" 2>/dev/null || true
 }
 
 tproxy_status() {
