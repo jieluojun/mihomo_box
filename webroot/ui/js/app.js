@@ -408,11 +408,16 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   // protocol / roaming_protocol 改成仅 IPv4，这里把「现在到底是不是 IPv4」直接摆出来。
   // content 查询每次要拉起一个 JVM，所以只在弹层打开与切换 IPv6 后各取一次，
   // 绝不放进 1.5 秒一次的 mod-state 轮询。
-  const apnStatus = h('span', { text: '首选 APN：读取中…' });
+  // 与 TUN 热点 / Tproxy 的「当前状态：…」同款样式：单独一行、12.5px、同一前景色，
+  // 与说明文字之间留 10px 上间距（不是紧贴在说明最后一行下面）。
+  const APN_LINE_STYLE = 'font-size:12.5px;color:var(--text-3);margin-top:10px;line-height:1.5';
+  const apnStatus = h('div', { style: APN_LINE_STYLE, text: '首选 APN：读取中…' });
+  // Android 的 APN protocol 取值是 IP / IPV6 / IPV4V6（老 ROM 也有 IPV4）：
+  // 「IP」就是仅 IPv4，直接印 IP 会让人以为没读出来。
   const apnProtoName = v => {
     const t = String(v || '').trim().toUpperCase();
-    if (t === 'IPV4V6') return 'IPv4/IPv6';
-    if (t === 'IPV4') return 'IPv4';
+    if (t === 'IPV4V6' || t === 'IPV4/IPV6') return 'IPv4/IPv6';
+    if (t === 'IPV4' || t === 'IP') return 'IPv4';
     if (t === 'IPV6') return 'IPv6';
     return t || '未知';
   };
@@ -648,7 +653,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
     // IPv6 相关开关（顶层 ipv6 / dns.ipv6 / eBPF 入站 local·shared.ipv6）并重启服务，
     // 手术与重启都由后端 set system_ipv6 一次完成（见 cfg_ipv6_set_all）。
     h('div', { class: 'f-row' },
-      h('div', { class: 'f-label' }, '系统 IPv6', h('div', { class: 'f-desc' }, v6DescMain, h('br'), apnStatus)),
+      h('div', { class: 'f-label' }, '系统 IPv6', h('div', { class: 'f-desc' }, v6DescMain), apnStatus),
       h('div', { class: 'f-ctl' }, (() => {
         let sw;
         sw = switchCtl(v6On, async (v) => {
