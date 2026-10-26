@@ -4094,7 +4094,7 @@ tun_hotspot_diag() {
   _tunhs_diag_config_tun "$RUNDIR/active-config.yaml"
   echo "== Mihomo API 实际 TUN 配置 =="
   if running; then
-    _dg_api=$(MH_API_TIMEOUT=2 api GET /configs 2>/dev/null)
+    _dg_api=$(MH_API_TIMEOUT=1 api GET /configs 2>/dev/null)
     _dg_api_tun=$(printf '%s\n' "$_dg_api" | _diag_api_tun_object)
     [ -n "$_dg_api_tun" ] && echo "tun=$_dg_api_tun" || echo "(API 不可达 / 未返回 tun 对象)"
   else
@@ -4206,10 +4206,14 @@ tun_hotspot_diag() {
   return 0
 }
 
-# dnsmasq 占用异常排查：进程 CPU（2s 采样）、等待点、fd 数、3s 内核网络事件速率与样例、
-# 模块写过 IPv6 开关的记录。事件速率高 = 网络参数被反复改动（netlink 风暴）；
-# 事件很少而 CPU 仍高 = dnsmasq 自己在空转（如某个 socket 一直报错），看 wchan/fd。
+# dnsmasq 占用异常排查：CPU / 网络事件默认各采样 0.5s，尽量让一键诊断快返回；
+# 需要高精度时用 TUNHS_DIAG_FULL=1 sh mihomo.sh tun-hotspot-diag（恢复 2s/3s）。
+# 同一诊断前段已经读取 Mihomo API TUN 配置，IPv6 速览跳过重复 API 请求。
 tunhs_diag_dnsmasq() {
+  _dd_cpu_wait=0.5; _dd_cpu_den=50; _dd_net_wait=0.5; _dd_net_label=0.5s
+  if [ "${TUNHS_DIAG_FULL:-0}" = "1" ]; then
+    _dd_cpu_wait=2; _dd_cpu_den=200; _dd_net_wait=3; _dd_net_label=3s
+  fi
   echo "== dnsmasq =="
   _dd_found=0
   for _dd_c in /proc/[0-9]*/comm; do
@@ -4220,29 +4224,29 @@ tunhs_diag_dnsmasq() {
     _dd_found=1
     echo "pid $_dd_p: $(tr '\0' ' ' < /proc/$_dd_p/cmdline 2>/dev/null | cut -c1-200)"
     _dd_t1=$(awk '{print $14+$15}' /proc/$_dd_p/stat 2>/dev/null)
-    sleep 2
+    sleep "$_dd_cpu_wait"
     _dd_t2=$(awk '{print $14+$15}' /proc/$_dd_p/stat 2>/dev/null)
     case "$_dd_t1$_dd_t2" in
       ''|*[!0-9]*) echo "  CPU：无法采样" ;;
-      *) echo "  CPU：约 $(( (_dd_t2 - _dd_t1) * 100 / 200 ))%（2s 采样，按 100 tick/s 折算；100=占满一核）" ;;
+      *) echo "  CPU：约 $(( (_dd_t2 - _dd_t1) * 100 / $_dd_cpu_den ))%（${_dd_cpu_wait}s 采样，按 100 tick/s 折算；100=占满一核）" ;;
     esac
     echo "  wchan: $(cat /proc/$_dd_p/wchan 2>/dev/null)  fd 数: $(ls /proc/$_dd_p/fd 2>/dev/null | wc -l)  $(grep -E '^(State|Threads)' /proc/$_dd_p/status 2>/dev/null | tr '\n' ' ')"
   done
   [ "$_dd_found" = "1" ] || echo "(未运行——热点共享未开启？)"
   if [ -n "$TUNHS_IP" ]; then
-    echo "== 内核网络事件（3s，address/link/route） =="
+    echo "== 内核网络事件（${_dd_net_label}采样，address/link/route） =="
     _dd_ev="$RUNDIR/dnsmasq.ev"
     : > "$_dd_ev" 2>/dev/null
     $TUNHS_IP monitor address link route > "$_dd_ev" 2>&1 &
     _dd_mp=$!
-    sleep 3
+    sleep "$_dd_net_wait"
     kill "$_dd_mp" 2>/dev/null; wait "$_dd_mp" 2>/dev/null
     echo "共 $(wc -l < "$_dd_ev" 2>/dev/null) 行；样例："
     head -n 12 "$_dd_ev" 2>/dev/null | cut -c1-160 | sed 's/^/  /'
     rm -f "$_dd_ev" 2>/dev/null
   fi
   echo "== 系统 IPv6 对账 =="
-  ipv6_status 2>&1 | head -n 30
+  ipv6_status skip-api 2>&1 | head -n 30
   echo "== ip6tables OUTPUT（RA 丢弃） =="
   if [ -n "$TUNHS_IP6T" ]; then $TUNHS_IP6T -S OUTPUT 2>&1 | grep -i icmpv6 || echo "(无)"; else echo "(无 ip6tables)"; fi
   return 0
@@ -5237,8 +5241,10 @@ ipv6_status() {
   echo "配置文件顶层 ipv6: $(cfg_top_ipv6)（空=未写）"
   [ -f "$RUNDIR/active-config.yaml" ] && echo "内核在用配置 ipv6: $(CONFIG="$RUNDIR/active-config.yaml" cfg_top_ipv6)（空=未写）"
   echo "配置文件 TUN: $( tunhs_tun_enabled && echo on || echo off )"
-  _iv_tunrep=$(MH_API_TIMEOUT=2 api GET /configs 2>/dev/null | grep -o '"tun":{"enable":[a-z]*' | head -n 1)
-  [ -n "$_iv_tunrep" ] && echo "内核自报 TUN: $_iv_tunrep （enable=false 而配置是 true ＝ TUN 没起来，流量不会进内核）"
+  if [ "${1:-}" != "skip-api" ]; then
+    _iv_tunrep=$(MH_API_TIMEOUT=2 api GET /configs 2>/dev/null | grep -o '"tun":{"enable":[a-z]*' | head -n 1)
+    [ -n "$_iv_tunrep" ] && echo "内核自报 TUN: $_iv_tunrep （enable=false 而配置是 true ＝ TUN 没起来，流量不会进内核）"
+  fi
   _iv_dir=${IPV6_CONF:-/proc/sys/net/ipv6/conf}
   _iv_w=""; [ -f "$IPV6_WANT" ] && IFS= read -r _iv_w < "$IPV6_WANT" 2>/dev/null
   case "$_iv_w" in
