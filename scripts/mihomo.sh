@@ -4046,13 +4046,21 @@ tunhs_status_short() {
 _tunhs_diag_config_tun() {
   _tdc_file=$1
   [ -r "$_tdc_file" ] || { echo "(不可读: $_tdc_file)"; return 0; }
-  (
-    CONFIG=$_tdc_file
-    for _tdc_k in enable device stack auto-route strict-route auto-redirect route-table; do
-      _tdc_v=$(tunhs_cfg_tun_field "$_tdc_k")
-      printf '  %s=%s\n' "$_tdc_k" "${_tdc_v:-<未设置>}"
-    done
-  )
+  awk '
+    BEGIN { n=split("enable device stack auto-route strict-route auto-redirect route-table", k, " ") }
+    /^[^ \t#-]/ { inb=($1 == "tun:") }
+    inb && /^tun:[ \t]*\{/ {
+      line=$0
+      for (i=1; i<=n; i++) if (match(line, k[i] ":[ \t]*")) {
+        v[k[i]]=substr(line, RSTART+RLENGTH); sub(/[,}].*$/, "", v[k[i]])
+        gsub(/["\047]/, "", v[k[i]]); sub(/[ \t]+$/, "", v[k[i]])
+      }
+    }
+    inb { for (i=1; i<=n; i++) if ($1 == k[i] ":") {
+      v[k[i]]=$2; gsub(/["\047]/, "", v[k[i]])
+    } }
+    END { for (i=1; i<=n; i++) printf "  %s=%s\n", k[i], (v[k[i]] == "" ? "<未设置>" : v[k[i]]) }
+  ' "$_tdc_file" 2>/dev/null
 }
 
 # 从 Mihomo /configs JSON 中抽出 tun 对象（处理字符串转义与嵌套对象）。
@@ -4077,6 +4085,7 @@ _diag_api_tun_object() {
 }
 
 tun_hotspot_diag() {
+  now_cs; _dg_t_start=$NOW_CS
   _tunhs_bins
   echo "== 模块设置 =="
   grep -E '^(core|hotspot_proxy|autostart|tproxy)=' "$SETTINGS" 2>/dev/null
@@ -4143,6 +4152,7 @@ tun_hotspot_diag() {
     esac
     echo "$_dg_lk"
   else echo "(空闲)"; fi
+  now_cs; _dg_t_state=$((NOW_CS - _dg_t_start)); _dg_t_mark=$NOW_CS
   echo "== 网卡列表 =="
   ls /sys/class/net 2>/dev/null | tr '\n' ' '; echo
   _dg_iface=$(tunhs_find_iface 2>/dev/null)
@@ -4169,16 +4179,20 @@ tun_hotspot_diag() {
       echo "== 默认表 2022（对照） =="
       $TUNHS_IP route show table 2022 2>&1
     fi
-    echo "== 默认路由（-4 table all） =="
+    echo "== 默认路由（IPv4，各表） =="
     $TUNHS_IP -4 route show table all 2>&1 | grep -E '^default |[Ee]rror|[Uu]sage' || echo "(空)"
-    echo "== 默认路由（table all） =="
-    $TUNHS_IP route show table all 2>&1 | grep -E '^default |[Ee]rror|[Uu]sage' || echo "(空)"
-    echo "== 默认路由（逐表兜底枚举，含命名表） =="
-    for _dg_t in $($TUNHS_IP rule show 2>/dev/null | sed -n 's/.*lookup \([a-zA-Z0-9_-][a-zA-Z0-9_-]*\)$/\1/p' | sort -u); do
-      $TUNHS_IP route show table "$_dg_t" 2>/dev/null | grep -E '^default ' | sed "s/^/  table $_dg_t: /"
-    done
+    echo "== 默认路由（IPv6，各表） =="
+    $TUNHS_IP -6 route show table all 2>&1 | grep -E '^default |[Ee]rror|[Uu]sage' || echo "(空)"
     echo "== 策略路由（全部） =="
-    $TUNHS_IP rule show 2>&1
+    printf '%s\n' "$_dg_rules"
+    if [ "${TUNHS_DIAG_FULL:-0}" = "1" ]; then
+      echo "== 默认路由（逐表兜底枚举，含命名表；完整诊断） =="
+      for _dg_t in $(printf '%s\n' "$_dg_rules" | sed -n 's/.*lookup \([a-zA-Z0-9_-][a-zA-Z0-9_-]*\)$/\1/p' | sort -u); do
+        $TUNHS_IP route show table "$_dg_t" 2>/dev/null | grep -E '^default ' | sed "s/^/  table $_dg_t: /"
+      done
+    else
+      echo "== 默认路由逐表枚举已省略（设 TUNHS_DIAG_FULL=1 查看） =="
+    fi
     echo "== TUN 热点直连专用表 $TUNHS_TABLE =="
     $TUNHS_IP route show table "$TUNHS_TABLE" 2>&1
   else echo "(无 ip 命令)"; fi
@@ -4190,7 +4204,9 @@ tun_hotspot_diag() {
     echo "== 链 $TUNHS_CHAIN (nat) =="
     $TUNHS_IPT -t nat -S "$TUNHS_CHAIN" 2>&1
   else echo "(无 iptables)"; fi
+  now_cs; _dg_t_routes=$((NOW_CS - _dg_t_mark)); _dg_t_mark=$NOW_CS
   tunhs_diag_dnsmasq
+  now_cs; _dg_t_dns=$((NOW_CS - _dg_t_mark)); _dg_t_mark=$NOW_CS
   echo "== 最近生命周期分段（action-latest.trace） =="
   cat "$RUNDIR/action-latest.trace" 2>/dev/null || echo "(无)"
   echo "== 当前启动 core.log（LOGFILE.off 之后的增量） =="
@@ -4203,11 +4219,19 @@ tun_hotspot_diag() {
   tail -n 60 "$TUNHS_LOG" 2>/dev/null
   echo "== tproxy.log 尾部（最近 40 行） =="
   tail -n 40 "$TP_LOG" 2>/dev/null
+  now_cs
+  _dg_t_logs=$((NOW_CS - _dg_t_mark)); _dg_t_total=$((NOW_CS - _dg_t_start))
+  printf '== 诊断耗时（配置/状态 %d.%02ds；接口/路由/防火墙 %d.%02ds；dnsmasq/IPv6 %d.%02ds；日志 %d.%02ds；总计 %d.%02ds） ==\n' \
+    "$((_dg_t_state / 100))" "$((_dg_t_state % 100))" \
+    "$((_dg_t_routes / 100))" "$((_dg_t_routes % 100))" \
+    "$((_dg_t_dns / 100))" "$((_dg_t_dns % 100))" \
+    "$((_dg_t_logs / 100))" "$((_dg_t_logs % 100))" \
+    "$((_dg_t_total / 100))" "$((_dg_t_total % 100))"
   return 0
 }
 
 # dnsmasq 占用异常排查：CPU / 网络事件默认各采样 0.5s，尽量让一键诊断快返回；
-# 需要高精度时用 TUNHS_DIAG_FULL=1 sh mihomo.sh tun-hotspot-diag（恢复 2s/3s）。
+# 需要完整取证时用 TUNHS_DIAG_FULL=1 sh mihomo.sh tun-hotspot-diag（恢复 2s/3s 采样及逐表默认路由枚举）。
 # 同一诊断前段已经读取 Mihomo API TUN 配置，IPv6 速览跳过重复 API 请求。
 tunhs_diag_dnsmasq() {
   _dd_cpu_wait=0.5; _dd_cpu_den=50; _dd_net_wait=0.5; _dd_net_label=0.5s
