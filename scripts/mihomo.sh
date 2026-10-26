@@ -2406,8 +2406,26 @@ tproxy_ready_wait() {
     done
   fi
   tproxy_sync >/dev/null 2>&1
+  # 规则可能不是「这一次」装上的：start_core 的后台对账往往已经抢到对账锁在装
+  # （抢不到锁的 tproxy_sync 会立刻返回），而 TUN→Tproxy 互切时那轮对账还要先
+  # 收尾 TUN 残留。以前只尝试一次就往下走，界面已经报「已切换」，规则却还在别人
+  # 手里装——用户看到的就是「切过去好几秒才真的接管」。这里改成真正等到接管规则
+  # 落地：以 TP_STATE 出现为准（谁装的都算），期间按真实时钟有界等待（≤2s），
+  # 每 0.5s 补一次对账（对账幂等，装好即停）。
+  if [ ! -f "$TP_STATE" ]; then
+    _tr_k=0
+    now_cs
+    if [ "$NOW_CS" -gt 0 ]; then _tr_dl2=$((NOW_CS + 200)); else _tr_dl2=0; fi
+    while [ "$_tr_k" -lt 20 ]; do
+      [ -f "$TP_STATE" ] && break
+      if [ "$_tr_dl2" != "0" ]; then now_cs; [ "$NOW_CS" -ge "$_tr_dl2" ] && break; fi
+      nap 0.1
+      _tr_k=$((_tr_k + 1))
+      case $_tr_k in 5|10|15) tproxy_sync >/dev/null 2>&1 ;; esac
+    done
+  fi
   if [ -f "$TP_STATE" ]; then
-    tp_log "mode-switch: 规则已就绪 port=${_tr_port:-?}（等待 ${_tr_i} 轮）"
+    tp_log "mode-switch: 规则已就绪 port=${_tr_port:-?}（等待 ${_tr_i} 轮 / 追装 ${_tr_k:-0} 轮）"
     return 0
   fi
   tp_log "mode-switch: 端口/规则尚未就绪（port=${_tr_port:-?}），后台每秒追一次"
@@ -2716,6 +2734,19 @@ _start_core_body() {
     _sc_do_tun=$_sc_tun_on; _sc_do_tp=$_sc_tp_on
     [ -f "$TUNHS_STATE" ] && _sc_do_tun=1
     [ -f "$TP_STATE" ] && _sc_do_tp=1
+    # 两路对账一个「装」一个「拆」时不再并行，装的那一路先跑完：
+    # 模式互切（TUN→Tproxy / Tproxy→TUN）时，被关掉那一路只剩「清残留」——它的
+    # 几十次 iptables -D / ip rule del 与装配那一路抢同一把内核 xtables 锁
+    # （-w 等锁）和 CPU，装配被拖慢，用户看到的就是「切过去之后还要等一会儿
+    # 才真的接管」。残留清理晚几百毫秒毫无影响（对应网卡/端口已不存在，规则
+    # 挂着也不转发流量），所以让装配先独占锁跑完，再做清理。
+    # 两路同态（都装 / 都只清理）时保持并行，语义不变。
+    _sc_seq=none
+    if [ "$_sc_do_tun" = "1" ] && [ "$_sc_do_tp" = "1" ]; then
+      if [ "$_sc_tp_on" = "1" ] && [ "$_sc_tun_on" = "0" ]; then _sc_seq=tp
+      elif [ "$_sc_tun_on" = "1" ] && [ "$_sc_tp_on" = "0" ]; then _sc_seq=tun
+      fi
+    fi
     # 系统 IPv6 开着时，代理侧 v6 初始化失败会让 TUN/eBPF 静默起不来（内核照跑、
     # 流量整段绕过代理）。这里挂一次后台守卫：发现失败就回退成仅 IPv4 代理并重启，
     # 详见 ipv6_proxy_guard 的注释。
@@ -2725,11 +2756,19 @@ _start_core_body() {
     if [ "$_sc_do_tun" = "1" ] || [ "$_sc_do_tp" = "1" ]; then
       ( _i=0
         while [ $_i -lt 12 ]; do
-          ( [ "$_sc_do_tun" = "1" ] && tun_hotspot_sync ) >/dev/null 2>&1 &
-          _sc_tun_job=$!
-          ( [ "$_sc_do_tp" = "1" ] && tproxy_sync ) >/dev/null 2>&1 &
-          _sc_tp_job=$!
-          wait "$_sc_tun_job"; wait "$_sc_tp_job"
+          if [ "$_sc_seq" = tp ]; then
+            ( tproxy_sync ) >/dev/null 2>&1
+            ( tun_hotspot_sync ) >/dev/null 2>&1
+          elif [ "$_sc_seq" = tun ]; then
+            ( tun_hotspot_sync ) >/dev/null 2>&1
+            ( tproxy_sync ) >/dev/null 2>&1
+          else
+            ( [ "$_sc_do_tun" = "1" ] && tun_hotspot_sync ) >/dev/null 2>&1 &
+            _sc_tun_job=$!
+            ( [ "$_sc_do_tp" = "1" ] && tproxy_sync ) >/dev/null 2>&1 &
+            _sc_tp_job=$!
+            wait "$_sc_tun_job"; wait "$_sc_tp_job"
+          fi
           # 收敛即停：开着的功能规则已装（状态文件已写）、关着的功能状态已清
           _sc_ok=1
           if [ "$_sc_do_tun" = "1" ]; then
@@ -10194,8 +10233,18 @@ case "$cmd" in
     # `sh $0 tun-hotspot-sync; sh $0 tproxy-sync` 连拉两次，每拉一次都要重新
     # 解析一份 9000+ 行的脚本（慢设备 100~200ms），两者之间还白等一个进程启动。
     # _SW_QUICK=1 由调用方通过环境变量传入，两个函数各自识别（跳过抽查的全量轮）。
-    tun_hotspot_sync >/dev/null 2>&1
-    tproxy_sync >/dev/null 2>&1
+    # 互切时与 _start_core_body 同一原则：先跑「装」的那一路，再跑「清残留」的
+    # 那一路，别让逐条 -D / ip rule del 抢装配的 xtables 锁。
+    _ns_tun_on=0; _ns_tp_on=0
+    tunhs_tun_enabled && _ns_tun_on=1
+    [ "$(get_setting tproxy false)" = "true" ] && _ns_tp_on=1
+    if [ "$_ns_tp_on" = "1" ] && [ "$_ns_tun_on" = "0" ]; then
+      tproxy_sync >/dev/null 2>&1
+      tun_hotspot_sync >/dev/null 2>&1
+    else
+      tun_hotspot_sync >/dev/null 2>&1
+      tproxy_sync >/dev/null 2>&1
+    fi
     exit 0 ;;
   tproxy-status) tproxy_status ;;
   tproxy-diag)   tproxy_diag ;;
