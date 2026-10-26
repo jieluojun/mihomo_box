@@ -2684,7 +2684,7 @@ _start_core_body() {
       if [ -n "$_sc_tpp" ]; then
         # 等待时长用真实时钟封顶（nap 在 ceil 模式每轮睡 1 秒，按轮数推算会整体失真）
         [ -n "$NAP_MODE" ] || nap_load_mode
-        _sc_tl_max=80; [ "$NAP_MODE" = "frac" ] || _sc_tl_max=3
+        _sc_tl_max=80; [ "$NAP_MODE" = "frac" ] || _sc_tl_max=3   # 退路：取不到时钟时按轮数
         _sc_tl_end=0; now_cs
         [ "$NOW_CS" -gt 0 ] && _sc_tl_end=$((NOW_CS + 150))   # 1.5s 上限
         _sc_tl_n=0
@@ -2714,8 +2714,8 @@ _start_core_body() {
       ( _i=0
         _sc_stuck=0
         _sc_dl=0; now_cs
-        [ "$NOW_CS" -gt 0 ] && _sc_dl=$((NOW_CS + 600))   # 最多重试 6 秒
-        while [ $_i -lt 24 ]; do
+        [ "$NOW_CS" -gt 0 ] && _sc_dl=$((NOW_CS + 600))   # 最多重试 6 秒（真时钟）
+        while [ $_i -lt 24 ]; do                          # 退路：取不到时钟时按轮数（24×0.2s）
           if [ "$_sc_dl" != "0" ]; then
             now_cs
             [ "$NOW_CS" -ge "$_sc_dl" ] && break
@@ -5524,7 +5524,12 @@ tproxy_probe() {
   # TProxy 开关通常会反复操作，而这些能力只由内核/防火墙实现决定；
   # 成功探测后按内核版本、后端与命令路径缓存，避免每次开关都重复探测。
   # 缓存不匹配时自然回退到完整探测。
-  _tp_key="$(uname -r 2>/dev/null)|$TP_BACKEND|${TP_NFT:-$TP_IPT}|$TP_IP6T|$TP_CORE_GID"
+  # 系统 IPv6 关着时 Tproxy 根本不会下发 v6 规则：不探 v6（省 4 次 ip6tables 调用）。
+  # 是否探过 v6 必须进缓存 key，否则用户后来打开「系统 IPv6」会拿到 v6=0 的旧缓存、
+  # 静默不劫持 v6（fake-ip6 的 AAAA 从真实网卡黑洞）。
+  _tp_want_v6=0
+  [ "$(get_setting system_ipv6 false)" = "true" ] && _tp_want_v6=1
+  _tp_key="$(uname -r 2>/dev/null)|$TP_BACKEND|${TP_NFT:-$TP_IPT}|$TP_IP6T|$TP_CORE_GID|v6=$_tp_want_v6"
   if [ -r "$TP_CAP" ]; then
     _tp_ck=""; _tp_ct=0; _tp_cg=0; _tp_cu=0; _tp_cs=0; _tp_cst=0; _tp_cv=0
     IFS="$(printf '\t')" read -r _tp_ck _tp_ct _tp_cg _tp_cu _tp_cs _tp_cst _tp_cv < "$TP_CAP" 2>/dev/null
@@ -5546,7 +5551,7 @@ tproxy_probe() {
   $TP_IPT -w -t mangle -A mihomo_tp_probe -p tcp -m socket -j RETURN 2>/dev/null && _tp_cap_sock=1
   $TP_IPT -w -t mangle -F mihomo_tp_probe 2>/dev/null
   $TP_IPT -w -t mangle -X mihomo_tp_probe 2>/dev/null
-  if [ -n "$TP_IP6T" ]; then
+  if [ -n "$TP_IP6T" ] && [ "$_tp_want_v6" = "1" ]; then
     $TP_IP6T -w -t mangle -N mihomo_tp_probe 2>/dev/null
     $TP_IP6T -w -t mangle -A mihomo_tp_probe -p udp -j TPROXY --on-ip :: --on-port 1 --tproxy-mark "$TP_MARK" 2>/dev/null && _tp_cap_v6=1
     $TP_IP6T -w -t mangle -F mihomo_tp_probe 2>/dev/null
@@ -5812,6 +5817,10 @@ tproxy_iprule_add() {
   # $1=ip 命令  $2=pref 列表（空格分隔）  其余参数原样传给 ip
   _ta_ip=$1; _ta_list=$2; shift 2
   for _ta_p in $_ta_list; do
+    # 重启 / 反复对账时最常见的情况：规则本来就是我们上次装的那条。
+    # 先认一下（1 次 ip rule show），省掉「add 失败 → 判归属 → 删 → 再加」
+    # 的 5~9 次 ip 调用——它们在 tproxy 切换的关键路径上。
+    if tproxy_iprule_ours "$_ta_ip" "$_ta_p" "$@"; then echo "$_ta_p"; return 0; fi
     _ta_err=$($_ta_ip "$@" rule add pref "$_ta_p" fwmark "$TP_MARK" table "$TP_TABLE" 2>&1) && { echo "$_ta_p"; return 0; }
     printf '%s\n' "$_ta_err" >> "$TP_LOG" 2>/dev/null
     # 参数本身被拒（如表号超出 busybox 范围）换优先级也没用，直接失败，不能误报成「优先级被占用」
@@ -6036,6 +6045,46 @@ _tproxy_restore_bin() {
   [ -n "$_trb" ] && [ -x "$_trb" ] && printf '%s\n' "$_trb"
 }
 
+# 内置链跳转：已经在位就别动它。
+# 原来每次安装都「删干净 → 插链首」（6 次 iptables 调用），可重启/重复对账时跳转
+# 一直都在、指向的也是同名链（restore 只是把链内容换掉，引用没断），删了再加纯属
+# 白花 100~400ms。改成先 -C 认一次，缺了才补（1 次调用）。
+_tproxy_jumps_ensure() {
+  if ! $TP_IPT -w -t mangle -C PREROUTING -j "$TP_CHAIN_PRE" 2>/dev/null; then
+    while $TP_IPT -w -t mangle -D PREROUTING -j "$TP_CHAIN_PRE" 2>/dev/null; do :; done
+    $TP_IPT -w -t mangle -I PREROUTING -j "$TP_CHAIN_PRE" 2>>"$TP_LOG" || return 1
+  fi
+  if ! $TP_IPT -w -t mangle -C OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>/dev/null; then
+    while $TP_IPT -w -t mangle -D OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
+    $TP_IPT -w -t mangle -I OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || return 1
+  fi
+  if ! $TP_IPT -w -t mangle -C OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>/dev/null; then
+    while $TP_IPT -w -t mangle -D OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
+    $TP_IPT -w -t mangle -I OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || return 1
+  fi
+  return 0
+}
+
+# v6 规则要不要清：本次要开 v6、上次装的就是 v6、或状态文件丢了（异常重启残留）
+# 才清；状态明确写着 v6=off 时整段 6 次 ip6tables 调用可以直接跳过。
+# 纯 shell 读状态文件，不起进程。
+_tproxy_v6_cleanup_needed() {
+  [ "$1" = "on" ] && return 0
+  if [ -f "$TP_STATE" ]; then
+    _tv6=""
+    while IFS= read -r _tv6_l; do
+      case "$_tv6_l" in v6=*) _tv6=${_tv6_l#v6=} ;; esac
+    done < "$TP_STATE" 2>/dev/null
+    [ "$_tv6" = "off" ] && return 1
+    return 0
+  fi
+  # 状态文件丢了（异常重启 / run/ 被清）：不能凭「不知道」就白做 13 次 ip6tables/ip 调用。
+  # 先问一次链在不在——链都不存在，v6 规则与跳转也一定不存在。
+  [ -n "$TP_IP6T" ] || return 1
+  $TP_IP6T -w -t mangle -S "$TP_CHAIN_PRE" >/dev/null 2>&1 || return 1
+  return 0
+}
+
 # 生成并一次性下发 v4 规则。成功返回 0；不可用/失败返回非零（调用方回退逐条）。
 # 前置：_ti_want/_ti_fp/_ti_fb/_ti_apps 就绪，能力探测已通过。
 _tproxy_install_ipt_batched() {
@@ -6101,13 +6150,7 @@ _tproxy_install_ipt_batched() {
     return 1
   fi
   rm -f "$_ib_file" 2>/dev/null
-  # 跳转：先删干净再插链首（幂等；每条 1~2 次调用）
-  while $TP_IPT -w -t mangle -D PREROUTING -j "$TP_CHAIN_PRE" 2>/dev/null; do :; done
-  $TP_IPT -w -t mangle -I PREROUTING -j "$TP_CHAIN_PRE" 2>>"$TP_LOG" || return 1
-  while $TP_IPT -w -t mangle -D OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
-  while $TP_IPT -w -t mangle -D OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
-  $TP_IPT -w -t mangle -I OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || return 1
-  $TP_IPT -w -t mangle -I OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || return 1
+  _tproxy_jumps_ensure || return 1
   return 0
 }
 
@@ -6235,18 +6278,14 @@ tproxy_install() {
     $TP_IPT -w -t mangle -A "$TP_CHAIN_OUT" -p udp -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG"
   fi
 
-  # 挂载（先删干净再插链首；PREROUTING 同时覆盖 lo 回注与热点转发流量）
-  while $TP_IPT -w -t mangle -D PREROUTING -j "$TP_CHAIN_PRE" 2>/dev/null; do :; done
-  $TP_IPT -w -t mangle -I PREROUTING -j "$TP_CHAIN_PRE" 2>>"$TP_LOG" || { tp_log "WARN PREROUTING 挂载失败"; tproxy_teardown; return 1; }
-  while $TP_IPT -w -t mangle -D OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
-  while $TP_IPT -w -t mangle -D OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
-  $TP_IPT -w -t mangle -I OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || { tp_log "WARN OUTPUT(tcp) 挂载失败"; tproxy_teardown; return 1; }
-  $TP_IPT -w -t mangle -I OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || { tp_log "WARN OUTPUT(udp) 挂载失败"; tproxy_teardown; return 1; }
+  # 挂载（已在位就不动；PREROUTING 同时覆盖 lo 回注与热点转发流量）
+  _tproxy_jumps_ensure || { tp_log "WARN 跳转挂载失败"; tproxy_teardown; return 1; }
   fi   # ← 逐条下发分支结束（批量成功时上面的整段跳过）
 
   # —— v6：真 GUA 原生；只把 DNS fake-ip6 送进 TPROXY（对齐 IPv4 的 198.18.0.0/16）。
   # 禁止 local default + 全量 OUTPUT mark，否则系统测不到 240e: 地址。
-  tproxy_v6_unhook
+  # 上次就是 v6=off 且这次也不要 v6 时，整段清理（6 次 ip6tables）没必要跑。
+  if _tproxy_v6_cleanup_needed "$_ti_v6"; then tproxy_v6_unhook; fi
   _ti_v6_ok=off
   if [ "$_ti_v6" = "on" ] && [ "$_tp_cap_v6" = "1" ] && [ -n "$TP_IP6T" ]; then
     _ti_v6ok=1
@@ -6396,19 +6435,19 @@ _tproxy_sync_body() {
   # —— 已应用态（mode=实际生效名单，swant=安装时期望名单，fp=名单指纹，fb=降级标记）——
   _ps_have=0; _ps_port=""; _ps_v6=off; _ps_bp=uid; _ps_ver=0; _ps_backend=ipt; _ps_wbackend=$TP_BACKEND
   _ps_mode=all; _ps_swant=all; _ps_fp=all; _ps_fb=0; _ps_uids=0; _ps_uh=""
-  if [ -f "$TP_STATE" ]; then
+  if state_read_tp; then
     _ps_have=1
-    _ps_port=$(grep '^port=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
-    grep -q '^v6=on' "$TP_STATE" 2>/dev/null && _ps_v6=on
-    _ps_bp=$(grep '^bypass=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
-    _ps_ver=$(grep '^ver=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
-    _ps_mode=$(grep '^mode=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
-    _ps_swant=$(grep '^want=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
-    _ps_fp=$(grep '^fp=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
-    _ps_fb=$(grep '^fb=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
-    _ps_uids=$(grep '^uids=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
-    _ps_uh=$(grep '^uh=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
-    _ps_backend=$(grep '^backend=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
+    _ps_port=$_SF_port
+    [ "$_SF_v6" = "on" ] && _ps_v6=on
+    _ps_bp=$_SF_bypass
+    _ps_ver=$_SF_ver
+    _ps_mode=$_SF_mode
+    _ps_swant=$_SF_want
+    _ps_fp=$_SF_fp
+    _ps_fb=$_SF_fb
+    _ps_uids=$_SF_uids
+    _ps_uh=$_SF_uh
+    _ps_backend=$_SF_backend
     case "$_ps_backend" in nft|ipt) ;; *) _ps_backend=ipt ;; esac
     case "$_ps_mode" in include|exclude) ;; *) _ps_mode=all ;; esac
     case "$_ps_swant" in include|exclude) ;; *) _ps_swant=all ;; esac
@@ -7162,20 +7201,48 @@ _tproxy_apply_body() {
 #   pending = 内核运行中，等待 TProxy 端口就绪
 #   holding = 规则已装但端口暂不可见，宽限期内保留规则（不拆，避免直连窗口）
 #   on:port=N:v6=on|off = 规则已应用
+# 读 Tproxy 状态文件到 _SF_* 全局，零 fork。
+# 以前每个字段单独一条 `grep ... | cut ...` 管道：一次对账要 20+ 个进程，
+# 慢设备上光读状态就几百毫秒，而这些读取全在切换/对账的关键路径上。
+state_read_tp() {
+  _SF_port=""; _SF_v6=off; _SF_bypass=uid; _SF_ver=0; _SF_mode=all; _SF_want=all
+  _SF_fp=all; _SF_fb=0; _SF_apps=0; _SF_uids=0; _SF_uh=""; _SF_pref=""; _SF_backend=ipt
+  [ -f "$TP_STATE" ] || return 1
+  while IFS= read -r _sf_l; do
+    case "$_sf_l" in
+      port=*)    _SF_port=${_sf_l#port=} ;;
+      v6=*)      _SF_v6=${_sf_l#v6=} ;;
+      bypass=*)  _SF_bypass=${_sf_l#bypass=} ;;
+      ver=*)     _SF_ver=${_sf_l#ver=} ;;
+      mode=*)    _SF_mode=${_sf_l#mode=} ;;
+      want=*)    _SF_want=${_sf_l#want=} ;;
+      fp=*)      _SF_fp=${_sf_l#fp=} ;;
+      fb=*)      _SF_fb=${_sf_l#fb=} ;;
+      apps=*)    _SF_apps=${_sf_l#apps=} ;;
+      uids=*)    _SF_uids=${_sf_l#uids=} ;;
+      uh=*)      _SF_uh=${_sf_l#uh=} ;;
+      pref=*)    _SF_pref=${_sf_l#pref=} ;;
+      backend=*) _SF_backend=${_sf_l#backend=} ;;
+    esac
+  done < "$TP_STATE" 2>/dev/null
+  return 0
+}
+
 tproxy_status_short() {
   setting_v tproxy false
   [ "$SV" = "true" ] || { echo "off"; return 0; }
-  if [ -f "$TP_STATE" ]; then
-    _tss_p=$(grep '^port=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
-    if grep -q '^v6=on' "$TP_STATE" 2>/dev/null; then _tss_v=on; else _tss_v=off; fi
+  if state_read_tp; then
+    _tss_p=$_SF_port
+    _tss_v=$_SF_v6
+    [ "$_tss_v" = "on" ] || _tss_v=off
     # 应用名单后缀（want=期望名单，apps=包数；fb=名单暂未生效、已按全部代理）
-    _tss_a=$(grep '^want=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
-    _tss_n=$(grep '^apps=' "$TP_STATE" 2>/dev/null | cut -d= -f2)
+    _tss_a=$_SF_want
+    _tss_n=$_SF_apps
     case "$_tss_a" in include|exclude) ;; *) _tss_a=all ;; esac
     case "$_tss_n" in ''|*[!0-9]*) _tss_n=0 ;; esac
     _tss_app=":app=$_tss_a"
     [ "$_tss_a" != "all" ] && _tss_app="$_tss_app:apps=$_tss_n"
-    grep -q '^fb=1' "$TP_STATE" 2>/dev/null && _tss_app="$_tss_app:fb"
+    [ "$_SF_fb" = "1" ] && _tss_app="$_tss_app:fb"
     if [ -f "$TP_MISS" ]; then
       _tss_m=$(cat "$TP_MISS" 2>/dev/null)
       case "$_tss_m" in ''|*[!0-9]*) _tss_m=0 ;; esac
