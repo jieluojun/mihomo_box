@@ -4032,18 +4032,82 @@ tunhs_status_short() {
   fi
 }
 
-# 全量诊断：直连未生效时收集设备侧真实状态（设置/状态/路由/规则/链/日志）。
-# 输出可直接截图反馈：覆盖「上游发现失败」「规则没装上」「被外部清除」各分支。
+# 全量诊断：同时收集 Mihomo 核心 TUN 路由和模块热点转发规则。
+# 核心 TUN 规则由 Mihomo 安装，tunhs.state 只代表热点 FORWARD 规则；必须分开展示，
+# 否则「热点规则已装」会被误读成「核心 TUN 已接管」。输出也带最近生命周期 trace，
+# 便于把 core_spawned/core_ready 与规则落地日志按同一时间线对齐。
+_tunhs_diag_config_tun() {
+  _tdc_file=$1
+  [ -r "$_tdc_file" ] || { echo "(不可读: $_tdc_file)"; return 0; }
+  (
+    CONFIG=$_tdc_file
+    for _tdc_k in enable device stack auto-route strict-route auto-redirect route-table; do
+      _tdc_v=$(tunhs_cfg_tun_field "$_tdc_k")
+      printf '  %s=%s\n' "$_tdc_k" "${_tdc_v:-<未设置>}"
+    done
+  )
+}
+
 tun_hotspot_diag() {
   _tunhs_bins
   echo "== 模块设置 =="
-  grep -E '^(core|hotspot_proxy|autostart)=' "$SETTINGS" 2>/dev/null
+  grep -E '^(core|hotspot_proxy|autostart|tproxy)=' "$SETTINGS" 2>/dev/null
   echo "== 内核状态 =="
-  running && echo "running pid $(pid_of)" || echo "stopped"
-  echo "== tunhs.state =="
+  if running; then
+    _dg_pid=$(pid_of)
+    echo "running pid $_dg_pid"
+    [ -r "/proc/$_dg_pid/cmdline" ] && printf 'cmdline: %s\n' "$(tr '\000' ' ' < "/proc/$_dg_pid/cmdline" 2>/dev/null | cut -c1-240)"
+  else
+    echo "stopped"
+  fi
+  echo "== TUN 配置（磁盘：下次启动期望值） =="
+  _tunhs_diag_config_tun "$CONFIG"
+  echo "== TUN 配置（active-config：当前内核启动快照） =="
+  _tunhs_diag_config_tun "$RUNDIR/active-config.yaml"
+  echo "== Mihomo API 实际 TUN 配置 =="
+  if running; then
+    _dg_api=$(MH_API_TIMEOUT=2 api GET /configs 2>/dev/null)
+    _dg_api_tun=$(printf '%s\n' "$_dg_api" | awk '
+      {
+        key="\"tun\":"; p=index($0,key); if (!p) next
+        s=substr($0,p+length(key)); depth=0; quoted=0; escaped=0
+        for (i=1; i<=length(s); i++) {
+          c=substr(s,i,1)
+          if (quoted) {
+            if (escaped) escaped=0
+            else if (c=="\\") escaped=1
+            else if (c=="\"") quoted=0
+          } else if (c=="\"") quoted=1
+          else if (c=="{") depth++
+          else if (c=="}") { depth--; if (depth==0) { print substr(s,1,i); exit } }
+        }
+        exit
+      }
+    ' 2>/dev/null)
+    [ -n "$_dg_api_tun" ] && echo "tun=$_dg_api_tun" || echo "(API 不可达 / 未返回 tun 对象)"
+  else
+    echo "(内核未运行)"
+  fi
+  echo "== TUN / eBPF / Tproxy 状态文件 =="
+  echo "tunhs.state:"
   cat "$TUNHS_STATE" 2>/dev/null || echo "(无)"
+  echo "tproxy.state:"
+  cat "$TP_STATE" 2>/dev/null || echo "(无)"
+  echo "ebpf.active: $(cat "$RUNDIR/ebpf.active" 2>/dev/null || echo '(无)')"
   echo "== tunhs.pickfail =="
   cat "$RUNDIR/tunhs.pickfail" 2>/dev/null || echo "(无)"
+  echo "== 规则状态文件时间 =="
+  _dg_now=$(date +%s 2>/dev/null)
+  for _dg_f in "$TUNHS_STATE" "$TP_STATE"; do
+    if [ -f "$_dg_f" ]; then
+      _dg_mt=$(stat -c %Y "$_dg_f" 2>/dev/null || "$BUSYBOX" stat -c %Y "$_dg_f" 2>/dev/null)
+      case "$_dg_now:$_dg_mt" in *[!0-9:]*) echo "${_dg_f##*/}: 时间不可读" ;;
+        *) echo "${_dg_f##*/}: mtime=$_dg_mt age=$((_dg_now - _dg_mt))s" ;;
+      esac
+    else
+      echo "${_dg_f##*/}: (无)"
+    fi
+  done
   echo "== 监听循环心跳 =="
   if [ -f "$RUNDIR/tunhs.beat" ]; then
     _dg_bn=$(date +%s 2>/dev/null)
@@ -4052,30 +4116,47 @@ tun_hotspot_diag() {
     case "$_dg_bn" in ''|*[!0-9]*) _dg_ok=0 ;; esac
     case "$_dg_bm" in ''|*[!0-9]*) _dg_ok=0 ;; esac
     if [ "$_dg_ok" = "1" ]; then
-      _dg_ba=$((_dg_bn - _dg_bm))
-      [ "$_dg_ba" -lt 0 ] && _dg_ba=0
-      if [ "$_dg_ba" -lt 30 ]; then
-        echo "存活（${_dg_ba}s 前心跳）"
-      else
-        echo "疑似未运行（${_dg_ba}s 前心跳）——监听循环未启动或已卡死"
-      fi
-    else
-      echo "(心跳时间戳不可读)"
-    fi
-  else
-    echo "(无心跳文件——监听循环未跑过)"
-  fi
+      _dg_ba=$((_dg_bn - _dg_bm)); [ "$_dg_ba" -lt 0 ] && _dg_ba=0
+      if [ "$_dg_ba" -lt 30 ]; then echo "存活（${_dg_ba}s 前心跳）"
+      else echo "疑似未运行（${_dg_ba}s 前心跳）——监听循环未启动或已卡死"; fi
+    else echo "(心跳时间戳不可读)"; fi
+  else echo "(无心跳文件——监听循环未跑过)"; fi
   echo "== 对账锁 =="
   if [ -d "$TUNHS_LOCK" ]; then
     _dg_lk="存在: pid=$(cat "$TUNHS_LOCK/pid" 2>/dev/null)"
     if tunhs_lock_stale; then _dg_lk="$_dg_lk age=$(tunhs_lock_age)s [陈旧]"; else _dg_lk="$_dg_lk age=$(tunhs_lock_age)s [持有中]"; fi
+    _dg_lpid=$(cat "$TUNHS_LOCK/pid" 2>/dev/null)
+    case "$_dg_lpid" in ''|*[!0-9]*) ;; *)
+      [ -r "/proc/$_dg_lpid/cmdline" ] && _dg_lk="$_dg_lk cmd=$(tr '\000' ' ' < "/proc/$_dg_lpid/cmdline" 2>/dev/null | cut -c1-160)" ;;
+    esac
     echo "$_dg_lk"
-  else
-    echo "(空闲)"
-  fi
+  else echo "(空闲)"; fi
   echo "== 网卡列表 =="
   ls /sys/class/net 2>/dev/null | tr '\n' ' '; echo
+  _dg_iface=$(tunhs_find_iface 2>/dev/null)
+  echo "TUN 接口期望=$(tunhs_cfg_tun_field device) 实际=${_dg_iface:-<不存在>}"
+  if [ -n "$_dg_iface" ] && [ -n "$TUNHS_IP" ]; then
+    echo "== TUN 接口 link =="
+    $TUNHS_IP -details link show dev "$_dg_iface" 2>&1
+    echo "== TUN 接口 IPv4 地址 =="
+    $TUNHS_IP -4 addr show dev "$_dg_iface" 2>&1
+    echo "== TUN 接口 IPv6 地址 =="
+    $TUNHS_IP -6 addr show dev "$_dg_iface" 2>&1
+  fi
   if [ -n "$TUNHS_IP" ]; then
+    _dg_rt=$( ( CONFIG="$RUNDIR/active-config.yaml"; tunhs_cfg_tun_field route-table ) 2>/dev/null)
+    case "$_dg_rt" in ''|*[!0-9]*) _dg_rt=2022 ;; esac
+    echo "== 核心 TUN 策略路由（9000-9010 / route-table=$_dg_rt） =="
+    _dg_rules=$($TUNHS_IP rule show 2>&1)
+    printf '%s\n' "$_dg_rules" | grep -E '(^|[[:space:]])90(0[0-9]|10):|lookup 2022|table 2022|iif .*mihomo' || echo "(未发现 Mihomo TUN 核心规则)"
+    echo "== 核心 TUN IPv4 路由表 $_dg_rt =="
+    $TUNHS_IP -4 route show table "$_dg_rt" 2>&1
+    echo "== 核心 TUN IPv6 路由表 $_dg_rt =="
+    $TUNHS_IP -6 route show table "$_dg_rt" 2>&1
+    if [ "$_dg_rt" != 2022 ]; then
+      echo "== 默认表 2022（对照） =="
+      $TUNHS_IP route show table 2022 2>&1
+    fi
     echo "== 默认路由（-4 table all） =="
     $TUNHS_IP -4 route show table all 2>&1 | grep -E '^default |[Ee]rror|[Uu]sage' || echo "(空)"
     echo "== 默认路由（table all） =="
@@ -4086,24 +4167,30 @@ tun_hotspot_diag() {
     done
     echo "== 策略路由（全部） =="
     $TUNHS_IP rule show 2>&1
-    echo "== 表 $TUNHS_TABLE =="
+    echo "== TUN 热点直连专用表 $TUNHS_TABLE =="
     $TUNHS_IP route show table "$TUNHS_TABLE" 2>&1
-  else
-    echo "(无 ip 命令)"
-  fi
+  else echo "(无 ip 命令)"; fi
   if [ -n "$TUNHS_IPT" ]; then
     echo "== iptables FORWARD（相关行） =="
-    $TUNHS_IPT -S FORWARD 2>&1 | grep -Ei 'mihomo|Meta|tunhs|tetherctrl'
+    $TUNHS_IPT -S FORWARD 2>&1 | grep -Ei 'mihomo|Meta|tunhs|tetherctrl' || echo "(无相关规则)"
     echo "== 链 $TUNHS_CHAIN (filter) =="
     $TUNHS_IPT -S "$TUNHS_CHAIN" 2>&1
     echo "== 链 $TUNHS_CHAIN (nat) =="
     $TUNHS_IPT -t nat -S "$TUNHS_CHAIN" 2>&1
-  else
-    echo "(无 iptables)"
-  fi
+  else echo "(无 iptables)"; fi
   tunhs_diag_dnsmasq
-  echo "== tunhs.log 尾部 =="
-  tail -n 30 "$TUNHS_LOG" 2>/dev/null
+  echo "== 最近生命周期分段（action-latest.trace） =="
+  cat "$RUNDIR/action-latest.trace" 2>/dev/null || echo "(无)"
+  echo "== 当前启动 core.log（LOGFILE.off 之后的增量） =="
+  _dg_off=$(cat "$LOGFILE.off" 2>/dev/null); _dg_size=$(wc -c < "$LOGFILE" 2>/dev/null)
+  case "$_dg_off:$_dg_size" in *[!0-9:]*) tail -n 60 "$LOGFILE" 2>/dev/null ;;
+    *) if [ "$_dg_size" -gt "$_dg_off" ]; then tail -c +$((_dg_off + 1)) "$LOGFILE" 2>/dev/null | tail -n 80
+       else echo "(当前启动后暂无 core.log 内容)"; fi ;;
+  esac
+  echo "== tunhs.log 尾部（最近 60 行） =="
+  tail -n 60 "$TUNHS_LOG" 2>/dev/null
+  echo "== tproxy.log 尾部（最近 40 行） =="
+  tail -n 40 "$TP_LOG" 2>/dev/null
   return 0
 }
 
