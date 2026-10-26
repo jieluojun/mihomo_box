@@ -772,10 +772,28 @@ const connectionModeTracker = createConnectionModeTracker({
   }),
   onChange: () => { bumpUiRev(); paintDashboardConnectionMode(); },
 });
+// 主页「代理模式」里那个值＝**当前生效的接管方式**，与同一张卡上按钮的高亮、
+// 切换完成后的提示同源（都用 proxyModeLabel），所以三者永远在同一帧兑现。
+// 以前这里直接印连接快照里的入站类型：内核刚起、还没有流量时 /connections 是空的，
+// 于是「已切换为 Tproxy」的提示刚弹出来，卡片却写着「暂无连接」——提示与状态对不上。
+// 入站类型仍然保留，但只作为补充说明挂在这个值的 title 上，不再冒充代理模式本身。
+const PROXY_MODE_NAMES = { tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy', '无': '直连' };
+function proxyModeName(st) { return PROXY_MODE_NAMES[proxyModeLabel(st)] || '直连'; }
+// 连接快照里真正在跑的入站类型；「暂无连接/待识别/读取失败」都不算观测结果。
+function observedInboundText() {
+  const label = connectionModeTracker.getLabel();
+  return ['暂无连接', '待识别', '读取失败'].includes(label) ? '' : label;
+}
+function proxyModeStatTitle(st) {
+  const observed = observedInboundText();
+  return '当前代理模式：' + proxyModeName(st) + '\n实际入站：' + (observed || '（暂无连接）');
+}
 function paintDashboardConnectionMode() {
   if (panelForeground || current !== 'page-dashboard' || document.visibilityState !== 'visible') return;
+  const tip = proxyModeStatTitle(state.status);
   document.querySelectorAll('#page-dashboard [data-connection-proxy-mode]').forEach(el => {
-    el.textContent = connectionModeTracker.getLabel();
+    el.textContent = proxyModeName(state.status);
+    el.title = tip;
   });
 }
 onCoreConfigApplied(() => {
@@ -1945,6 +1963,14 @@ async function switchDashboardProxyMode(mode) {
     uiToast('正在切换为 ' + ({ tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy' }[mode]) + '…', 2200);
     const ok = await saveConfig({ silent: true, restart: true, requireRestartSuccess: true });
     if (ok) {
+      // ACK 里的状态（pid / 运行时长 / tproxy / proxy_mode）在 saveConfig 返回前就已回填并
+      // 整页重绘；这里再定点补画一次「代理模式」「运行时长」，保证下面这句提示弹出的那一帧，
+      // 卡片、时长、提示说的是同一件事，而不是等一秒后的定点刷新才对齐。
+      if (document.visibilityState === 'visible' && current === 'page-dashboard') {
+        paintDashboardProxyModeSelection();
+        paintDashboardConnectionMode();
+        paintUptime();
+      }
       // 后端可能在「内核本来就在 tproxy 端口监听」时只装规则、不重启内核
       // （见 scripts/mihomo.sh 的 tproxy_attach_ready）。这时提示里不能说「重启」
       // 相关的话，运行时长也确实没被清零——提示与时长由此始终对得上。
@@ -2050,9 +2076,9 @@ function renderDashboard(el) {
   const curVer = st.current_ver || st[coreKey + '_ver'] || '';
   const coreInstalled = st[coreKey + '_exists'];
 
-  // 代理模式统计值：按 Zashboard 连接页 metadata.type 汇总当前活跃入站类型。
-  // 不读取模式开关、待应用配置或运行快照；tcp/udp 是 network，不是模式。
-  const modeStatVal = h('div', { class: 'v', text: connectionModeTracker.getLabel(), dataset: { connectionProxyMode: '1' } });
+  // 代理模式统计值：与上方按钮高亮同源（proxyModeLabel → 当前生效的接管方式）。
+  // 连接页 metadata.type 汇总出来的入站类型只放进 title，见 paintDashboardConnectionMode。
+  const modeStatVal = h('div', { class: 'v', text: proxyModeName(st), title: proxyModeStatTitle(st), dataset: { connectionProxyMode: '1' } });
 
   // ------- 状态卡 -------
   const hero = h('div', { class: 'card hero' });
