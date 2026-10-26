@@ -184,11 +184,22 @@ if [ "$AUTH" = "true" ]; then
   [ -n "$GOT" ] && [ "$GOT" = "$WANT" ] || fail "401 Unauthorized" "bad token"
 fi
 
+# 记录「执行桥刚刚还在正常服务」的时间戳（面板看门狗用它避开长请求期间重启 httpd：
+# 重启会把正在跑的 restart-json 连回包一起掐掉，前端只能看到 HTTP 400 / 空响应）。
+[ -d "$RUNDIR" ] && : > "$RUNDIR/webui.cgi.alive" 2>/dev/null
+
 # ---------- 读取请求体 ----------
 [ "$REQUEST_METHOD" = "POST" ] || fail "405 Method Not Allowed" "POST only"
 LEN=${CONTENT_LENGTH:-0}
 case "$LEN" in ''|*[!0-9]*) LEN=0 ;; esac
-[ "$LEN" -gt 0 ] || fail "400 Bad Request" "empty body"
+_len_unknown=0
+if [ "$LEN" -le 0 ]; then
+  # 拿不到 Content-Length（HTTP/1.0、被中间层剥头、连接复用残留）时不要立刻
+  # 400：按「读到 EOF 为止」处理，最多 1MB。旧写法直接 fail，一次抖动就足以
+  # 让前端拿到 HTTP 400（表现为「服务重启失败：HTTP 400」）。
+  _len_unknown=1
+  LEN=1000000
+fi
 [ "$LEN" -le 8000000 ] || fail "413 Too Large" "body too large"
 
 # ---------- 残留请求目录清扫 ----------
@@ -245,7 +256,11 @@ webui_sweep_stale
 head -c "$LEN" > "$TMP.b64" 2>/dev/null
 [ -s "$TMP.b64" ] || dd bs=1 count="$LEN" 2>/dev/null > "$TMP.b64"
 ACTUAL=$(wc -c < "$TMP.b64" | tr -d ' ')
-[ "$ACTUAL" = "$LEN" ] || fail "400 Bad Request" "incomplete body"
+if [ "$_len_unknown" = "1" ]; then
+  [ "$ACTUAL" -gt 0 ] 2>/dev/null || fail "400 Bad Request" "empty body"
+else
+  [ "$ACTUAL" = "$LEN" ] || fail "400 Bad Request" "incomplete body"
+fi
 
 # 解码到文件而非变量：Linux 单个 argv 参数上限 128KiB(MAX_ARG_STRLEN)，
 # 保存较大的 config.yaml 时 sh -c "$CMD" 会直接 E2BIG 失败。

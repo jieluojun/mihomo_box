@@ -4687,7 +4687,12 @@ export async function saveConfig({ silent, restart = false, afterWrite, requireR
     });
     // 配置刚落盘：后台预跑一次 mihomo -t，用户随后点「重载/启动」时直接命中校验
     // 缓存（否则每次重载都要在关键路径上等 1~3 秒）。不阻塞保存。
-    prewarmVerify();
+    //
+    // 透明模式切换（TUN / eBPF / Tproxy）例外：紧接着的 restart-json 会先做配置手术
+    // （关 TUN / 注释 tun 监听 / 关 eBPF 入站），刚保存的这份配置随即失效 —— 预热等于
+    // 让这次切换白多等一份 -t，而且它占着「正在校验」标记还会把真正需要的那次校验
+    // 挤成排队或重跑。切换路径不做预热，让后端只为最终要跑的配置校验一次。
+    if (!transparentMode) prewarmVerify();
     // 写入期间若用户又修改，不可用旧快照覆盖新草稿，也不可误清「未保存」。
     const sameDraft = version === draftVersion && state.raw === text && !sourcePending;
     if (sameDraft) clearDirty();

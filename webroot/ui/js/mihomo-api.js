@@ -94,6 +94,21 @@ export const reloadConfigs = () => lifecycleRequest('PUT', '/configs?reload=true
 // restart-json：重启并把现算的状态 JSON 一并带回（action_rc / action_msg 为重启命令
 // 本身的退出码与输出），调用方可直接交给 refreshStatus(prefetched) 省一次 status 往返。
 // 命令本身的 errno 恒为 0（状态 JSON 总要吐出来），成败看 action_rc。
+// 执行桥在「命令还没跑」就失败时（400/5xx、空响应、连接异常），重启到底成没成
+// 不能只看这一次请求：用 status 的 pid + uptime 反推。内核是本次操作之后才起来的
+// （uptime 不超过「按下到现在」的秒数 + 5s 容差）就认为重启已经生效。
+async function serviceLooksRestarted(startedAt) {
+  try {
+    const r = await cmdline('status', { timeout: 8000 });
+    const j = parseJsonLoose(r && r.stdout);
+    if (!j || !j.running || !j.pid) return false;
+    const up = Number(j.uptime_sec);
+    if (!isFinite(up) || up < 0) return false;
+    const elapsed = Math.ceil((Date.now() - startedAt) / 1000) + 5;
+    return up <= elapsed;
+  } catch (e) { return false; }
+}
+
 export async function restartService({ transparentMode = null } = {}) {
   if (lifecycleBusy) throw new Error('已有内核操作进行中，请等待完成');
   if (transparentMode !== null && !['tun', 'ebpf', 'tproxy'].includes(transparentMode)) throw new Error('无效透明代理模式');
@@ -108,16 +123,49 @@ export async function restartService({ transparentMode = null } = {}) {
     // 75s 上限：慢设备上 restart-json 内含配置校验（mihomo -t，大 geodata +
     // memconservative 模式在路由器上可达数十秒），通道层默认 15s 会在校验
     // 还没跑完时就误报「重启未确认」。
-    const result = await cmdline(transparentMode ? `restart-json ${transparentMode}` : 'restart-json', { timeout: 75000 });
-    const j = parseJsonLoose(result && result.stdout);
-    uiLog('debug', '服务重启耗时', { roundtrip_ms: Math.round(performance.now() - actionStarted), backend_ms: j?.action_elapsed_ms });
-    const rc = j && j.action_rc != null ? Number(j.action_rc) : -1;
-    if (!result || Number(result.errno) !== 0 || rc !== 0) {
-      const detail = (j && String(j.action_msg || '').trim())
+    const startedAt = Date.now();
+    const cmd = transparentMode ? `restart-json ${transparentMode}` : 'restart-json';
+    // 执行桥在「命令还没跑」就失败时（HTTP 400 请求体不完整 / 空响应 / 面板服务重建）
+    // 不该让用户看到「服务重启失败」：重发一次，再不行就用 status 反推真实状态。
+    // （切代理模式来回互点最容易撞上：重启请求正巧赶上执行桥的一次抖动。）
+    // 判定「命令没跑成」的通道级失败：执行桥错误、通道超时，以及裸的 HTTP 状态码
+    // （旧版传输层只回 "HTTP 400" 这种文本）。
+    const transportFail = d => /^(执行桥|请求超时)/.test(d || '') || /^HTTP\s*\d{3}$/.test(String(d || '').trim());
+    let result = null, j = null, lastErr = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt) await new Promise(res => setTimeout(res, 700));
+      try {
+        result = await cmdline(cmd, { timeout: 75000 });
+      } catch (e) {
+        lastErr = e;
+        result = null;
+        continue;
+      }
+      j = parseJsonLoose(result && result.stdout);
+      const rc0 = j && j.action_rc != null ? Number(j.action_rc) : -1;
+      if (result && Number(result.errno) === 0 && rc0 === 0) { lastErr = null; break; }
+      const d = (j && String(j.action_msg || '').trim())
         || [result?.stdout, result?.stderr].filter(Boolean).join('\n').trim();
-      const error = new Error(detail || '模块服务重启未成功返回');
-      if (j && j.action_rc != null) error.actionResult = result;
-      throw error;
+      lastErr = new Error(d || '模块服务重启未成功返回');
+      if (!transportFail(d)) break;      // 后端真的报错：重发没有意义
+      // 执行桥没回包，但内核可能已经重启好了：先确认，确认不了才重发
+      // （避免「重启其实成功、只是回包丢了」又被重启一次）
+      if (await serviceLooksRestarted(startedAt)) {
+        uiLog('warn', '服务重启确认', '执行桥异常，但内核已按新配置重启', d || '执行桥未回包');
+        return undefined;
+      }
+      uiLog('warn', '服务重启重试', d || '执行桥未回包');
+      result = null; j = null;
+    }
+    uiLog('debug', '服务重启耗时', { roundtrip_ms: Math.round(performance.now() - actionStarted), backend_ms: j && j.action_elapsed_ms });
+    if (lastErr) {
+      // 通道层失败不代表没重启成功：uptime 反推内核是不是本次操作之后起来的
+      if (transportFail(String(lastErr.message)) && await serviceLooksRestarted(startedAt)) {
+        uiLog('warn', '服务重启确认', '执行桥异常，但内核已按新配置重启', String(lastErr.message));
+        return undefined;
+      }
+      if (j && j.action_rc != null && result) lastErr.actionResult = result;
+      throw lastErr;
     }
     applyServiceConfigSnapshot(j, configToken);
     return result;

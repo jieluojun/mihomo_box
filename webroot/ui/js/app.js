@@ -347,11 +347,14 @@ function showTransparentModePicker() {
       close();
       uiToast(mode === 'tun' ? '正在保存 TUN 配置并重启服务…' : '正在保存 eBPF 配置并重启服务…', 3000);
       beginOpToast();
-      if (typeof window !== 'undefined') window.__mbRestartToastMsg = mode === 'tun' ? '✅ TUN 已启用，服务已重启' : '✅ eBPF 已启用，服务已重启';
+      const pickMsg = mode === 'tun' ? '✅ TUN 已启用，服务已重启' : '✅ eBPF 已启用，服务已重启';
+      // 保存后会重启内核：完成提示等新核起表那一帧（与 00:00 同屏）
+      armUpToast(pickMsg);
       const ok = await saveConfig({ silent: true, restart: true });
-      if (typeof window !== 'undefined') delete window.__mbRestartToastMsg;
-      if (ok) toastDoneFallback(mode === 'tun' ? '✅ TUN 已启用，服务已重启' : '✅ eBPF 已启用，服务已重启', 3200);
-      else uiToast('配置未能保存，已保留草稿，请检查后重试', 4200);
+      if (!ok) { dropPendingUpToast(); uiToast('配置未能保存，已保留草稿，请检查后重试', 4200); }
+    } catch (e) {
+      dropPendingUpToast();
+      uiToast('配置未能保存：' + ((e && e.message) || e), 4200);
     } finally {
       setSaveBarSuppressed(false);
       busy = false;
@@ -396,8 +399,93 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   const hsOn = st.hotspot_proxy !== 'false';   // 默认开启
   const v6On = st.system_ipv6 === 'true';      // 默认关闭（后端 get_setting system_ipv6 false）
   const tpOn = st.tproxy === 'true';           // 默认关闭
-  const hsStatus = h('div', { style: 'font-size:12.5px;color:var(--text-3);margin-top:10px;line-height:1.5', text: tunHsStatusText() });
-  const tpStatus = h('div', { style: 'font-size:12.5px;color:var(--text-3);margin-top:10px;line-height:1.5', text: tproxyStatusText() });
+  // 「当前状态：…」与首选 APN 这类状态行，字号／颜色／字重一律跟上面的说明文字走：
+  // 直接挂同一个 .f-desc 类（12px / var(--text-3) / weight 400），只额外留 10px 上间距，
+  // 这样以后改说明文字样式，状态行自动跟着变，不会再各自跑偏。
+  const STATUS_LINE_CLASS = 'f-desc';
+  const STATUS_LINE_STYLE = 'margin-top:10px';
+  const hsStatus = h('div', { class: STATUS_LINE_CLASS, style: STATUS_LINE_STYLE, text: tunHsStatusText() });
+  const tpStatus = h('div', { class: STATUS_LINE_CLASS, style: STATUS_LINE_STYLE, text: tproxyStatusText() });
+  // 「系统 IPv6」说明：一句话讲清当前状态做了什么，切换时当场改写（不留旧态文案）。
+  // 只保留用户能感知的事实：哪些网卡禁用 / APN 协议 / 配置文件里的开关 / IMS 不受影响。
+  const v6DescText = on => on
+    ? '已开启：系统 IPv6 保持可用，配置文件中的 IPv6 开关同步打开，Wi-Fi 与蜂窝网卡均可使用 IPv6。代理运行中会自动重启以生效'
+    : '已关闭（默认）：Wi-Fi 等非蜂窝网卡禁用 IPv6，上网 APN 协议改为仅 IPv4，配置文件中的 IPv6 开关同时关闭；不影响 IMS 高清通话与短信。代理运行中会自动重启以生效';
+  const v6DescMain = h('span', { text: v6DescText(v6On) });
+  // 首选 APN 的协议状态（紧跟在说明文字下一行）：系统 IPv6=关 时后端会把上网 APN 的
+  // protocol / roaming_protocol 改成仅 IPv4，这里把「现在到底是不是 IPv4」直接摆出来。
+  // content 查询每次要拉起一个 JVM，所以只在弹层打开与切换 IPv6 后各取一次，
+  // 绝不放进 1.5 秒一次的 mod-state 轮询。
+  // 与 TUN 热点 / Tproxy 的「当前状态：…」同款样式：单独一行、跟说明文字同字号同色，
+  // 与说明文字之间留 10px 上间距（不是紧贴在说明最后一行下面）。
+  const APN_LINE_STYLE = STATUS_LINE_STYLE;
+  const apnStatus = h('div', { class: STATUS_LINE_CLASS, style: APN_LINE_STYLE, text: '首选 APN：读取中…' });
+  // Android 的 APN protocol 取值是 IP / IPV6 / IPV4V6（老 ROM 也有 IPV4）：
+  // 「IP」就是仅 IPv4，直接印 IP 会让人以为没读出来。
+  const apnProtoName = v => {
+    const t = String(v || '').trim().toUpperCase();
+    if (t === 'IPV4V6' || t === 'IPV4/IPV6') return 'IPv4/IPv6';
+    if (t === 'IPV4' || t === 'IP') return 'IPv4';
+    if (t === 'IPV6') return 'IPv6';
+    return t || '未知';
+  };
+  const apnLineText = j => {
+    if (!j) return '首选 APN：读取失败';
+    if (!j.content) return '首选 APN：系统缺少 content 命令，无法读取';
+    const items = Array.isArray(j.items) ? j.items : [];
+    if (!items.length) return '首选 APN：未查询到（多卡/定制 ROM 可能如此）';
+    return items.map(it => '首选 APN「' + String(it.apn || ('id=' + (it.id || '?'))) + '」：协议 '
+      + apnProtoName(it.protocol) + '，漫游 ' + apnProtoName(it.roaming)).join('；');
+  };
+  // 两段式：先用后端缓存秒开（纯文件读，不起 JVM），随后再真查刷新。
+  // content 查询每次都要拉起一个 JVM（0.3~1s），等它回来才显示就等于「打开设置先卡一秒」。
+  //
+  // opts.tries / opts.gap：刚切完系统 IPv6 时用「多读几轮」。原因是 APN 协议的改写
+  // 是 content update 写库 + 重新附着数据，库写进去到 content query 读出来之间可能
+  // 还有几秒延迟（甚至重启内核期间 JVM 起得很慢、一次 20s 超时被掐掉），只读一次就
+  // 很容易把改动前的协议留在界面上——用户看到的就是「关了 IPv6，APN 还写着 IPv4/IPv6」。
+  // opts.expect(txt)：这一轮读到什么才算「已经翻篇」（例如关掉 IPv6 时期望不再出现
+  // IPv6）。没有 expect 时退化成「连续两轮读数一致即稳定」，正常打开弹层只查一次。
+  const refreshApnStatus = async (opts) => {
+    const tries = Math.max(1, (opts && opts.tries) || 1);
+    const gap = (opts && opts.gap) || 1500;
+    const expect = (opts && opts.expect) || null;
+    if (DEMO) { apnStatus.textContent = '首选 APN：演示模式下不可读取'; return; }
+    let painted = false;
+    let cached = null;
+    try {
+      const c = await cmdline('apn4-json cached', { timeout: 5000 });
+      const jc = parseJsonLoose(c && c.stdout);
+      if (jc && Array.isArray(jc.items) && jc.items.length) {
+        cached = apnLineText(jc); apnStatus.textContent = cached; painted = true;
+      }
+    } catch (e) { /* 没有缓存就走真查 */ }
+    let prev = null;
+    for (let i = 0; i < tries; i++) {
+      if (i > 0) {
+        // 弹层被关/被换掉就别再读了（节点还在，但已经没人看）
+        if (sheetClose && !sheetClose.isCurrent()) return;
+        await new Promise(res => setTimeout(res, gap));
+      }
+      let txt = '';
+      try {
+        const r = await cmdline('apn4-json refresh', { timeout: 20000 });
+        const j = parseJsonLoose(r && r.stdout);
+        if (j && j.ok) txt = apnLineText(j);
+      } catch (e) { /* 超时/被杀：下一轮再试 */ }
+      if (!txt) continue;
+      apnStatus.textContent = txt;
+      painted = true;
+      if (expect) {
+        if (expect(txt)) return;               // 已经读到期望的读数
+      } else {
+        if (prev !== null && txt === prev) return;          // 连续两轮一致＝稳定
+        if (i === 0 && tries > 1 && txt === cached) return; // 与缓存一致＝没变化
+      }
+      prev = txt;
+    }
+    if (!painted) apnStatus.textContent = '首选 APN：读取失败';
+  };
   // 诊断按钮工厂（Tproxy / TUN 热点各一个）：与配置源码弹窗一致的圆形诊断
   // 按钮（btn sm circle + 脉搏图标），放在各自开关的左旁。不生效时靠人猜很
   // 慢，一键跑后端诊断，把关键状态全部打出来，可直接复制给开发者。以前
@@ -442,6 +530,9 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   };
   const tpDiagBtn = makeDiagBtn('诊断 Tproxy', 'tproxy-diag', 'Tproxy 诊断');
   const hsDiagBtn = makeDiagBtn('诊断 TUN 热点', 'tun-hotspot-diag', 'TUN 热点诊断');
+  // IPv6 诊断：说清「代理侧 v6 现状 / 配置里与内核在用的 ipv6 / 内核自报的 TUN 是否
+  // 真的起来了 / 回退记录」。碰到「开了系统 IPv6 代理就不接管」先看这张纸。
+  const v6DiagBtn = makeDiagBtn('诊断 IPv6', 'ipv6-status', 'IPv6 诊断');
   let busy = false;
   let tpBusy = false;
   let tpQuiet = false;   // Tproxy 开启的重启静默窗是否已压（收尾用 Math.min 收回）
@@ -544,17 +635,20 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
       }))),
     // Tproxy 代理：开启→识别端口+关 TUN+装 TPROXY 规则；关闭→拆规则+还原 TUN 配置
     h('div', { class: 'f-row' },
-      h('div', { class: 'f-label' }, 'Tproxy 代理', h('div', { class: 'f-desc', text: '开启后自动识别配置里的 TProxy 端口（tproxy-port 或 tproxy 监听器），关闭配置里的 TUN 并把 eBPF 入站的 local/shared.enable 置为 false（参数原样保留），安装 TPROXY 转发规则接管系统流量（内核会重启）；关闭则拆除规则并还原本次自动修改的 TUN 配置。应用黑白名单直接复用 TUN 页「仅代理以下应用」／「排除以下应用」（前者优先），改完保存配置自动生效' }), tpStatus),
+      h('div', { class: 'f-label' }, 'Tproxy 代理', h('div', { class: 'f-desc', text: '开启后接管系统流量：自动识别 tproxy-port 并关闭配置里的 TUN / eBPF，安装 TPROXY 规则（代理运行中会自动重启以生效）；关闭则拆除规则、还原被改动的 TUN 配置。应用黑白名单复用 TUN 页的「仅代理以下应用」／「排除以下应用」' }), tpStatus),
       h('div', { class: 'f-ctl' }, tpDiagBtn, (() => {
         let sw;
         sw = switchCtl(tpOn, async (v) => {
           if (tpBusy) { sw.querySelector('input').checked = !v; return; }
           tpBusy = true;
           const wasDirty = state.dirty;
+          // 开启会重启内核：提示等「新核确认、时长归零」那一帧再弹（见 armUpToast）。
+          const tpWasRunning = !!(state.status && state.status.running);
           if (state.status) state.status.tproxy = v ? 'true' : 'false';
           tpStatus.textContent = v ? '当前状态：正在应用 Tproxy 规则并重启内核…' : '当前状态：正在关闭 Tproxy 规则…';
           uiToast(v ? '正在开启 Tproxy…' : '正在关闭 Tproxy…', 1600);
           beginOpToast();
+          let tpOk = false;   // 命令成功才允许把待弹提示留给起表那一帧
           try {
             // ★即时反馈（开启）：Tproxy 开启会重启内核——运行时长不在按下瞬间归零起表
             //  （旧值定格，新核确认活时才从 00:00 起表），pid/资源徽标由 quickResPaint 在
@@ -571,16 +665,20 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
                 state.status.pid = '';
                 if (current === 'page-dashboard' && dEl) renderDashboard(dEl);
               }
-              if (!DEMO && dEl) quickResPaint(dEl, { oldPid: tPrevPid, stillActive: () => tpBusy, reanchor: true, onReady: () => toastUpDone('✅ Tproxy 已开启') }).catch(() => {});
+              armUpToast('✅ Tproxy 已开启');
+              if (!DEMO && dEl) quickResPaint(dEl, { oldPid: tPrevPid, stillActive: () => tpBusy, reanchor: true, onReady: () => flushPendingUpToast() }).catch(() => {});
             }
             // 关闭时先还原配置但暂不重启，等用户选择 TUN/eBPF 后由保存流程统一重启。
             const r = await cmdline(v ? 'tproxy-set true' : 'tproxy-set false defer');
             const out = ((r && r.stdout) || '').trim();
             const ok = !!r && r.errno === 0 && !/(^|\n)ERR/.test(out);
+            tpOk = ok;
             if (ok) {
               if (state.status) state.status.tproxy = v ? 'true' : 'false';
               refreshModState(true);   // 命令一返回就刷新文案，不等下面的配置重载和完整 status
-              toastDoneFallback(v ? '✅ Tproxy 已开启' : '✅ 已还原默认状态');
+              // 开启且内核在跑＝会重启：提示交给起表那一帧弹；关闭不重启，立刻弹。
+              if (v && tpWasRunning) armUpToast('✅ Tproxy 已开启');
+              else { dropPendingUpToast(); toastDoneFallback(v ? '✅ Tproxy 已开启' : '✅ 已还原默认状态'); }
               // 后端改过 config.yaml（TUN 开关/监听器注释）：重载草稿，
               // 避免旧草稿在下次保存时把手术结果覆盖回去
               let reloaded = false;
@@ -592,6 +690,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             } else {
               if (state.status) state.status.tproxy = (!v) ? 'true' : 'false';
               sw.querySelector('input').checked = !v;   // 回弹开关显示
+              dropPendingUpToast();
               uiToast('⚠️ ' + (out || (r && r.stderr) || '操作失败'), 5000);
             }
             try { await refreshStatus(); } catch (e) { /* 状态刷新失败不影响开关 */ }
@@ -601,6 +700,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             if (ok) pollTpStatus(v, Date.now() + 14000);
           } finally {
             tpBusy = false;
+            if (!tpOk) dropPendingUpToast();   // 失败/异常：不留待弹提示
             // 同系统 IPv6：把 20s 长窗收回成 2.5s 补读短窗（Math.min 不挤掉别处的静默窗）
             if (tpQuiet) { restartQuietUntil = Math.min(restartQuietUntil, Date.now() + 2500); tpQuiet = false; }
             refreshModState(true);
@@ -613,13 +713,20 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
     // IPv6 相关开关（顶层 ipv6 / dns.ipv6 / eBPF 入站 local·shared.ipv6）并重启服务，
     // 手术与重启都由后端 set system_ipv6 一次完成（见 cfg_ipv6_set_all）。
     h('div', { class: 'f-row' },
-      h('div', { class: 'f-label' }, '系统 IPv6', h('div', { class: 'f-desc', text: 'IPv6 总开关。开启＝系统 IPv6 保持可用，并把配置里的 IPv6 相关开关（IPv6 总开关 ipv6、解析 AAAA dns.ipv6、eBPF 入站 local/shared 的接管 IPv6）一并置为开启；关闭（默认）＝上述开关一并置为关闭，并在内核协议栈层面禁用各网卡 IPv6，防止 v6 流量绕过代理直连。每次切换都会同步配置并重启服务（含 eBPF 入站重建）；关闭期间每约 5 秒自动对账一次，飞行模式/切换网络后被系统放回来的 IPv6 会被自动收回' })),
-      h('div', { class: 'f-ctl' }, (() => {
+      h('div', { class: 'f-label' }, '系统 IPv6', h('div', { class: 'f-desc' }, v6DescMain), apnStatus,
+        // 本机内核在 IPv6 下起不来 TUN/eBPF 时后端会自动回退成仅 IPv4 代理（见
+        // scripts/mihomo.sh 的 ipv6_proxy_guard）。这行必须在界面上说清楚，
+        // 否则用户只会看到「系统 IPv6 开着但代理不走 v6」，以为坏了。
+        h('div', { class: STATUS_LINE_CLASS, style: APN_LINE_STYLE, hidden: st.ipv6_proxy !== 'fallback',
+          text: '代理侧：本机内核无法在 IPv6 下接管，已回退为仅 IPv4 代理（系统 IPv6 与 IMS 不受影响）' })),
+      h('div', { class: 'f-ctl' }, v6DiagBtn, (() => {
         let sw;
         sw = switchCtl(v6On, async (v) => {
           if (busy) { sw.querySelector('input').checked = !v; return; }
           busy = true;
           const wasDirty = state.dirty;
+          // 说明文字与开关同帧换成目标状态：切完还挂着旧状态的文案，就是在骗人。
+          v6DescMain.textContent = v6DescText(v);
           uiToast(v ? '正在启用系统 IPv6：同步配置并重启服务…' : '正在关闭系统 IPv6：同步配置并重启服务…', 3000);
           beginOpToast();
           // 切换会重启内核（含 eBPF 入站重建）：运行时长不在按下瞬间归零起表（核心
@@ -639,9 +746,10 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             // 按 pid 变化归零一次、从 00:00 起表（锚定真实启动时刻）。
             state.status.pid = '';
             if (current === 'page-dashboard' && dEl) renderDashboard(dEl);
+            armUpToast(v ? '✅ 系统 IPv6 已启用' : '✅ 系统 IPv6 已禁用');
             if (!DEMO && dEl) quickResPaint(dEl, {
               oldPid: v6PrevPid, stillActive: () => busy, reanchor: true,
-              onReady: () => toastUpDone(v ? '✅ 系统 IPv6 已启用，配置已同步，服务已重启' : '✅ 系统 IPv6 已禁用，配置已同步，服务已重启'),
+              onReady: () => flushPendingUpToast(),
             }).catch(() => {});
           }
           try {
@@ -654,10 +762,19 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
               // 避免旧草稿在下次保存时把同步结果覆盖回去
               try { await loadConfig(); rerenderCurrent(); } catch (e) { /* 重载失败不影响开关 */ }
               if (wasDirty) uiToast('⚠️ 配置已由模块修改并重新载入，先前未保存的编辑已丢弃', 4200);
-              const tail = /服务已重启/.test(out) ? '，配置已同步，服务已重启'
-                : /服务未运行/.test(out) ? '，配置已同步（服务未运行，下次启动生效）' : '，配置已同步';
-              toastDoneFallback((v ? '✅ 系统 IPv6 已启用' : '✅ 系统 IPv6 已禁用') + tail, 3200);
+              // 本机内核在 IPv6 下起不来时后端只开系统协议栈、不改配置并回 WARN，
+              // toast 必须照实说，不能继续报「配置已同步」
+              const skipped = /代理维持仅 IPv4/.test(out);
+              const tail = skipped ? '，本机无法在 IPv6 下接管流量，代理维持仅 IPv4'
+                : /服务已重启/.test(out) ? '，配置已同步，服务已重启'
+                  : /服务未运行/.test(out) ? '，配置已同步（服务未运行，下次启动生效）' : '，配置已同步';
+              // 服务确实重启了＝提示等新核起表那一帧；没重启（服务未运行等）就立刻弹。
+              const v6Msg = (v ? '✅ 系统 IPv6 已启用' : '✅ 系统 IPv6 已禁用') + tail;
+              if (/服务已重启/.test(out)) armUpToast(v6Msg);
+              else { dropPendingUpToast(); toastDoneFallback(v6Msg, 3200); }
             } else {
+              v6DescMain.textContent = v6DescText(!v);   // 没成功：说明文字退回原状态
+              dropPendingUpToast();
               uiToast('⚠️ ' + (out || (r && r.stderr) || '操作失败'), 5000);
             }
             refreshStatus(false, true).catch(() => { /* 补读失败不影响开关 */ });
@@ -666,6 +783,20 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             // 收尾只留 2.5s 补读短窗。Math.min：把本次 20s 长窗收回，避免一直挂着盖住
             // 之后真实的「已停止」显示；也不挤掉别处刚按下的更长静默窗。
             if (v6Quiet) restartQuietUntil = Math.min(restartQuietUntil, Date.now() + 2500);
+            // APN 协议刚被改写（关）或还原（开）：APN 状态行跟着刷新，不留旧读数。
+            // 先把这一行改成「正在重新读取」，避免在 APN 库落盘 / 内核重启的几秒里
+            // 一直挂着改动前的协议（「关了系统 IPv6，APN 还写着 IPv4/IPv6」就是这么来的）；
+            // 随后多读几轮，读数稳定即停。
+            if (sheetClose && sheetClose.isCurrent()) {
+              const apnBefore = apnStatus.textContent;
+              apnStatus.textContent = '首选 APN：正在重新读取…';
+              // 关：APN 协议应变成仅 IPv4（读到不含 IPv6 的读数才算翻篇）；
+              // 开：协议按接管前的原值还原，读数与原读数不同即算翻篇。
+              void refreshApnStatus({
+                tries: 4, gap: 1800,
+                expect: v ? (t => t !== apnBefore) : (t => !/IPv6/i.test(t)),
+              });
+            }
           }
         });
         return sw;
@@ -680,6 +811,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   }));
   // 打开弹层时异步刷一次最新状态，确保 Tproxy 与热点对账状态实时呈现
   startModPoll();   // 立即取一次轻量状态（不等完整 status），之后每 1.5 秒一次，关闭即停
+  void refreshApnStatus();   // 首选 APN 协议/漫游：打开弹层取一次（content 要拉 JVM，不进轮询）
   refreshStatus().then(async () => {
     if (sheetClose && sheetClose.isCurrent()) await refreshModState();   // status 带回的可能是旧值，文案以轻量状态为准
   }).catch(() => {});
@@ -930,6 +1062,7 @@ function syncUpStart(st) {
   if (upStartMs === null || pid !== upPid) {
     upStartMs = start;   // 首次 / 换 pid＝新核：必按真实启动时刻归零起表（钉锚不挡换核，反复重启都要重新计时）
     upPid = pid;
+    flushPendingUpToast();   // 计时归零这一帧，把待弹的「已开启/已重启」提示一起放出来
     return;
   }  // 首次 / 重启
   if (!pinned && Math.abs(start - upStartMs) >= 3000) { upStartMs = start; upPid = pid; }          // 大幅漂移
@@ -1191,6 +1324,43 @@ function toastDoneFallback(msg, ms) {
   uiToast(msg, ms || 2800);
 }
 
+// ---- 「已开启 / 已重启」类提示与运行时长起表对齐 ----
+// toast 要落在运行时长归零的那一帧上。判据不能是「命令返回」：tproxy-set 现在会
+// 等规则装好才返回（返回时新核往往已经跑了几秒，时长早已在轮询里归零），按下瞬间
+// 归零也不对（核心还没起）。这里登记一条待弹提示，由 anchorFresh / syncUpStart 在
+// 「确认新核、计时归零」那一刻统一弹出 —— 谁先发现新核都一样，提示与 00:00 同帧。
+// 迟迟等不到新核（服务本来没运行 / 启动失败）则由兜底定时器照实弹出，不会吞掉。
+const PENDING_UP_TOAST_MS = 10000;
+let pendingUpToast = null;
+let pendingUpToastTimer = 0;
+function armUpToast(msg) {
+  // 本次操作已经弹过完成提示了（另一个入口先到）：不再登记，免得兜底定时器补一条
+  if (typeof window !== 'undefined' && window.__mbDoneToastAt
+    && window.__mbDoneToastSeq === window.__mbOpToastSeq) return;
+  pendingUpToast = msg;
+  if (pendingUpToastTimer) clearTimeout(pendingUpToastTimer);
+  pendingUpToastTimer = setTimeout(() => {
+    pendingUpToastTimer = 0;
+    if (!pendingUpToast) return;
+    const m = pendingUpToast;
+    pendingUpToast = null;
+    toastDoneFallback(m, 3200);
+  }, PENDING_UP_TOAST_MS);
+}
+function flushPendingUpToast() {
+  if (!pendingUpToast) return;
+  const m = pendingUpToast;
+  pendingUpToast = null;
+  if (pendingUpToastTimer) { clearTimeout(pendingUpToastTimer); pendingUpToastTimer = 0; }
+  // 同帧把 00:00 画上去：只弹提示、时长还停在旧值的话，看起来就是「又不同步了」
+  try { paintUptime(); } catch (e) { /* 绘制失败不影响提示 */ }
+  toastUpDone(m);
+}
+function dropPendingUpToast() {
+  pendingUpToast = null;
+  if (pendingUpToastTimer) { clearTimeout(pendingUpToastTimer); pendingUpToastTimer = 0; }
+}
+
 // 新实例确认时的时长锚点统一处理（起表只发生在这里或 syncUpStart 的「锚空/换 pid」
 // 分支，都锚定真实启动时刻，不在按下瞬间）：换 pid＝新核，必归零起表——连按多次
 // 重启每次都必须重新计时（钉锚只让路「同实例」的权威漂移校正，绝不能挡住换核归零，
@@ -1198,12 +1368,14 @@ function toastDoneFallback(msg, ms) {
 // （否则用户看到「记一秒 → 重新开始计时」）。
 function anchorFresh(pidStr, reanchor) {
   const anchoredSamePid = !!pidStr && upPid != null && String(upPid) === String(pidStr);
-  if (upStartMs === null || (pidStr && !anchoredSamePid)) {
+  const fresh = upStartMs === null || !!(pidStr && !anchoredSamePid);
+  if (fresh) {
     upStartMs = Date.now();
     if (state.status) state.status.uptime_sec = 0;
   }
   upStartPinnedUntil = Date.now() + 15000;
   if (pidStr) upPid = String(pidStr);
+  if (fresh) flushPendingUpToast();   // 起表那一帧弹提示（与 syncUpStart 二选一，谁先到）
 }
 
 // ---------------- 启停在途的「快照补位」（总开关按下即显示 pid/时长/资源） ----------------
@@ -1618,6 +1790,7 @@ function teardownExternalPanel() {
   clearTimeout(s.timer);
   clearTimeout(s.refreshTimer);
   clearTimeout(s.hideT);   // 进场动画后「背景页停绘制」的补挂：层都拆了就别再挂
+  clearTimeout(s.nudgeTimer);
   clearInterval(s.closeTimer);
   // 关闭时立即摘掉 iframe，停止面板脚本与在途导航，只让空壳完成退出动画。
   // 延后启动的加载也已取消，旧面板不能在退出后继续占用共享 WebView。
@@ -1687,8 +1860,27 @@ function openExternalPanel(st) {
     h('span', { text: '面板一直没出来？多半是内核未运行、外部面板尚未下载，或 WebView 拦了内嵌。' }),
     h('button', { class: 'btn xs', text: '新窗口打开', onclick: () => { window.open(url, '_blank'); } }));
   // refreshing：0 空闲 / 1 已导到 about:blank，等它落地 / 2 已 history.back()，等面板按原 hash 重新载入 / 3 兜底重载中
-  const self = { layer: null, frame, timer: 0, pushedHist: false, refreshing: 0, refreshTimer: 0, lenBefore: 0, guardUntil: 0, fallback: null, atBlank: null, closeTimer: 0, panelSeen: false, hideT: 0 };
-  const armHint = () => { self.timer = setTimeout(() => { if (pembedState === self) hint.hidden = false; }, 8000); };
+  const self = { layer: null, frame, timer: 0, pushedHist: false, refreshing: 0, refreshTimer: 0, lenBefore: 0, guardUntil: 0, fallback: null, atBlank: null, closeTimer: 0, panelSeen: false, hideT: 0, nudgeTimer: 0, nudgeTries: 0 };
+  // 内核还在重启（控制器端口没起来）时，iframe 只会一直白着；以前没有任何人替用户
+  // 重试，只能自己点刷新或退出重进 —— 「切到 Tproxy 后面板打开是空的」就是这么来的。
+  // 这里在「还没看到面板」时短暂盯一下内核：5 秒一次、最多 12 次（约 1 分钟），
+  // 内核一活过来就原地重载一次；面板一旦载入立刻停。
+  const stopNudge = () => { clearTimeout(self.nudgeTimer); self.nudgeTimer = 0; };
+  const nudge = async () => {
+    if (pembedState !== self || self.panelSeen || self.refreshing !== 0) return;
+    if (self.nudgeTries >= 12) return;
+    self.nudgeTries++;
+    let up = false;
+    try {
+      const r = await cmdline('status-fast', { timeout: 5000 });
+      const j = parseJsonLoose(r && r.stdout);
+      up = !!(j && (j.running === 1 || j.running === true || j.running === '1'));
+    } catch (e) { /* 读不到就当没起来，下一轮再看 */ }
+    if (pembedState !== self || self.panelSeen || self.refreshing !== 0) return;
+    if (up) { try { frame.contentWindow.location.replace(url); } catch (e) { frame.src = url; } }
+    self.nudgeTimer = setTimeout(nudge, 5000);
+  };
+  const armHint = () => { self.timer = setTimeout(() => { if (pembedState === self) { hint.hidden = false; void nudge(); } }, 8000); };
   armHint();
   const refreshBtn = h('button', { class: 'pembed-tool refresh', title: '刷新面板（停留在当前页）', 'aria-label': '刷新面板',
     onclick: () => refresh() }, h('span', { class: 'ico', html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66L20 9M20 4v5h-5"/></svg>' }));
@@ -1736,7 +1928,7 @@ function openExternalPanel(st) {
       // 没在刷新却落到了 about:blank：只可能是有人沿「前进」方向（桌面浏览器的前进键/触控板手势）
       // 走进了上次刷新留在前面的 blank 条目。退一步回到面板，别让人对着白屏
       if (self.panelSeen) { try { history.back(); } catch (e) { } }
-    } else self.panelSeen = true;
+    } else { self.panelSeen = true; stopNudge(); }
   });
   // 刷新：about:blank → 等它 load → history.back() 回到面板刷新前那条历史（见本节顶部注释）。
   // 不读跨域 location、不需要面板配合，任何 hash 路由的面板（zashboard / metacubexd / yacd）都适用。
@@ -1885,9 +2077,13 @@ async function switchDashboardProxyMode(mode) {
     requestTransparentModeOnSave(mode);
     beginOpToast();
     uiToast('正在切换为 ' + ({ tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy' }[mode]) + '…', 2200);
+    // 切换必重启内核：完成提示押到「新核确认、时长归零」那一帧，和 00:00 同屏出现。
+    const modeMsg = '✅ 代理模式已切换为 ' + ({ tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy' }[mode]);
+    armUpToast(modeMsg);
     const ok = await saveConfig({ silent: true, restart: true, requireRestartSuccess: true });
-    if (ok) toastDoneFallback('✅ 代理模式已切换为 ' + ({ tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy' }[mode]), 3200);
+    if (!ok) dropPendingUpToast();
   } catch (e) {
+    dropPendingUpToast();
     uiToast('代理模式切换失败：' + (e?.message || String(e)), 5000);
   } finally {
     proxyModeBusy = false;
