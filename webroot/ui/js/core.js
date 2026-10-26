@@ -4675,16 +4675,25 @@ export async function saveConfig({ silent, restart = false, afterWrite, requireR
       backupCmd = `mkdir -p "${WORKDIR}/backup"; cp "${CONFIG_PATH}" "${WORKDIR}/backup/config-${stamp}.yaml" 2>/dev/null; ls -1t ${WORKDIR}/backup/config-*.yaml 2>/dev/null | tail -n +8 | xargs rm -f 2>/dev/null`;
     }
     const writeStarted = performance.now();
-    const r = await writeText(CONFIG_PATH, text, backupCmd ? { prelude: backupCmd } : {});
-    if (r.errno !== 0) { uiToast('写入失败: ' + (r.stderr || '未知错误'), 3000); return false; }
-    // 写盘现在把「备份旧配置 + 分块写入 + mv 覆盖」合成一趟执行桥往返，所以这段
-    // 耗时就是「代理模式」切换里除重启之外的全部前置开销，值得留一条痕迹：
-    // 真机上排查「保存/切换怎么这么慢」时，一看日志就知道卡在写盘还是重启。
-    uiLog('debug', '配置写盘耗时', {
-      roundtrip_ms: Math.round(performance.now() - writeStarted),
-      bytes: text.length,
-      chunks: Math.max(1, Math.ceil(b64encode(text).length / 40000)),
-    });
+    // ★草稿与磁盘一致时（典型：点「代理模式」只想切接管方式，没改任何字段）不再写盘：
+    //   写盘要走「备份 + 分块写入 + mv」一整趟执行桥往返（慢设备 200~500ms），
+    //   内容一个字节都没变，纯属白等。跳过它，切换就只剩后端那一步。
+    //   注意：这里依据的是「上次载入/保存后没有任何草稿改动」，磁盘若被后端手术过，
+    //   前端也会通过 core-config-applied 事件重新载入，不会用旧快照覆盖新内容。
+    if (state.dirty) {
+      const r = await writeText(CONFIG_PATH, text, backupCmd ? { prelude: backupCmd } : {});
+      if (r.errno !== 0) { uiToast('写入失败: ' + (r.stderr || '未知错误'), 3000); return false; }
+      // 写盘现在把「备份旧配置 + 分块写入 + mv 覆盖」合成一趟执行桥往返，所以这段
+      // 耗时就是「代理模式」切换里除重启之外的全部前置开销，值得留一条痕迹：
+      // 真机上排查「保存/切换怎么这么慢」时，一看日志就知道卡在写盘还是重启。
+      uiLog('debug', '配置写盘耗时', {
+        roundtrip_ms: Math.round(performance.now() - writeStarted),
+        bytes: text.length,
+        chunks: Math.max(1, Math.ceil(b64encode(text).length / 40000)),
+      });
+    } else {
+      uiLog('debug', '配置未变更，跳过写盘', { bytes: text.length });
+    }
     // 配置刚落盘：后台预跑一次 mihomo -t，用户随后点「重载/启动」时直接命中校验
     // 缓存（否则每次重载都要在关键路径上等 1~3 秒）。不阻塞保存。
     prewarmVerify();

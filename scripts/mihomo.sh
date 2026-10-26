@@ -2170,13 +2170,15 @@ sha256(${_go_name})=${_go_local}"
 # ---------------- 启停控制 ----------------
 
 # 配置指纹（内核路径 + 配置内容）：与上次校验通过的一致时跳过 -t，显著加快重启
+# $1 = 可选文件（缺省 $CONFIG）：用于比对「磁盘上的配置」与「内核正在用的快照」
 config_fingerprint() {
+  _cf_f=${1:-$CONFIG}
   if command -v md5sum >/dev/null 2>&1; then
-    echo "$(core_path)|$(md5sum "$CONFIG" 2>/dev/null | cut -d' ' -f1)"
+    echo "$(core_path)|$(md5sum "$_cf_f" 2>/dev/null | cut -d' ' -f1)"
   elif have_busybox; then
-    echo "$(core_path)|$("$BUSYBOX" md5sum "$CONFIG" 2>/dev/null | cut -d' ' -f1)"
+    echo "$(core_path)|$("$BUSYBOX" md5sum "$_cf_f" 2>/dev/null | cut -d' ' -f1)"
   else
-    echo "$(core_path)|$(ls -l "$CONFIG" 2>/dev/null | awk '{print $5}')"
+    echo "$(core_path)|$(ls -l "$_cf_f" 2>/dev/null | awk '{print $5}')"
   fi
 }
 
@@ -2700,6 +2702,13 @@ _start_core_body() {
         tproxy_sync >/dev/null 2>&1
         action_mark tproxy_installed
       fi
+    else
+      # Tproxy 关着但配置里有 tproxy 端口：趁内核启动后的空闲期把「能力探测」预跑掉
+      # （7~11 次串行 iptables，慢设备 200~400ms）。以后用户点 Tproxy 时探测直接命中
+      # 缓存，切换关键路径上只剩装规则。
+      if [ ! -f "$TP_CAP" ] && [ -n "$(tproxy_detect | awk '{print $1}')" ]; then
+        ( tproxy_probe ) >/dev/null 2>&1 &
+      fi
     fi
     if [ "$_sc_do_tun" = "1" ] || [ "$_sc_do_tp" = "1" ]; then
       ( _i=0
@@ -2821,18 +2830,93 @@ _stop_core_body() {
   return 0
 }
 
+# 免重启接管判定：$1=期望的 tproxy 端口。返回 0 表示「切到 Tproxy 不必重启内核」。
+#
+# 背景（对齐 Mishka 的 root 模式思路：能 attach 就不重启）：mihomo 只要配置里写了
+# `tproxy-port`，内核启动时就已经在这个端口上监听，与我们开不开 Tproxy 开关无关。
+# 也就是说从「无接管 / 直连」切到 Tproxy 时，内核那边其实什么都不用改，缺的只是
+# 防火墙规则。之前这条链无条件 stop+start 一次内核（大配置 2~4 秒，期间整机断流），
+# 用户看到的就是「切 Tproxy 很慢，而且运行时长被清零、提示与时长对不上」。
+#
+# 判定全部用「内核自报 + 磁盘配置」双证据，任何一条拿不准就走重启（宁可慢也不错）：
+#   1) 内核在跑，pid 活着；
+#   2) 磁盘配置不需要任何手术（TUN 关、eBPF 角色关）——否则必须重启才能让内核读到
+#      手术后的配置；
+#   3) 磁盘配置与内核启动时的快照逐字节一致（md5）——用户改过配置没重启就要重启；
+#   4) 控制器 GET /configs 自报：tproxy-port 就是期望端口、tun.enable=false；
+#   5) 该端口确实在监听（/proc 零 fork），避免给死端口装规则。
+tproxy_attach_ready() {
+  _tar_port=$1
+  case "$_tar_port" in ''|*[!0-9]*) return 1 ;; esac
+  running || return 1
+  _tar_pid=$(pid_of)
+  [ -n "$_tar_pid" ] && pid_is_live "$_tar_pid" || return 1
+  # TUN / eBPF 还在配置里：需要手术 + 重启
+  tunhs_tun_enabled && return 1
+  ebpf_listener_active && return 1
+  # 内核用的配置快照必须与磁盘上的完全一致
+  [ -r "$RUNDIR/active-config.yaml" ] || return 1
+  [ "$(config_fingerprint)" = "$(config_fingerprint "$RUNDIR/active-config.yaml")" ] || return 1
+  # 内核自报（紧凑 JSON，纯参数展开解析，不额外 fork）
+  _tar_cfg=$(MH_API_TIMEOUT=2 api GET /configs 2>/dev/null)
+  case "$_tar_cfg" in *'"tproxy-port"'*) ;; *) return 1 ;; esac
+  _tar_v=${_tar_cfg#*'"tproxy-port"'}
+  _tar_v=${_tar_v#*:}
+  _tar_v=${_tar_v%%[!0-9]*}
+  [ "$_tar_v" = "$_tar_port" ] || return 1
+  case "$_tar_cfg" in *'"tun":{'*) ;; *) return 1 ;; esac
+  _tar_t=${_tar_cfg#*'"tun"'}
+  _tar_t=${_tar_t#*\{}
+  _tar_t=${_tar_t%%\}*}
+  case "$_tar_t" in *'"enable":true'*|*'"enable": true'*) return 1 ;; esac
+  tproxy_port_listening "$_tar_port" 2>/dev/null || return 1
+  return 0
+}
+
 # 重启 = keep 模式停止 + 启动；启动失败时补一次全量对账，把保留下来的接管规则拆掉
 # （Tproxy 规则指向已死端口等于断网，绝不能留到监听循环的下一轮——先摘跳转断开
 # 流量导向，再全量清理）。
 _restart_core_body() {
   _rc_mode=${1:-}
   _rc_keep_tp_cfg=0
+  MH_CORE_ATTACHED=0
   if [ "$_rc_mode" = tproxy ]; then
     # 能力探测不通过时不写设置、不改配置，也不停止旧内核。
     tproxy_probe || return 1
     if [ "$(get_setting tproxy false)" = true ] && [ -f "$TP_CFG" ] &&
        [ "$(config_fingerprint)" = "$(cat "$RUNDIR/tproxy.config.fp" 2>/dev/null)" ]; then
       _rc_keep_tp_cfg=1
+    fi
+    # —— 免重启接管（见 tproxy_attach_ready 注释）：内核本来就在 tproxy-port 上监听，
+    #    从「直连」切到 Tproxy 只需要装规则。省掉一次 stop+start，切换从数秒 + 断流
+    #    变成亚秒级，运行时长也不再被清零（前端提示与时长因此永远对得上）。
+    _rc_ap=$(tproxy_detect | awk '{print $1}')
+    if tproxy_attach_ready "$_rc_ap"; then
+      action_mark tproxy_attach_begin
+      printf 'tun_before=false\nlistener_marked=0\nport=%s\n' "$_rc_ap" > "$TP_CFG" || return 1
+      config_fingerprint > "$RUNDIR/tproxy.config.fp" || return 1
+      set_setting tproxy true || return 1
+      action_mark tproxy_enabled
+      tproxy_sync >/dev/null 2>&1
+      action_mark tproxy_attached
+      # 免重启路径没有「后台对账循环」兜底（内核没重启，也就没有那张网），
+      # 规则没装上就等于没切换：必须当场报错并回滚设置，绝不谎报成功
+      # ——否则用户看到「✅ 已切换」，实际整机直连，正是这类断网问题的老剧本。
+      if [ ! -f "$TP_STATE" ]; then
+        set_setting tproxy false >/dev/null 2>&1
+        rm -f "$TP_CFG" "$RUNDIR/tproxy.config.fp" 2>/dev/null
+        live_invalidate 2>/dev/null
+        tp_log "attach: 规则未装上（见上方告警），已回滚 tproxy 设置"
+        echo "ERR: Tproxy 规则未能安装（详见运行日志）；已回滚开关，当前仍为直连"
+        return 1
+      fi
+      MH_CORE_ATTACHED=1
+      _rc_pid=$(pid_of)
+      rm -f "$BOOT_DATA_CACHE" 2>/dev/null
+      live_invalidate 2>/dev/null
+      tp_log "attach: 内核未重启（pid=$_rc_pid，已在端口 $_rc_ap 监听），仅装规则"
+      echo "OK: Tproxy 已接管端口 $_rc_ap（内核未重启，规则当场装好）"
+      return 0
     fi
   fi
   # 新配置校验失败时不杀死仍可用的旧内核。
@@ -5952,17 +6036,6 @@ _tproxy_restore_bin() {
   [ -n "$_trb" ] && [ -x "$_trb" ] && printf '%s\n' "$_trb"
 }
 
-# 写「已安装」状态文件（ipt/nft 两条路径共用；$1=port $2=v6 $3=bypass $4=mode）
-_tproxy_write_state_ipt() {
-  _ws_uh=$(printf '%s' "${_ti_uids:-}" | tp_fp_of)
-  printf 'port=%s\nv6=%s\nbypass=%s\nmode=%s\nwant=%s\nfp=%s\nfb=%s\napps=%s\nuids=%s\nuh=%s\npref=%s\nver=%s\nbackend=%s\n' \
-    "$1" "$2" "$3" "$4" "${_ti_want:-$4}" "${_ti_fp:-none}" "${_ti_fb:-0}" "${_ti_apps:-0}" "${_ti_applied:-0}" "$_ws_uh" "${_ti_pref:-}" "$TP_STATE_VER" ipt > "$TP_STATE" 2>/dev/null
-  rm -f "$RUNDIR/tproxy.fail" "$TP_MISS" 2>/dev/null
-  tp_log "install backend=ipt port=$1 v6=$2 bypass=$3 mode=$4 want=${_ti_want:-$4} fb=${_ti_fb:-0} uids=${_ti_applied:-0} table=$TP_TABLE pref=${_ti_pref:-} batched=1"
-  ( boot_data_sync ) >/dev/null 2>&1 &
-  return 0
-}
-
 # 生成并一次性下发 v4 规则。成功返回 0；不可用/失败返回非零（调用方回退逐条）。
 # 前置：_ti_want/_ti_fp/_ti_fb/_ti_apps 就绪，能力探测已通过。
 _tproxy_install_ipt_batched() {
@@ -6109,21 +6182,16 @@ tproxy_install() {
     ( boot_data_sync ) >/dev/null 2>&1 &
     return 0
   fi
-  # —— 快路径：v4 规则一次性批量下发（IPv6 关闭时；v6 规则仍走下面的逐条路径）——
-  if [ "$_ti_v6" != "on" ]; then
-    if _tproxy_install_ipt_batched "$_ti_port" "$_ti_bp" "$_ti_mode" "$_ti_uids"; then
-      _ti_v4n=$_ti_applied
-      _ti_v6_ok=off
-      _ti_total=$(printf '%s' "$_ti_uids" | wc -w 2>/dev/null)
-      if [ "${_ti_total:-0}" -gt "$TP_APP_MAX" ] 2>/dev/null; then
-        tp_log "WARN 应用名单过大（UID $_ti_total 个），仅前 $TP_APP_MAX 个生效"
-      fi
-      tproxy_v6_unhook
-      _tproxy_write_state_ipt "$_ti_port" "$_ti_v6_ok" "$_ti_bp" "$_ti_mode"
-      return 0
+  # —— v4 规则：优先批量下发（一次 iptables-restore 提交三条子链，见
+  #    _tproxy_install_ipt_batched），不可用/失败回退逐条下发 ——
+  if _tproxy_install_ipt_batched "$_ti_port" "$_ti_bp" "$_ti_mode" "$_ti_uids"; then
+    _ti_v4n=$_ti_applied
+    _ti_total=$(printf '%s' "$_ti_uids" | wc -w 2>/dev/null)
+    if [ "${_ti_total:-0}" -gt "$TP_APP_MAX" ] 2>/dev/null; then
+      tp_log "WARN 应用名单过大（UID $_ti_total 个），仅前 $TP_APP_MAX 个生效"
     fi
-    tp_log "WARN iptables 批量下发不可用或失败，回退逐条下发（较慢但不影响结果）"
-  fi
+  else
+  tp_log "WARN iptables 批量下发不可用或失败，回退逐条下发（较慢但不影响结果）"
   # —— v4 mangle 链（先建链清链，再挂跳转，全程幂等）——
   $TP_IPT -w -t mangle -N "$TP_CHAIN_DIV" 2>/dev/null; $TP_IPT -w -t mangle -F "$TP_CHAIN_DIV" 2>/dev/null
   $TP_IPT -w -t mangle -A "$TP_CHAIN_DIV" -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG"
@@ -6174,6 +6242,7 @@ tproxy_install() {
   while $TP_IPT -w -t mangle -D OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
   $TP_IPT -w -t mangle -I OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || { tp_log "WARN OUTPUT(tcp) 挂载失败"; tproxy_teardown; return 1; }
   $TP_IPT -w -t mangle -I OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || { tp_log "WARN OUTPUT(udp) 挂载失败"; tproxy_teardown; return 1; }
+  fi   # ← 逐条下发分支结束（批量成功时上面的整段跳过）
 
   # —— v6：真 GUA 原生；只把 DNS fake-ip6 送进 TPROXY（对齐 IPv4 的 198.18.0.0/16）。
   # 禁止 local default + 全量 OUTPUT mark，否则系统测不到 240e: 地址。
@@ -9627,6 +9696,9 @@ status_with_action() {
     "$_swa_epoch" "$_swa_mode" "$_swa_proxy" "$_swa_tp_on" "$_swa_tp" "$_swa_tun"
   printf '"cpu_pct":%s,"cpu_dbg":"%s","cpu_wait_ms":%s,"mem_kib":%s,' \
     "${_rs_cpu:-null}" "${_rs_dbg:-wait}" "${_rs_wait:-0}" "${_rs_memk:-0}"
+  # 1 = 本次「重启」其实没有重启内核（Tproxy 免重启接管）。前端据此换提示文案，
+  # 不再演一遍「重启中 / 运行时长归零」，提示与运行时长天然同步。
+  printf '"core_attached":%s,' "${MH_CORE_ATTACHED:-0}"
   # 启动/重启成功时把已应用 YAML 同包返回；前端无需再发一次完整状态/配置请求。
   # 读取运行快照，不能把用户刚替换但尚未应用的磁盘文件说成内核实际配置。
   if [ "$_swa_rc" = "0" ] && [ "$_swa_run" = "1" ]; then

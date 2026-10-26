@@ -1944,7 +1944,16 @@ async function switchDashboardProxyMode(mode) {
     beginOpToast();
     uiToast('正在切换为 ' + ({ tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy' }[mode]) + '…', 2200);
     const ok = await saveConfig({ silent: true, restart: true, requireRestartSuccess: true });
-    if (ok) toastDoneFallback('✅ 代理模式已切换为 ' + ({ tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy' }[mode]), 3200);
+    if (ok) {
+      // 后端可能在「内核本来就在 tproxy 端口监听」时只装规则、不重启内核
+      // （见 scripts/mihomo.sh 的 tproxy_attach_ready）。这时提示里不能说「重启」
+      // 相关的话，运行时长也确实没被清零——提示与时长由此始终对得上。
+      let attached = false;
+      try { attached = !!window.__mbCoreAttachedAt && Date.now() - window.__mbCoreAttachedAt < 20000; } catch (e) { /* 忽略 */ }
+      try { window.__mbCoreAttachedAt = 0; } catch (e) { /* 忽略 */ }
+      toastDoneFallback('✅ 代理模式已切换为 ' + ({ tun: 'TUN', ebpf: 'eBPF', tproxy: 'Tproxy' }[mode])
+        + (attached ? '（内核未重启）' : ''), 3200);
+    }
     // 返回值供其它入口（如「模块设置」里的 Tproxy 开关）复用同一条流程时判断结果。
     return ok;
   } catch (e) {

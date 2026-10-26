@@ -53,6 +53,26 @@ static int port_from_config(const char *path) {
     return port;
 }
 
+/* 取配置里的一个整数键（如 tproxy-port）。真内核会把 tproxy-port 实际绑起来，
+ * 假内核只需要让脚本/面板在 `GET /configs` 里读到同一个值。 */
+static int int_key_from_config(const char *path, const char *key) {
+    if (!path) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[512];
+    int v = 0;
+    size_t klen = strlen(key);
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, key, klen) != 0) continue;
+        char *colon = strchr(line, ':');
+        if (!colon) continue;
+        v = atoi(colon + 1);
+        if (v > 0) break;
+    }
+    fclose(f);
+    return v;
+}
+
 int main(int argc, char **argv) {
     int port = 0, testonly = 0;
     const char *conf = NULL;
@@ -60,6 +80,11 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-t")) testonly = 1;
         if (!strcmp(argv[i], "-f") && i + 1 < argc) conf = argv[i + 1];
         if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[i + 1]);
+    }
+    int tproxy_port = int_key_from_config(conf, "tproxy-port");
+    {
+        const char *e = getenv("FAKE_TPROXY_PORT");
+        if (e && *e) tproxy_port = atoi(e);
     }
     if (port <= 0 && conf) port = port_from_config(conf);
     if (port <= 0) port = 19090;
@@ -90,6 +115,46 @@ int main(int argc, char **argv) {
         return 1;
     }
     listen(s, 16);
-    for (;;) pause();
+    /* 真内核在 tproxy-port 上同时开 TCP/UDP 透明代理入站；这里只需要「端口在听」，
+     * 让脚本的端口就绪判定与 tproxy_port_listening 走真实路径。 */
+    if (tproxy_port > 0 && tproxy_port != port) {
+        int ts = socket(AF_INET, SOCK_STREAM, 0);
+        if (ts >= 0) {
+            setsockopt(ts, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+            struct sockaddr_in ta;
+            memset(&ta, 0, sizeof ta);
+            ta.sin_family = AF_INET;
+            ta.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            ta.sin_port = htons((unsigned short)tproxy_port);
+            if (bind(ts, (struct sockaddr *)&ta, sizeof ta) == 0) listen(ts, 16);
+        }
+    }
+    /* 最小 RESTful 模拟：只回 GET /configs（脚本的「免重启接管」判定和面板的
+     * mode 回读都只用这一个端点）。其它路径回 404，行为与真内核一致地「有响应
+     * 但不是我们要的数据」，便于测回退分支。 */
+    char body[512];
+    int blen = snprintf(body, sizeof body,
+        "{\"port\":0,\"socks-port\":0,\"redir-port\":0,\"tproxy-port\":%d,"
+        "\"mixed-port\":0,\"allow-lan\":false,\"bind-address\":\"*\","
+        "\"mode\":\"rule\",\"log-level\":\"info\",\"ipv6\":false,"
+        "\"tun\":{\"enable\":false,\"device\":\"\",\"stack\":\"mixed\"}}",
+        tproxy_port > 0 ? tproxy_port : 0);
+    for (;;) {
+        int c = accept(s, NULL, NULL);
+        if (c < 0) continue;
+        char req[1024];
+        ssize_t n = read(c, req, sizeof req - 1);
+        if (n <= 0) { close(c); continue; }
+        req[n] = 0;
+        int ok = strstr(req, "GET /configs") != NULL;
+        char head[256];
+        int hlen = snprintf(head, sizeof head,
+            "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n",
+            ok ? "200 OK" : "404 Not Found", ok ? blen : 2);
+        if (write(c, head, hlen) < 0) { close(c); continue; }
+        if (write(c, ok ? body : "{}", ok ? blen : 2) < 0) { close(c); continue; }
+        close(c);
+    }
     return 0;
 }
