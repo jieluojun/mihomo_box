@@ -4625,6 +4625,38 @@ EOF
   return 0
 }
 
+# WebUI「模块设置」用：系统 IPv6 行下方要显示「首选 APN「ctnet」：协议 IPv4，漫游 IPv4」。
+# JSON 而不是让前端解析 apn4-status 的文本：字段名就是 content 的列名，前端零猜测。
+#   {"ok":1,"content":1,"taken":0|1,"items":[{"id","apn","protocol","roaming","type","managed"}]}
+# 只在弹层打开 / 切换系统 IPv6 后各调用一次——content 每次都要拉起一个 JVM，
+# 绝不能塞进 1.5 秒一次的 mod-state 轮询。
+_apn4_json_esc() {
+  printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+apn4_json() {
+  _aj_cmd=1; command -v content >/dev/null 2>&1 || _aj_cmd=0
+  _aj_taken=0; [ -f "$APN4_STATE" ] && _aj_taken=1
+  printf '{"ok":1,"content":%s,"taken":%s,"items":[' "$_aj_cmd" "$_aj_taken"
+  _aj_first=1
+  if [ "$_aj_cmd" = "1" ]; then
+    while IFS='|' read -r _aj_id _aj_apn _aj_p _aj_r _aj_t; do
+      [ -n "$_aj_id" ] || continue
+      _aj_m=0
+      grep -q "^$_aj_id|" "$APN4_STATE" 2>/dev/null && _aj_m=1
+      [ "$_aj_first" = "1" ] || printf ','
+      _aj_first=0
+      printf '{"id":"%s","apn":"%s","protocol":"%s","roaming":"%s","type":"%s","managed":%s}' \
+        "$(_apn4_json_esc "$_aj_id")" "$(_apn4_json_esc "$_aj_apn")" \
+        "$(_apn4_json_esc "$_aj_p")" "$(_apn4_json_esc "$_aj_r")" \
+        "$(_apn4_json_esc "$_aj_t")" "$_aj_m"
+    done <<EOF
+$(apn4_rows)
+EOF
+  fi
+  printf ']}\n'
+  return 0
+}
+
 system_ipv6_sync() {
   _si_dir=${IPV6_CONF:-/proc/sys/net/ipv6/conf}
   [ -d "$_si_dir" ] || return 0
@@ -9612,6 +9644,7 @@ case "$cmd" in
   ipv6-status)   ipv6_status ;;
   # APN 协议接管（等效「APN 协议=IPv4」防蜂窝 v6 泄漏，不碰 IMS）：
   apn4-status)   apn4_status ;;
+  apn4-json)     apn4_json ;;
   apn4-apply)    apn4_apply  && echo "OK: APN 已按 IPv4 接管（详见 $APN4_LOG）" ;;
   apn4-restore)  apn4_restore && echo "OK: APN 协议已还原（详见 $APN4_LOG）" ;;
   # Tproxy 透明代理：开关主流程 / 手动对账 / 查看状态

@@ -398,6 +398,41 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   const tpOn = st.tproxy === 'true';           // 默认关闭
   const hsStatus = h('div', { style: 'font-size:12.5px;color:var(--text-3);margin-top:10px;line-height:1.5', text: tunHsStatusText() });
   const tpStatus = h('div', { style: 'font-size:12.5px;color:var(--text-3);margin-top:10px;line-height:1.5', text: tproxyStatusText() });
+  // 「系统 IPv6」说明：一句话讲清当前状态做了什么，切换时当场改写（不留旧态文案）。
+  // 只保留用户能感知的事实：哪些网卡禁用 / APN 协议 / 配置文件里的开关 / IMS 不受影响。
+  const v6DescText = on => on
+    ? '已开启：系统 IPv6 保持可用，配置文件中的 IPv6 开关同步打开，Wi-Fi 与蜂窝网卡均可使用 IPv6。代理运行中会自动重启以生效'
+    : '已关闭（默认）：Wi-Fi 等非蜂窝网卡禁用 IPv6，上网 APN 协议改为仅 IPv4，配置文件中的 IPv6 开关同时关闭；不影响 IMS 高清通话与短信。代理运行中会自动重启以生效';
+  const v6DescMain = h('span', { text: v6DescText(v6On) });
+  // 首选 APN 的协议状态（紧跟在说明文字下一行）：系统 IPv6=关 时后端会把上网 APN 的
+  // protocol / roaming_protocol 改成仅 IPv4，这里把「现在到底是不是 IPv4」直接摆出来。
+  // content 查询每次要拉起一个 JVM，所以只在弹层打开与切换 IPv6 后各取一次，
+  // 绝不放进 1.5 秒一次的 mod-state 轮询。
+  const apnStatus = h('span', { text: '首选 APN：读取中…' });
+  const apnProtoName = v => {
+    const t = String(v || '').trim().toUpperCase();
+    if (t === 'IPV4V6') return 'IPv4/IPv6';
+    if (t === 'IPV4') return 'IPv4';
+    if (t === 'IPV6') return 'IPv6';
+    return t || '未知';
+  };
+  const apnLineText = j => {
+    if (!j) return '首选 APN：读取失败';
+    if (!j.content) return '首选 APN：系统缺少 content 命令，无法读取';
+    const items = Array.isArray(j.items) ? j.items : [];
+    if (!items.length) return '首选 APN：未查询到（多卡/定制 ROM 可能如此）';
+    return items.map(it => '首选 APN「' + String(it.apn || ('id=' + (it.id || '?'))) + '」：协议 '
+      + apnProtoName(it.protocol) + '，漫游 ' + apnProtoName(it.roaming)).join('；');
+  };
+  const refreshApnStatus = async () => {
+    if (DEMO) { apnStatus.textContent = '首选 APN：演示模式下不可读取'; return; }
+    try {
+      const r = await cmdline('apn4-json', { timeout: 20000 });
+      apnStatus.textContent = apnLineText(parseJsonLoose(r && r.stdout));
+    } catch (e) {
+      apnStatus.textContent = '首选 APN：读取失败';
+    }
+  };
   // 诊断按钮工厂（Tproxy / TUN 热点各一个）：与配置源码弹窗一致的圆形诊断
   // 按钮（btn sm circle + 脉搏图标），放在各自开关的左旁。不生效时靠人猜很
   // 慢，一键跑后端诊断，把关键状态全部打出来，可直接复制给开发者。以前
@@ -544,7 +579,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
       }))),
     // Tproxy 代理：开启→识别端口+关 TUN+装 TPROXY 规则；关闭→拆规则+还原 TUN 配置
     h('div', { class: 'f-row' },
-      h('div', { class: 'f-label' }, 'Tproxy 代理', h('div', { class: 'f-desc', text: '开启后自动识别配置里的 TProxy 端口（tproxy-port 或 tproxy 监听器），关闭配置里的 TUN 并把 eBPF 入站的 local/shared.enable 置为 false（参数原样保留），安装 TPROXY 转发规则接管系统流量（内核会重启）；关闭则拆除规则并还原本次自动修改的 TUN 配置。应用黑白名单直接复用 TUN 页「仅代理以下应用」／「排除以下应用」（前者优先），改完保存配置自动生效' }), tpStatus),
+      h('div', { class: 'f-label' }, 'Tproxy 代理', h('div', { class: 'f-desc', text: '开启后接管系统流量：自动识别 tproxy-port 并关闭配置里的 TUN / eBPF，安装 TPROXY 规则（代理运行中会自动重启以生效）；关闭则拆除规则、还原被改动的 TUN 配置。应用黑白名单复用 TUN 页的「仅代理以下应用」／「排除以下应用」' }), tpStatus),
       h('div', { class: 'f-ctl' }, tpDiagBtn, (() => {
         let sw;
         sw = switchCtl(tpOn, async (v) => {
@@ -613,13 +648,15 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
     // IPv6 相关开关（顶层 ipv6 / dns.ipv6 / eBPF 入站 local·shared.ipv6）并重启服务，
     // 手术与重启都由后端 set system_ipv6 一次完成（见 cfg_ipv6_set_all）。
     h('div', { class: 'f-row' },
-      h('div', { class: 'f-label' }, '系统 IPv6', h('div', { class: 'f-desc', text: 'IPv6 总开关。开启＝系统 IPv6 保持可用，并把配置里的 IPv6 相关开关（IPv6 总开关 ipv6、解析 AAAA dns.ipv6、eBPF 入站 local/shared 的接管 IPv6）一并置为开启；关闭（默认）＝上述开关一并置为关闭，并在内核协议栈层面禁用各网卡 IPv6，防止 v6 流量绕过代理直连。每次切换都会同步配置并重启服务（含 eBPF 入站重建）；关闭期间每约 5 秒自动对账一次，飞行模式/切换网络后被系统放回来的 IPv6 会被自动收回' })),
+      h('div', { class: 'f-label' }, '系统 IPv6', h('div', { class: 'f-desc' }, v6DescMain, h('br'), apnStatus)),
       h('div', { class: 'f-ctl' }, (() => {
         let sw;
         sw = switchCtl(v6On, async (v) => {
           if (busy) { sw.querySelector('input').checked = !v; return; }
           busy = true;
           const wasDirty = state.dirty;
+          // 说明文字与开关同帧换成目标状态：切完还挂着旧状态的文案，就是在骗人。
+          v6DescMain.textContent = v6DescText(v);
           uiToast(v ? '正在启用系统 IPv6：同步配置并重启服务…' : '正在关闭系统 IPv6：同步配置并重启服务…', 3000);
           beginOpToast();
           // 切换会重启内核（含 eBPF 入站重建）：运行时长不在按下瞬间归零起表（核心
@@ -658,6 +695,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
                 : /服务未运行/.test(out) ? '，配置已同步（服务未运行，下次启动生效）' : '，配置已同步';
               toastDoneFallback((v ? '✅ 系统 IPv6 已启用' : '✅ 系统 IPv6 已禁用') + tail, 3200);
             } else {
+              v6DescMain.textContent = v6DescText(!v);   // 没成功：说明文字退回原状态
               uiToast('⚠️ ' + (out || (r && r.stderr) || '操作失败'), 5000);
             }
             refreshStatus(false, true).catch(() => { /* 补读失败不影响开关 */ });
@@ -666,6 +704,8 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             // 收尾只留 2.5s 补读短窗。Math.min：把本次 20s 长窗收回，避免一直挂着盖住
             // 之后真实的「已停止」显示；也不挤掉别处刚按下的更长静默窗。
             if (v6Quiet) restartQuietUntil = Math.min(restartQuietUntil, Date.now() + 2500);
+            // APN 协议刚被改写（关）或还原（开）：APN 状态行跟着刷新，不留旧读数
+            if (sheetClose && sheetClose.isCurrent()) void refreshApnStatus();
           }
         });
         return sw;
@@ -680,6 +720,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   }));
   // 打开弹层时异步刷一次最新状态，确保 Tproxy 与热点对账状态实时呈现
   startModPoll();   // 立即取一次轻量状态（不等完整 status），之后每 1.5 秒一次，关闭即停
+  void refreshApnStatus();   // 首选 APN 协议/漫游：打开弹层取一次（content 要拉 JVM，不进轮询）
   refreshStatus().then(async () => {
     if (sheetClose && sheetClose.isCurrent()) await refreshModState();   // status 带回的可能是旧值，文案以轻量状态为准
   }).catch(() => {});
