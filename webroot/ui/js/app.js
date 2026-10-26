@@ -396,8 +396,13 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   const hsOn = st.hotspot_proxy !== 'false';   // 默认开启
   const v6On = st.system_ipv6 === 'true';      // 默认关闭（后端 get_setting system_ipv6 false）
   const tpOn = st.tproxy === 'true';           // 默认关闭
-  const hsStatus = h('div', { style: 'font-size:12.5px;color:var(--text-3);margin-top:10px;line-height:1.5', text: tunHsStatusText() });
-  const tpStatus = h('div', { style: 'font-size:12.5px;color:var(--text-3);margin-top:10px;line-height:1.5', text: tproxyStatusText() });
+  // 「当前状态：…」与首选 APN 这类状态行，字号／颜色／字重一律跟上面的说明文字走：
+  // 直接挂同一个 .f-desc 类（12px / var(--text-3) / weight 400），只额外留 10px 上间距，
+  // 这样以后改说明文字样式，状态行自动跟着变，不会再各自跑偏。
+  const STATUS_LINE_CLASS = 'f-desc';
+  const STATUS_LINE_STYLE = 'margin-top:10px';
+  const hsStatus = h('div', { class: STATUS_LINE_CLASS, style: STATUS_LINE_STYLE, text: tunHsStatusText() });
+  const tpStatus = h('div', { class: STATUS_LINE_CLASS, style: STATUS_LINE_STYLE, text: tproxyStatusText() });
   // 「系统 IPv6」说明：一句话讲清当前状态做了什么，切换时当场改写（不留旧态文案）。
   // 只保留用户能感知的事实：哪些网卡禁用 / APN 协议 / 配置文件里的开关 / IMS 不受影响。
   const v6DescText = on => on
@@ -408,10 +413,10 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   // protocol / roaming_protocol 改成仅 IPv4，这里把「现在到底是不是 IPv4」直接摆出来。
   // content 查询每次要拉起一个 JVM，所以只在弹层打开与切换 IPv6 后各取一次，
   // 绝不放进 1.5 秒一次的 mod-state 轮询。
-  // 与 TUN 热点 / Tproxy 的「当前状态：…」同款样式：单独一行、12.5px、同一前景色，
+  // 与 TUN 热点 / Tproxy 的「当前状态：…」同款样式：单独一行、跟说明文字同字号同色，
   // 与说明文字之间留 10px 上间距（不是紧贴在说明最后一行下面）。
-  const APN_LINE_STYLE = 'font-size:12.5px;color:var(--text-3);margin-top:10px;line-height:1.5';
-  const apnStatus = h('div', { style: APN_LINE_STYLE, text: '首选 APN：读取中…' });
+  const APN_LINE_STYLE = STATUS_LINE_STYLE;
+  const apnStatus = h('div', { class: STATUS_LINE_CLASS, style: APN_LINE_STYLE, text: '首选 APN：读取中…' });
   // Android 的 APN protocol 取值是 IP / IPV6 / IPV4V6（老 ROM 也有 IPV4）：
   // 「IP」就是仅 IPv4，直接印 IP 会让人以为没读出来。
   const apnProtoName = v => {
@@ -668,7 +673,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
         // 本机内核在 IPv6 下起不来 TUN/eBPF 时后端会自动回退成仅 IPv4 代理（见
         // scripts/mihomo.sh 的 ipv6_proxy_guard）。这行必须在界面上说清楚，
         // 否则用户只会看到「系统 IPv6 开着但代理不走 v6」，以为坏了。
-        h('div', { style: APN_LINE_STYLE, hidden: st.ipv6_proxy !== 'fallback',
+        h('div', { class: STATUS_LINE_CLASS, style: APN_LINE_STYLE, hidden: st.ipv6_proxy !== 'fallback',
           text: '代理侧：本机内核无法在 IPv6 下接管，已回退为仅 IPv4 代理（系统 IPv6 与 IMS 不受影响）' })),
       h('div', { class: 'f-ctl' }, v6DiagBtn, (() => {
         let sw;
