@@ -429,13 +429,21 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
     return items.map(it => '首选 APN「' + String(it.apn || ('id=' + (it.id || '?'))) + '」：协议 '
       + apnProtoName(it.protocol) + '，漫游 ' + apnProtoName(it.roaming)).join('；');
   };
+  // 两段式：先用后端缓存秒开（纯文件读，不起 JVM），随后再真查一次刷新。
+  // content 查询每次都要拉起一个 JVM（0.3~1s），等它回来才显示就等于「打开设置先卡一秒」。
   const refreshApnStatus = async () => {
     if (DEMO) { apnStatus.textContent = '首选 APN：演示模式下不可读取'; return; }
+    let painted = false;
     try {
-      const r = await cmdline('apn4-json', { timeout: 20000 });
+      const c = await cmdline('apn4-json cached', { timeout: 5000 });
+      const jc = parseJsonLoose(c && c.stdout);
+      if (jc && Array.isArray(jc.items) && jc.items.length) { apnStatus.textContent = apnLineText(jc); painted = true; }
+    } catch (e) { /* 没有缓存就走真查 */ }
+    try {
+      const r = await cmdline('apn4-json refresh', { timeout: 20000 });
       apnStatus.textContent = apnLineText(parseJsonLoose(r && r.stdout));
     } catch (e) {
-      apnStatus.textContent = '首选 APN：读取失败';
+      if (!painted) apnStatus.textContent = '首选 APN：读取失败';
     }
   };
   // 诊断按钮工厂（Tproxy / TUN 热点各一个）：与配置源码弹窗一致的圆形诊断
@@ -482,6 +490,9 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   };
   const tpDiagBtn = makeDiagBtn('诊断 Tproxy', 'tproxy-diag', 'Tproxy 诊断');
   const hsDiagBtn = makeDiagBtn('诊断 TUN 热点', 'tun-hotspot-diag', 'TUN 热点诊断');
+  // IPv6 诊断：说清「代理侧 v6 现状 / 配置里与内核在用的 ipv6 / 内核自报的 TUN 是否
+  // 真的起来了 / 回退记录」。碰到「开了系统 IPv6 代理就不接管」先看这张纸。
+  const v6DiagBtn = makeDiagBtn('诊断 IPv6', 'ipv6-status', 'IPv6 诊断');
   let busy = false;
   let tpBusy = false;
   let tpQuiet = false;   // Tproxy 开启的重启静默窗是否已压（收尾用 Math.min 收回）
@@ -653,8 +664,13 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
     // IPv6 相关开关（顶层 ipv6 / dns.ipv6 / eBPF 入站 local·shared.ipv6）并重启服务，
     // 手术与重启都由后端 set system_ipv6 一次完成（见 cfg_ipv6_set_all）。
     h('div', { class: 'f-row' },
-      h('div', { class: 'f-label' }, '系统 IPv6', h('div', { class: 'f-desc' }, v6DescMain), apnStatus),
-      h('div', { class: 'f-ctl' }, (() => {
+      h('div', { class: 'f-label' }, '系统 IPv6', h('div', { class: 'f-desc' }, v6DescMain), apnStatus,
+        // 本机内核在 IPv6 下起不来 TUN/eBPF 时后端会自动回退成仅 IPv4 代理（见
+        // scripts/mihomo.sh 的 ipv6_proxy_guard）。这行必须在界面上说清楚，
+        // 否则用户只会看到「系统 IPv6 开着但代理不走 v6」，以为坏了。
+        h('div', { style: APN_LINE_STYLE, hidden: st.ipv6_proxy !== 'fallback',
+          text: '代理侧：本机内核无法在 IPv6 下接管，已回退为仅 IPv4 代理（系统 IPv6 与 IMS 不受影响）' })),
+      h('div', { class: 'f-ctl' }, v6DiagBtn, (() => {
         let sw;
         sw = switchCtl(v6On, async (v) => {
           if (busy) { sw.querySelector('input').checked = !v; return; }
@@ -683,7 +699,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             if (current === 'page-dashboard' && dEl) renderDashboard(dEl);
             if (!DEMO && dEl) quickResPaint(dEl, {
               oldPid: v6PrevPid, stillActive: () => busy, reanchor: true,
-              onReady: () => toastUpDone(v ? '✅ 系统 IPv6 已启用，配置已同步，服务已重启' : '✅ 系统 IPv6 已禁用，配置已同步，服务已重启'),
+              onReady: () => toastUpDone(v ? '✅ 系统 IPv6 已启用，服务已重启' : '✅ 系统 IPv6 已禁用，服务已重启'),
             }).catch(() => {});
           }
           try {
@@ -696,8 +712,12 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
               // 避免旧草稿在下次保存时把同步结果覆盖回去
               try { await loadConfig(); rerenderCurrent(); } catch (e) { /* 重载失败不影响开关 */ }
               if (wasDirty) uiToast('⚠️ 配置已由模块修改并重新载入，先前未保存的编辑已丢弃', 4200);
-              const tail = /服务已重启/.test(out) ? '，配置已同步，服务已重启'
-                : /服务未运行/.test(out) ? '，配置已同步（服务未运行，下次启动生效）' : '，配置已同步';
+              // 本机内核在 IPv6 下起不来时后端只开系统协议栈、不改配置并回 WARN，
+              // toast 必须照实说，不能继续报「配置已同步」
+              const skipped = /代理维持仅 IPv4/.test(out);
+              const tail = skipped ? '，本机无法在 IPv6 下接管流量，代理维持仅 IPv4'
+                : /服务已重启/.test(out) ? '，配置已同步，服务已重启'
+                  : /服务未运行/.test(out) ? '，配置已同步（服务未运行，下次启动生效）' : '，配置已同步';
               toastDoneFallback((v ? '✅ 系统 IPv6 已启用' : '✅ 系统 IPv6 已禁用') + tail, 3200);
             } else {
               v6DescMain.textContent = v6DescText(!v);   // 没成功：说明文字退回原状态
