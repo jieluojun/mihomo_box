@@ -2611,6 +2611,43 @@ _start_core_body() {
   action_mark core_spawned
   echo "$pid" > "$PIDFILE"
   rm -f "$RUNDIR/starting" 2>/dev/null
+  # ★Tproxy 已开启：规则装法与内核启动并行。
+  #   以前的顺序是「等内核在 tproxy 端口监听 → 再装规则」，两段串行：内核 0.4~2s
+  #   起来之后，用户还要再等一整轮对账（慢设备 1~2s 的 iptables）才算切换完成，
+  #   于是「运行时长都 2 秒了才弹已切换」。
+  #   现在把装规则整体扔进后台，跟内核启动抢这段时间：先只写链内容、**不挂内置链
+  #   跳转**（= 一点流量都不接管，端口没起来也不会捅出黑洞），随后这个后台任务自己
+  #   盯着端口，一就绪就挂跳转（3 次 iptables）。前台只需 wait 它。
+  _sc_tp_pre_on=0
+  [ "$(get_setting tproxy false)" = "true" ] && _sc_tp_pre_on=1
+  _sc_tp_job=""
+  if [ "$_sc_tp_pre_on" = "1" ]; then
+    _sc_tpp=$(tproxy_detect | awk '{print $1}')
+    if [ -n "$_sc_tpp" ]; then
+      (
+        TP_EARLY_INSTALL=1 TP_DEFER_JUMPS=1 tproxy_sync >/dev/null 2>&1
+        [ -f "$TP_JUMPS" ] || exit 0          # 没装上 / 不需要提交：交给前台兜底
+        _tpj_dl=0; now_cs
+        [ "$NOW_CS" -gt 0 ] && _tpj_dl=$((NOW_CS + 800))   # 最多盯 8 秒端口
+        while :; do
+          tproxy_port_listening "$_sc_tpp" 2>/dev/null && break
+          if [ "$_tpj_dl" != "0" ]; then
+            now_cs
+            [ "$NOW_CS" -ge "$_tpj_dl" ] && exit 0          # 端口迟迟不来：留给前台兜底
+          fi
+          nap 0.02
+        done
+        tp_setup_bins
+        if _tproxy_jumps_ensure; then
+          rm -f "$TP_JUMPS" 2>/dev/null
+          tp_log "commit: 端口 $_sc_tpp 就绪，跳转已挂上（链内容与内核启动并行装好）"
+        else
+          tp_log "WARN commit: 跳转挂载失败，留给随后的对账重试"
+        fi
+      ) </dev/null >/dev/null 2>&1 &
+      _sc_tp_job=$!
+    fi
+  fi
   t=0; alive=0
   # 网络匹配只要进程活着就让主页切到运行中，不再干等控制器端口 1.2s。
   if [ "${MH_QUICK_START:-0}" = "1" ]; then
@@ -2681,7 +2718,17 @@ _start_core_body() {
     #   同一刻生效；后台循环仍保留，作为兜底与名单变化时的重建路径。
     if [ "$_sc_tp_on" = "1" ]; then
       _sc_tpp=$(tproxy_detect | awk '{print $1}')
-      if [ -n "$_sc_tpp" ]; then
+      if [ -n "${_sc_tp_job:-}" ]; then
+        # 并行预装任务收尾（它自己盯着端口，端口一就绪就提交跳转）。
+        # 正常路径到这里就不用再做任何 iptables 了：切换与内核启动同一时刻完成。
+        wait "$_sc_tp_job" 2>/dev/null
+        _sc_tp_job=""
+        action_mark tproxy_port_ready
+        action_mark tproxy_installed
+      fi
+      # 兜底：预装没成功（能力探测不过 / 端口迟迟没起来 / 跳转没挂上）就按老路子
+      # 「等端口 → 同步对账」再走一遍。宁可慢，也不留下「说已切换其实没接管」。
+      if [ -n "$_sc_tpp" ] && { [ ! -f "$TP_STATE" ] || [ -f "$TP_JUMPS" ]; }; then
         # 等待时长用真实时钟封顶（nap 在 ceil 模式每轮睡 1 秒，按轮数推算会整体失真）
         [ -n "$NAP_MODE" ] || nap_load_mode
         _sc_tl_max=80; [ "$NAP_MODE" = "frac" ] || _sc_tl_max=3   # 退路：取不到时钟时按轮数
@@ -5053,6 +5100,7 @@ TP_APP_MAX=64                     # 单次安装最多写入的 UID 数（名单
 TP_STATE=$RUNDIR/tproxy.state     # 已应用规则的状态（文件存在=已装）:
                                   # port= v6= bypass= mode= want= fp= fb= apps= uids= uh= pref= ver= backend=
 TP_MISS=$RUNDIR/tproxy.miss       # 「内核在但端口未就绪」连续命中次数（宽限期内不拆规则）
+TP_JUMPS=$RUNDIR/tproxy.nojump    # 标记：链内容已装好、内置链跳转还没挂（= 尚未接管流量）
 TP_GRACE=3                        # 宽限轮数（对账约 5s/轮 → 约 15s）
                                   # 权衡：太短挡不住热重载抖动（又变回直连窗口），
                                   # 太长则内核真死时规则久留，流量被送进黑洞（无网络）。
@@ -6050,16 +6098,16 @@ _tproxy_restore_bin() {
 # 一直都在、指向的也是同名链（restore 只是把链内容换掉，引用没断），删了再加纯属
 # 白花 100~400ms。改成先 -C 认一次，缺了才补（1 次调用）。
 _tproxy_jumps_ensure() {
+  # -C 找的就是「参数完全相同」的那条规则：命中＝已经挂好，一次调用搞定；
+  # 没命中说明内置链里根本没有这条（同参数的重复项自然也不存在），
+  # 不必再跑 -D 清一遍，直接 -I 插链首。
   if ! $TP_IPT -w -t mangle -C PREROUTING -j "$TP_CHAIN_PRE" 2>/dev/null; then
-    while $TP_IPT -w -t mangle -D PREROUTING -j "$TP_CHAIN_PRE" 2>/dev/null; do :; done
     $TP_IPT -w -t mangle -I PREROUTING -j "$TP_CHAIN_PRE" 2>>"$TP_LOG" || return 1
   fi
   if ! $TP_IPT -w -t mangle -C OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>/dev/null; then
-    while $TP_IPT -w -t mangle -D OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
     $TP_IPT -w -t mangle -I OUTPUT -p tcp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || return 1
   fi
   if ! $TP_IPT -w -t mangle -C OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>/dev/null; then
-    while $TP_IPT -w -t mangle -D OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>/dev/null; do :; done
     $TP_IPT -w -t mangle -I OUTPUT -p udp -j "$TP_CHAIN_OUT" 2>>"$TP_LOG" || return 1
   fi
   return 0
@@ -6150,7 +6198,14 @@ _tproxy_install_ipt_batched() {
     return 1
   fi
   rm -f "$_ib_file" 2>/dev/null
-  _tproxy_jumps_ensure || return 1
+  if [ "${TP_DEFER_JUMPS:-0}" = "1" ]; then
+    # 预装：链内容就位、内置链跳转先不挂。没挂跳转＝流量一点不受影响，所以可以
+    # 在内核还没开始监听的安全窗口里装（见 _start_core_body 的并行预装）。
+    : > "$TP_JUMPS" 2>/dev/null
+  else
+    _tproxy_jumps_ensure || return 1
+    rm -f "$TP_JUMPS" 2>/dev/null
+  fi
   return 0
 }
 
@@ -6279,7 +6334,12 @@ tproxy_install() {
   fi
 
   # 挂载（已在位就不动；PREROUTING 同时覆盖 lo 回注与热点转发流量）
-  _tproxy_jumps_ensure || { tp_log "WARN 跳转挂载失败"; tproxy_teardown; return 1; }
+  if [ "${TP_DEFER_JUMPS:-0}" = "1" ]; then
+    : > "$TP_JUMPS" 2>/dev/null
+  else
+    _tproxy_jumps_ensure || { tp_log "WARN 跳转挂载失败"; tproxy_teardown; return 1; }
+    rm -f "$TP_JUMPS" 2>/dev/null
+  fi
   fi   # ← 逐条下发分支结束（批量成功时上面的整段跳过）
 
   # —— v6：真 GUA 原生；只把 DNS fake-ip6 送进 TPROXY（对齐 IPv4 的 198.18.0.0/16）。
@@ -6336,6 +6396,7 @@ tproxy_install() {
 # 其余清理（链删除、ip rule、路由表、状态文件）无流量影响，交给随后的
 # 后台全量对账。这里 6 条「删到没有」循环，亚秒级，专为总开关返回提速。
 tproxy_unhook_quick() {
+  rm -f "$TP_JUMPS" 2>/dev/null   # 跳转被摘掉，预装标记随之作废
   tp_setup_bins
   tproxy_nft_delete
   [ -n "$TUNHS_IPT" ] && {
@@ -6465,7 +6526,8 @@ _tproxy_sync_body() {
     _ps_wport=$(printf '%s\n' "$_ps_det" | awk '{print $1}')
     _ps_src=$(printf '%s\n' "$_ps_det" | awk '{print $2}')
     _ps_lsn=$(printf '%s\n' "$_ps_det" | awk '{print $3}')
-    if [ -n "$_ps_wport" ] && tproxy_port_listening "$_ps_wport"; then
+    # TP_EARLY_INSTALL：内核刚起、端口还在监听路上也允许先装（跳转延后，不接管流量）。
+    if [ -n "$_ps_wport" ] && { tproxy_port_listening "$_ps_wport" || [ "${TP_EARLY_INSTALL:-0}" = "1" ]; }; then
       # 内核实际运行身份决定旁路方式：gid=3005（setuidgid 拉起）→ 精确旁路；
       # 否则 uid 0 兜底（root 进程全部直连）
       _ps_g=$(awk '/^Gid:/{print $2; exit}' "/proc/$(pid_of)/status" 2>/dev/null)
@@ -6504,6 +6566,18 @@ _tproxy_sync_body() {
      && [ "$_ps_wbackend" = "$_ps_backend" ] \
      && [ "$_ps_wport" = "$_ps_port" ] && [ "$_ps_wv6" = "$_ps_v6" ] && [ "$_ps_wbp" = "$_ps_bp" ] \
      && [ "$_ps_wmode" = "$_ps_swant" ] && [ "$_ps_wfp" = "$_ps_fp" ]; then
+    # 预装过但跳转还没挂（内核刚起时先装链、端口就绪后再接管）：这里补上。
+    # 正常路径下这一步由 _start_core_body 的并行预装任务完成，这里是兜底与自愈
+    # ——后台对账每轮都会把「链在、跳转不在」的半成品状态补齐，绝不会留着不接管。
+    if [ -f "$TP_JUMPS" ]; then
+      if _tproxy_jumps_ensure; then
+        rm -f "$TP_JUMPS" 2>/dev/null
+        tp_log "commit: 端口 ${_ps_port:-?} 就绪，跳转已挂上（链内容在预装阶段完成）"
+      else
+        tp_log "WARN commit: 跳转挂载失败，等下一轮对账重试"
+        return 1
+      fi
+    fi
     # 名单模式定期重解析 UID：应用重装/升级会换 UID，包管理器抖动或名单未解析的
     # 降级态也靠它恢复。UID 无变化则静默 touch 状态文件顺延窗口（稳态零日志）。
     _ps_refresh=0
