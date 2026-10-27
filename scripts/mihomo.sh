@@ -5098,16 +5098,25 @@ _apn4_json_esc() {
 #   apn4-json refresh   → 强制真查并更新缓存
 apn4_json() {
   _aj_mode=${1:-auto}
+  if [ "$_aj_mode" = "cached" ]; then
+    if [ -f "$APN4_CACHE" ]; then
+      sed -n '2,$p' "$APN4_CACHE" 2>/dev/null
+      return 0
+    fi
+    # cache miss must stay cheap: the caller will explicitly request one fresh read next.
+    _aj_cmd=1; command -v content >/dev/null 2>&1 || _aj_cmd=0
+    _aj_taken=0; [ -f "$APN4_STATE" ] && _aj_taken=1
+    printf '{"ok":1,"content":%s,"taken":%s,"items":[]}\n' "$_aj_cmd" "$_aj_taken"
+    return 0
+  fi
   if [ -f "$APN4_CACHE" ] && [ "$_aj_mode" != "refresh" ]; then
     _aj_ts=""; IFS= read -r _aj_ts < "$APN4_CACHE" 2>/dev/null
     case "$_aj_ts" in ''|*[!0-9]*) _aj_ts=0 ;; esac
-    if [ "$_aj_mode" = "cached" ]; then
-      sed -n '2,$p' "$APN4_CACHE" 2>/dev/null; return 0
-    fi
     _aj_now=$(date +%s 2>/dev/null)
     case "$_aj_now" in ''|*[!0-9]*) _aj_now=0 ;; esac
     if [ "$_aj_ts" -gt 0 ] && [ "$_aj_now" -gt 0 ] && [ $((_aj_now - _aj_ts)) -lt "$APN4_TTL" ]; then
-      sed -n '2,$p' "$APN4_CACHE" 2>/dev/null; return 0
+      sed -n '2,$p' "$APN4_CACHE" 2>/dev/null
+      return 0
     fi
   fi
   _aj_cmd=1; command -v content >/dev/null 2>&1 || _aj_cmd=0
@@ -10623,7 +10632,7 @@ case "$cmd" in
   ipv6-guard)    ipv6_proxy_guard ;;
   # APN 协议接管（等效「APN 协议=IPv4」防蜂窝 v6 泄漏，不碰 IMS）：
   apn4-status)   apn4_status ;;
-  apn4-json)     apn4_json ;;
+  apn4-json)     apn4_json "$1" ;;
   apn4-apply)    apn4_apply  && echo "OK: APN 已按 IPv4 接管（详见 $APN4_LOG）" ;;
   apn4-restore)  apn4_restore && echo "OK: APN 协议已还原（详见 $APN4_LOG）" ;;
   # Tproxy 透明代理：开关主流程 / 手动对账 / 查看状态
