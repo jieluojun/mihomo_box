@@ -451,8 +451,8 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   // 两段式：先用后端缓存秒开（纯文件读，不起 JVM），随后再真查刷新。
   // content 查询每次都要拉起一个 JVM（0.3~1s），等它回来才显示就等于「打开设置先卡一秒」。
   //
-  // 切换后查询在后端命令一返回就启动，并与配置草稿重载并行；不再串行等完配置重载
-  // 才读 APN。每次新读数会取消旧请求的绘制，避免弹层打开时的慢查询覆盖切换后的结果。
+  // 普通刷新与配置草稿重载并行；IPv6 切换另有 after-write 快路，可在内核重启期间
+  // 等 APN 写事务结束后读取。每次新读数会取消旧请求的绘制，避免迟到的旧查询覆盖新结果。
   // opts.expect(txt)：只在读到有效 APN 行且符合目标时停止；失败/空结果最多快速补读一次。
   let apnStatusReadSeq = 0;
   const refreshApnStatus = async (opts) => {
@@ -506,6 +506,23 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
       prev = txt;
     }
     if (!painted) apnStatus.textContent = '首选 APN：读取失败';
+  };
+  // IPv6 切换的后端命令会等到新内核启动才返回。单独等待 APN 写事务结束后刷新，
+  // 让 provider 查询与 core 重启并行，避免 APN 行也跟着多等整个重启窗口。
+  const refreshApnAfterWrite = async () => {
+    const seq = ++apnStatusReadSeq;
+    const isCurrentRead = () => seq === apnStatusReadSeq && !(sheetClose && !sheetClose.isCurrent());
+    if (DEMO) return false;
+    try {
+      const r = await cmdline('apn4-json after-write', { timeout: 22000 });
+      if (!isCurrentRead()) return false;
+      const j = parseJsonLoose(r && r.stdout);
+      const items = j && Array.isArray(j.items) ? j.items : [];
+      if (!j || !j.ok || !items.length) return false;
+      const txt = apnLineText(j);
+      apnStatus.textContent = txt;
+      return true;
+    } catch (e) { return false; }
   };
   // 诊断按钮工厂（Tproxy / TUN 热点各一个）：与配置源码弹窗一致的圆形诊断
   // 按钮（btn sm circle + 脉搏图标），放在各自开关的左旁。不生效时靠人猜很
@@ -774,23 +791,42 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
               onReady: () => flushPendingUpToast(),
             }).catch(() => {});
           }
+          const apnBefore = apnStatus.textContent;
+          const hasApn = t => /^首选 APN「/.test(t);
+          const expectApn = v
+            ? (t => hasApn(t) && t !== apnBefore)
+            : (t => hasApn(t) && !/IPv6/i.test(t));
+          let ipv6CommandDone = false;
+          let earlyApnDone = !(sheetClose && sheetClose.isCurrent());
+          let earlyApnFresh = false;
+          let fallbackApnStarted = false;
+          const startFallbackApnRead = () => {
+            if (!ipv6CommandDone || !earlyApnDone || earlyApnFresh || fallbackApnStarted ||
+                !(sheetClose && sheetClose.isCurrent())) return;
+            fallbackApnStarted = true;
+            apnStatus.textContent = '首选 APN：正在重新读取…';
+            void refreshApnStatus({ tries: 2, gap: 500, timeout: 6000, expect: expectApn });
+          };
+          if (!earlyApnDone) {
+            // 先等后端 APN 写入标记清除，再查一次；这段查询可与后续内核重启并行。
+            apnStatus.textContent = '首选 APN：等待协议更新…';
+            void refreshApnAfterWrite().then(fresh => {
+              earlyApnDone = true;
+              earlyApnFresh = fresh;
+              startFallbackApnRead();
+            }).catch(() => {
+              earlyApnDone = true;
+              startFallbackApnRead();
+            });
+          }
           try {
             const r = await cmdline(`set system_ipv6 ${v}`);
             const out = ((r && r.stdout) || '').trim();
             const ok = !!r && r.errno === 0 && !/(^|\n)ERR/.test(out);
             if (state.status) state.status.system_ipv6 = v ? 'true' : 'false';
-            if (ok && sheetClose && sheetClose.isCurrent()) {
-              // 先启动 APN 状态读取，再并行重载配置草稿，别把这两段耗时串起来。
-              const apnBefore = apnStatus.textContent;
-              const hasApn = t => /^首选 APN「/.test(t);
-              apnStatus.textContent = '首选 APN：正在重新读取…';
-              void refreshApnStatus({
-                tries: 2, gap: 500, timeout: 6000,
-                expect: v
-                  ? (t => hasApn(t) && t !== apnBefore)
-                  : (t => hasApn(t) && !/IPv6/i.test(t)),
-              });
-            }
+            if (ok) v6FallbackStatus.hidden = true; // 结束“验证中”；状态回读确认 fallback 时再显示警告
+            ipv6CommandDone = true;
+            startFallbackApnRead();
             if (ok) {
               // 后端会尝试同步并重启；若代理侧仍无法接管，守卫会自动回退配置。
               // 仅当后端明确报告回退时才在 toast 中直接说明，常规重启后的最终状态由诊断行展示。
@@ -807,6 +843,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
               if (wasDirty) uiToast('⚠️ 配置已由模块修改并重新载入，先前未保存的编辑已丢弃', 4200);
             } else {
               v6DescMain.textContent = v6DescText(!v);   // 没成功：说明文字退回原状态
+              v6FallbackStatus.hidden = true;
               dropPendingUpToast();
               uiToast('⚠️ ' + (out || (r && r.stderr) || '操作失败'), 5000);
             }
@@ -817,6 +854,8 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
               }
             }, 2200);
           } finally {
+            ipv6CommandDone = true;
+            startFallbackApnRead();
             busy = false;
             // 收尾只留 2.5s 补读短窗。Math.min：把本次 20s 长窗收回，避免一直挂着盖住
             // 之后真实的「已停止」显示；也不挤掉别处刚按下的更长静默窗。

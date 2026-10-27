@@ -4788,6 +4788,13 @@ _apn4_parse_row() {
     END { if (id != "") print id "|" apn "|" p "|" r "|" t }'
 }
 
+apn4_update_elapsed_cs() {
+  now_cs || { echo 0; return 0; }
+  _aue=$((NOW_CS - ${_au_wcs:-NOW_CS}))
+  [ "$_aue" -ge 0 ] || _aue=0
+  echo "$_aue"
+}
+
 # content update 在部分 ROM 上成功时 stdout 为空，不能把「无输出」直接当失败，
 # 也不能只看 rc=0（可能实际更新了 0 行）。若返回没有明确的 Updated N rows，
 # 就按 id 回查协议；只有读回与目标一致才确认成功。
@@ -4802,7 +4809,7 @@ _apn4_update_verified_content_locked() {
   _au_n=$(printf '%s\n' "$_au_out" | awk '{ for (i=1; i<NF; i++) if (tolower($i)=="updated" && $(i+1) ~ /^[0-9]+$/) { print $(i+1); exit } }')
   case "$_au_n" in ''|*[!0-9]*) _au_n=0 ;; esac
   if [ "$_au_rc" = "0" ] && [ "$_au_n" -gt 0 ]; then
-    APN4_UPDATE_DETAIL="Updated $_au_n rows"
+    APN4_UPDATE_DETAIL="Updated $_au_n rows elapsed_cs=$(apn4_update_elapsed_cs)"
     return 0
   fi
 
@@ -4822,10 +4829,10 @@ _apn4_update_verified_content_locked() {
     }
   ')
   if [ "$_au_got" = "$_au_p|$_au_r" ]; then
-    APN4_UPDATE_DETAIL="回查确认成功（update rc=$_au_rc, query rc=$_au_qrc）"
+    APN4_UPDATE_DETAIL="回查确认成功（update rc=$_au_rc, query rc=$_au_qrc, elapsed_cs=$(apn4_update_elapsed_cs)）"
     return 0
   fi
-  APN4_UPDATE_DETAIL="未确认（update rc=$_au_rc, 输出=${_au_out:-无输出}; query rc=$_au_qrc, 实读=${_au_got:-无匹配行}）"
+  APN4_UPDATE_DETAIL="未确认（update rc=$_au_rc, 输出=${_au_out:-无输出}; query rc=$_au_qrc, 实读=${_au_got:-无匹配行}, elapsed_cs=$(apn4_update_elapsed_cs)）"
   return 1
 }
 
@@ -5024,7 +5031,7 @@ _apn4_apply_locked() {
       printf '%s|%s|%s|%s\n' "$_aa_id" "$_aa_apn" "$_aa_p" "$_aa_r" >> "$APN4_STATE" 2>/dev/null
     fi
     if apn4_update_verified "$_aa_id" IP IP; then
-      apn4_log "id=$_aa_id apn=$_aa_apn: $_aa_p/$_aa_r -> IP/IP ($_APN4_UPDATE_DETAIL)"
+      apn4_log "id=$_aa_id apn=$_aa_apn: $_aa_p/$_aa_r -> IP/IP ($APN4_UPDATE_DETAIL)"
       _aa_changed=1
     else
       apn4_log "WARN id=$_aa_id 写库失败: $APN4_UPDATE_DETAIL"
@@ -5070,7 +5077,7 @@ _apn4_restore_locked() {
       continue
     fi
     if apn4_update_verified "$_ar_id" "$_ar_p" "$_ar_r"; then
-      apn4_log "还原 id=$_ar_id apn=$_ar_apn -> $_ar_p/$_ar_r ($_APN4_UPDATE_DETAIL)"
+      apn4_log "还原 id=$_ar_id apn=$_ar_apn -> $_ar_p/$_ar_r ($APN4_UPDATE_DETAIL)"
       _ar_changed=1
     else
       apn4_log "WARN 还原 id=$_ar_id apn=$_ar_apn 失败: $APN4_UPDATE_DETAIL"
@@ -5156,12 +5163,53 @@ EOF
 _apn4_json_esc() {
   printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
+# 等一次 APN 写入事务完成：供 IPv6 重启期间并行的 UI 状态刷新使用。
+# 没观察到 writer 就有界等待 12s；观察到后等它清除，再读最终 provider 状态。
+apn4_wait_for_write() {
+  _aw_seen=0
+  now_cs || return 1
+  _aw_deadline=$((NOW_CS + 1200))
+  while :; do
+    if [ -f "$APN4_CONTENT_WRITER_FILE" ]; then
+      if apn4_content_write_pending; then
+        _aw_seen=1
+      else
+        # 看到但已失效的 writer 标记也说明事务退出了，清掉后直接读实际状态。
+        return 0
+      fi
+    elif [ "$_aw_seen" = 1 ]; then
+      return 0
+    fi
+    now_cs || return 1
+    [ "$NOW_CS" -ge "$_aw_deadline" ] && return 1
+    nap 0.2
+  done
+}
+
 # 缓存：APN 协议不会每秒变，content 却每次都要拉起 JVM。
 #   apn4-json           → 缓存新鲜（默认 60s）就直接吐，过期才查
 #   apn4-json cached    → 只吐缓存（没有就吐空 items），供界面先秒开再后台刷新
 #   apn4-json refresh   → 强制真查并更新缓存
+#   apn4-json after-write → 等 APN writer 完成后真查；让 UI 查询与后续 core 重启并行
 apn4_json() {
   _aj_mode=${1:-auto}
+  if [ "$_aj_mode" = "after-write" ]; then
+    # 没有 content 时不可能有 provider 写事务，直接返回诊断状态。
+    # 开启 IPv6 且无接管状态时没有 APN 还原事务，直接读；关闭 IPv6 即使
+    # 尚无 state 文件也会创建它并检查首选 APN，仍需等 apply writer。
+    if ! command -v content >/dev/null 2>&1; then
+      _aj_mode=refresh
+    elif [ "$(get_setting system_ipv6 false)" = "true" ] && [ ! -f "$APN4_STATE" ] &&
+       ! apn4_content_write_pending; then
+      _aj_mode=refresh
+    elif ! apn4_wait_for_write; then
+      _aj_cmd=1; command -v content >/dev/null 2>&1 || _aj_cmd=0
+      _aj_taken=0; [ -f "$APN4_STATE" ] && _aj_taken=1
+      printf '{"ok":1,"content":%s,"taken":%s,"deferred":1,"items":[]}\n' "$_aj_cmd" "$_aj_taken"
+      return 0
+    fi
+    _aj_mode=refresh
+  fi
   if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then
     # 不显示将被覆盖的旧缓存，也不排队启动 provider 查询；写完后调用方会刷新。
     _aj_cmd=1; command -v content >/dev/null 2>&1 || _aj_cmd=0
