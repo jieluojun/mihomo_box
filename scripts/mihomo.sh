@@ -4650,7 +4650,6 @@ APN4_TTL=60                       # 缓存有效期（秒）：过期才重新�
 APN4_LOG=$RUNDIR/apn4.log
 APN4_LOCK=$RUNDIR/apn4.lock              # 显式开关与 5s 对账循环可能并发触碰 APN
 APN4_CONTENT_LOCK=$RUNDIR/apn4.content.lock # 序列化本模块所有 Android content JVM 调用
-APN4_ATTACH_LOCK=$RUNDIR/apn4.reattach.lock # svc data off/on 在后台执行，单独覆盖完整重连周期
 APN4_RETRY_FILE=$RUNDIR/apn4.restore.retry  # 内容提供者暂时失败时限频重试（单调时钟厘秒）
 APN4_RETRY_COOL_CS=6000                   # 最多每 60s 重试一次，避免 5s 对账循环反复拉起 content
 
@@ -4942,46 +4941,9 @@ apn4_rows() {
   return "$_arows_rc"
 }
 
-# 改协议后需重新附着才生效：自动开关一次移动数据（飞行模式开启时是空操作，
-# 下次附着自然生效）。后台执行，不阻塞调用方。单独持有覆盖完整 off/sleep/on 的锁：
-# APN 写库锁只覆盖到后台任务启动；若另一条对账随后改 APN，不能再启动第二组 off/on，
-# 当前 worker 最后一次 enable 会按已更新的 APN 重新建链。
-apn4_reattach() {
-  command -v svc >/dev/null 2>&1 || { apn4_log "WARN 无 svc，请手动开关一次飞行模式使 APN 协议生效"; return 0; }
-  now_cs || NOW_CS=0
-  _aat_now=$NOW_CS
-  if ! mkdir "$APN4_ATTACH_LOCK" 2>/dev/null; then
-    _aat_start=""; IFS= read -r _aat_start < "$APN4_ATTACH_LOCK/start" 2>/dev/null
-    case "$_aat_start" in ''|*[!0-9]*) _aat_start="" ;; esac
-    _aat_stale=0
-    if [ -n "$_aat_start" ]; then
-      if [ "$_aat_now" -lt "$_aat_start" ] || [ $((_aat_now - _aat_start)) -ge 3000 ]; then
-        _aat_stale=1   # 超过 30s 或 uptime 回退（重启后遗留）
-      fi
-    fi
-    if [ "$_aat_stale" = "1" ]; then
-      rm -rf "$APN4_ATTACH_LOCK" 2>/dev/null
-      mkdir "$APN4_ATTACH_LOCK" 2>/dev/null || {
-        apn4_log "WARN 移动数据重连锁仍被占用，本次不重复触发"
-        return 0
-      }
-    else
-      apn4_log "移动数据重连已在进行中，本次并入当前重连"
-      return 0
-    fi
-  fi
-  _aat_token="$$-$_aat_now"
-  printf '%s\n' "$_aat_now" > "$APN4_ATTACH_LOCK/start" 2>/dev/null
-  printf '%s\n' "$_aat_token" > "$APN4_ATTACH_LOCK/token" 2>/dev/null
-  (
-    svc data disable >/dev/null 2>&1
-    sleep 2
-    svc data enable >/dev/null 2>&1
-    [ "$(cat "$APN4_ATTACH_LOCK/token" 2>/dev/null)" = "$_aat_token" ] && rm -rf "$APN4_ATTACH_LOCK" 2>/dev/null
-  ) </dev/null >/dev/null 2>&1 &
-  apn4_log "重新附着数据（svc data off/on，重连期间合并重复请求）"
-  return 0
-}
+# APN provider 更新可能自行触发 Android telephony 重建数据连接。不要再额外执行
+# svc data disable/enable：在观察到 provider 已重连的 ROM 上会造成第二次掉线；
+# 若 ROM 不会自动重建，APN 新协议将在下一次自然附着时生效。
 
 # 「系统 IPv6=关」：把上网 APN 协议改成 IPv4（幂等；只写漂移的行）
 _apn4_apply_locked() {
@@ -5016,12 +4978,12 @@ EOF
     # 改写过的行刚变：APN 读取缓存立刻作废，否则前端「cached 秒画」会把改动前的
     # 协议再显示一次（用户看到的就是「明明关了 IPv6，APN 还写着 IPv4/IPv6」）
     rm -f "$APN4_CACHE" 2>/dev/null
-    apn4_reattach
+    apn4_log "APN 已改为 IPv4；不再主动切换移动数据，交由 Android provider 生效"
   fi
   return 0
 }
 
-# 公共入口持锁后再查询 APN，避免显式开关与周期监听并发触发两次重连。
+# 公共入口持锁后再查询 APN，避免显式开关与周期监听并发重复写库.
 apn4_apply() {
   apn4_lock_acquire || { apn4_log "WARN APN 对账锁忙，本轮跳过，等待下一次对账"; return 1; }
   _a4a_rc=0
@@ -5057,7 +5019,7 @@ _apn4_restore_locked() {
   if [ "$_ar_changed" = "1" ]; then
     # 同 apn4_apply：还原后缓存必须作废，别让前端先画出还原前的协议
     rm -f "$APN4_CACHE" 2>/dev/null
-    apn4_reattach
+    apn4_log "APN 协议已还原；不再主动切换移动数据，交由 Android provider 生效"
   fi
   return 0
 }
