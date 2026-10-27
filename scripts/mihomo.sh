@@ -4650,14 +4650,52 @@ APN4_TTL=60                       # 缓存有效期（秒）：过期才重新�
 APN4_LOG=$RUNDIR/apn4.log
 APN4_LOCK=$RUNDIR/apn4.lock              # 显式开关与 5s 对账循环可能并发触碰 APN
 APN4_CONTENT_LOCK=$RUNDIR/apn4.content.lock # 序列化本模块所有 Android content JVM 调用
+APN4_CONTENT_WRITER_FILE=$RUNDIR/apn4.content.writer # IPv6/APN 写入优先级标记
 APN4_RETRY_FILE=$RUNDIR/apn4.restore.retry  # 内容提供者暂时失败时限频重试（单调时钟厘秒）
 APN4_RETRY_COOL_CS=6000                   # 最多每 60s 重试一次，避免 5s 对账循环反复拉起 content
 
 # 多个 WebUI APN 查询、IPv6 对账与验证回查都可能同时拉起 content JVM。
 # ROM 上 content 并发查询可直接以 139 崩溃；全局串行化，避免 provider/JVM 争用。
+# APN 写入声明意图后，新读者不再抢锁；已在途的多 URI 读取会在当前 content
+# 命令结束后停止，让 APN 写入优先获得 provider。
+apn4_content_write_pending() {
+  [ -f "$APN4_CONTENT_WRITER_FILE" ] || return 1
+  _ac_wp_line=$(cat "$APN4_CONTENT_WRITER_FILE" 2>/dev/null)
+  _ac_wp_pid=${_ac_wp_line%% *}
+  case "$_ac_wp_pid" in ''|*[!0-9]*) rm -f "$APN4_CONTENT_WRITER_FILE" 2>/dev/null; return 1 ;; esac
+  if ! kill -0 "$_ac_wp_pid" 2>/dev/null; then
+    rm -f "$APN4_CONTENT_WRITER_FILE" 2>/dev/null
+    return 1
+  fi
+  return 0
+}
+
+apn4_content_write_begin() {
+  _ac_wtmp="$APN4_CONTENT_WRITER_FILE.$$"
+  _ac_wcs=0; now_cs && _ac_wcs=$NOW_CS
+  printf '%s %s\n' "$$" "$_ac_wcs" > "$_ac_wtmp" 2>/dev/null || return 1
+  if ! mv "$_ac_wtmp" "$APN4_CONTENT_WRITER_FILE" 2>/dev/null; then
+    rm -f "$_ac_wtmp" 2>/dev/null
+    return 1
+  fi
+  APN4_CONTENT_WRITER=1
+  rm -f "$APN4_CACHE" 2>/dev/null
+  apn4_log "APN 写入请求已登记，优先等待 provider 锁 boot_cs=$_ac_wcs"
+  return 0
+}
+
+apn4_content_write_end() {
+  _ac_we_line=$(cat "$APN4_CONTENT_WRITER_FILE" 2>/dev/null)
+  [ "${_ac_we_line%% *}" = "$$" ] && rm -f "$APN4_CONTENT_WRITER_FILE" 2>/dev/null
+  APN4_CONTENT_WRITER=0
+  return 0
+}
+
 apn4_content_lock_acquire() {
+  if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then return 1; fi
   _ac_i=0
   while ! mkdir "$APN4_CONTENT_LOCK" 2>/dev/null; do
+    if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then return 1; fi
     _ac_i=$((_ac_i + 1))
     _ac_pid=$(cat "$APN4_CONTENT_LOCK/pid" 2>/dev/null)
     case "$_ac_pid" in ''|*[!0-9]*) _ac_pid=0 ;; esac
@@ -4688,7 +4726,7 @@ apn4_content_lock_release() {
 
 # 显式切换 IPv6 会立即对账，后台 5s 监听循环也可能同时看到同一次翻转。
 # 串行化 APN 读改写与数据重连：后拿到锁的一方必须在锁内重新查询，通常会发现
-# APN 已到目标值，从而不再重复 content update / svc data disable-enable。
+# APN 已到目标值，从而不再重复 content update；APN 更新不主动 disable/enable 移动数据。
 apn4_lock_acquire() {
   _a4l_wait=0
   while ! mkdir "$APN4_LOCK" 2>/dev/null; do
@@ -4756,6 +4794,8 @@ _apn4_parse_row() {
 _apn4_update_verified_content_locked() {
   _au_id=$1; _au_p=$2; _au_r=$3
   APN4_UPDATE_DETAIL=""
+  _au_wcs=0; now_cs && _au_wcs=$NOW_CS
+  apn4_log "开始更新 APN id=$_au_id protocol=$_au_p roaming_protocol=$_au_r boot_cs=$_au_wcs"
   _au_out=$(content update --uri content://telephony/carriers \
     --where "_id=$_au_id" --bind "protocol:s:$_au_p" --bind "roaming_protocol:s:$_au_r" 2>&1)
   _au_rc=$?
@@ -4870,6 +4910,11 @@ _apn4_fetch() {
   # 查询串行化虽稍慢，但不会与 provider/JVM 争用，更不能读到半更新状态。
   _a4_n=0
   for _a4_u in $1; do
+    if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then
+      apn4_log "APN status read yielded to pending writer before next URI"
+      rm -rf "$_a4_dir" 2>/dev/null
+      return 0
+    fi
     content query --uri "$_a4_u" --projection _id:apn:protocol:roaming_protocol:type \
       > "$_a4_dir/$_a4_n" 2>/dev/null
     _a4_qrc=$?
@@ -4879,6 +4924,11 @@ _apn4_fetch() {
     fi
     _a4_n=$((_a4_n + 1))
   done
+  if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then
+    apn4_log "APN status read discarded results for pending writer"
+    rm -rf "$_a4_dir" 2>/dev/null
+    return 0
+  fi
   _a4_i=0
   while [ "$_a4_i" -lt "$_a4_n" ]; do
     _a4_out=$(cat "$_a4_dir/$_a4_i" 2>/dev/null)
@@ -4920,6 +4970,7 @@ _apn4_rows_content_locked() {
   fi
   if [ "$_a4_sims" -le 1 ]; then
     _apn4_fetch "content://telephony/carriers/preferapn"
+    if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then return 0; fi
     [ "$_A4_NROWS" -gt 0 ] || [ "$_A4_QFAIL" -gt 0 ] || _apn4_fetch "content://telephony/carriers/preferapn/subId/1"
     return 0
   fi
@@ -4932,6 +4983,7 @@ _apn4_rows_content_locked() {
   # 多卡时逐卡 URI 已覆盖实际首选 APN；只有 ROM 不支持 subId URI 时才退回默认 URI，
   # 避免正常情况下为同一张默认卡额外启动一个 content JVM。
   _apn4_fetch "$_a4_uris"
+  if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then return 0; fi
   [ "$_A4_NROWS" -gt 0 ] || [ "$_A4_QFAIL" -gt 0 ] || _apn4_fetch "content://telephony/carriers/preferapn"
   return 0
 }
@@ -4992,8 +5044,14 @@ EOF
 # 公共入口持锁后再查询 APN，避免显式开关与周期监听并发重复写库.
 apn4_apply() {
   apn4_lock_acquire || { apn4_log "WARN APN 对账锁忙，本轮跳过，等待下一次对账"; return 1; }
+  if ! apn4_content_write_begin; then
+    apn4_lock_release
+    apn4_log "WARN 无法登记 APN 写入优先级，本轮跳过"
+    return 1
+  fi
   _a4a_rc=0
   _apn4_apply_locked || _a4a_rc=$?
+  apn4_content_write_end
   apn4_lock_release
   return "$_a4a_rc"
 }
@@ -5032,8 +5090,14 @@ _apn4_restore_locked() {
 
 apn4_restore() {
   apn4_lock_acquire || { apn4_log "WARN APN 对账锁忙，本轮还原跳过，等待下一次对账"; return 1; }
+  if ! apn4_content_write_begin; then
+    apn4_lock_release
+    apn4_log "WARN 无法登记 APN 写入优先级，本轮还原跳过"
+    return 1
+  fi
   _a4r_rc=0
   _apn4_restore_locked || _a4r_rc=$?
+  apn4_content_write_end
   apn4_lock_release
   return "$_a4r_rc"
 }
@@ -5098,6 +5162,13 @@ _apn4_json_esc() {
 #   apn4-json refresh   → 强制真查并更新缓存
 apn4_json() {
   _aj_mode=${1:-auto}
+  if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then
+    # 不显示将被覆盖的旧缓存，也不排队启动 provider 查询；写完后调用方会刷新。
+    _aj_cmd=1; command -v content >/dev/null 2>&1 || _aj_cmd=0
+    _aj_taken=0; [ -f "$APN4_STATE" ] && _aj_taken=1
+    printf '{"ok":1,"content":%s,"taken":%s,"items":[]}\n' "$_aj_cmd" "$_aj_taken"
+    return 0
+  fi
   if [ "$_aj_mode" = "cached" ]; then
     if [ -f "$APN4_CACHE" ]; then
       sed -n '2,$p' "$APN4_CACHE" 2>/dev/null
@@ -5138,6 +5209,10 @@ apn4_json() {
     done <<EOF
 $(apn4_rows)
 EOF
+    if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then
+      printf '{"ok":1,"content":%s,"taken":%s,"items":[]}\n' "$_aj_cmd" "$_aj_taken"
+      return 0
+    fi
   fi
   _aj_json=$(printf '{"ok":1,"content":%s,"taken":%s,"items":[%s]}' "$_aj_cmd" "$_aj_taken" "$_aj_body")
   _aj_now=$(date +%s 2>/dev/null)
