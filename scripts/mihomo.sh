@@ -4690,6 +4690,16 @@ APN4_STATE=$RUNDIR/apn4.state
 APN4_CACHE=$RUNDIR/apn4.json      # apn4-json 的结果缓存（首行时间戳，次行 JSON）
 APN4_TTL=60                       # 缓存有效期（秒）：过期才重新拉起 content JVM
 APN4_LOG=$RUNDIR/apn4.log
+IPV6_TOGGLE_STAGE=$RUNDIR/ipv6-toggle.stage
+
+# 前端在 set system_ipv6 尚未返回时轮询此阶段；APN 改写/还原一结束即通知其刷新状态。
+ipv6_toggle_stage() {
+  [ -n "${MH_IPV6_TOGGLE_TOKEN:-}" ] || return 0
+  case "$MH_IPV6_TOGGLE_TOKEN" in *[!A-Za-z0-9_-]*) return 0 ;; esac
+  printf '%s|%s\n' "$MH_IPV6_TOGGLE_TOKEN" "$1" > "$IPV6_TOGGLE_STAGE.tmp.$$" 2>/dev/null &&
+    mv -f "$IPV6_TOGGLE_STAGE.tmp.$$" "$IPV6_TOGGLE_STAGE" 2>/dev/null
+  return 0
+}
 
 apn4_log() {
   printf '%s %s\n' "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$*" >> "$APN4_LOG" 2>/dev/null
@@ -5008,7 +5018,7 @@ EOF
 
 system_ipv6_sync() {
   _si_dir=${IPV6_CONF:-/proc/sys/net/ipv6/conf}
-  [ -d "$_si_dir" ] || return 0
+  if [ ! -d "$_si_dir" ]; then ipv6_toggle_stage apn-ready; return 0; fi
   # 热点下游交还系统：与期望开关无关，br0 等绝不能停在 disable_ipv6=1。
   si_restore_tether_ipv6
   # 保持系统 IPv6 协议栈可用（_si_d=0 → disable_ipv6=0）的三类情况：
@@ -5095,11 +5105,12 @@ system_ipv6_sync() {
       if [ "$_si_cur" != "$_si_net_prev" ]; then
         printf '%s' "$_si_cur" 2>/dev/null > "$_si_net_file"
       fi
+      ipv6_toggle_stage apn-ready
       return 0
     fi
   fi
 
-  [ "$_si_need" = "0" ] && return 0
+  if [ "$_si_need" = "0" ]; then ipv6_toggle_stage apn-ready; return 0; fi
 
   # —— 蜂窝侧防 v6 泄漏：走 APN（等同「APN 协议=IPv4」），不碰内核 disable_ipv6 ——
   # 见 APN4 子系统注释。触发点：
@@ -5113,6 +5124,8 @@ system_ipv6_sync() {
   else
     [ "$_si_flip" = "1" ] && apn4_restore
   fi
+  # 精确通知 UI：APN Provider 更新/还原已完成，可以立即强制重读，不必等代理重启完成。
+  ipv6_toggle_stage apn-ready
 
   # 修复：只写值不对的网卡（lo 跳过），并把 RA 相关一并置位，堵住重拉起路径
   # 开启时要尽量立即生效：关是删地址立即消失，开是等 RA，需主动触发 RS
@@ -10449,6 +10462,12 @@ case "$cmd" in
   tun-hotspot-diag)   tun_hotspot_diag ;;
   # 系统 IPv6：手动对账一次 / 查看各网卡实况（正常由监听循环每 IPV6_TICK 秒自动做）
   ipv6-sync)     system_ipv6_sync >/dev/null 2>&1; echo "OK: 系统 IPv6 已按当前开关对账" ;;
+  ipv6-toggle-status)
+    _its_want=$1; _its_token=""; _its_stage=pending
+    case "$_its_want" in ''|*[!A-Za-z0-9_-]*) echo pending; exit 0 ;; esac
+    if [ -r "$IPV6_TOGGLE_STAGE" ]; then IFS='|' read -r _its_token _its_stage < "$IPV6_TOGGLE_STAGE"; fi
+    [ "$_its_token" = "$_its_want" ] || _its_stage=pending
+    echo "$_its_stage" ;;
   ipv6-status)   ipv6_status ;;
   ipv6-guard)    ipv6_proxy_guard ;;
   # APN 协议接管（等效「APN 协议=IPv4」防蜂窝 v6 泄漏，不碰 IMS）：
@@ -10576,6 +10595,13 @@ case "$cmd" in
           true|on|1)   _s6_v=true;  _s6_wd=启用 ;;
           false|off|0) _s6_v=false; _s6_wd=禁用 ;;
           *) echo "ERR: 参数只能是 true / false"; exit 1 ;;
+        esac
+        _s6_token=${3:-}
+        case "$_s6_token" in ''|*[!A-Za-z0-9_-]*) unset MH_IPV6_TOGGLE_TOKEN ;;
+          *) mkdir -p "$RUNDIR" 2>/dev/null
+             MH_IPV6_TOGGLE_TOKEN=$_s6_token
+             printf '%s|syncing\n' "$_s6_token" > "$IPV6_TOGGLE_STAGE.tmp.$$" 2>/dev/null &&
+               mv -f "$IPV6_TOGGLE_STAGE.tmp.$$" "$IPV6_TOGGLE_STAGE" 2>/dev/null ;;
         esac
         set_setting system_ipv6 "$_s6_v"
         # 系统 IPv6＝总开关：切换的同时把配置里的 IPv6 相关开关（顶层 ipv6 /
