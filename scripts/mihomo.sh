@@ -4873,7 +4873,10 @@ _apn4_fetch() {
     content query --uri "$_a4_u" --projection _id:apn:protocol:roaming_protocol:type \
       > "$_a4_dir/$_a4_n" 2>/dev/null
     _a4_qrc=$?
-    [ "$_a4_qrc" = "0" ] || apn4_log "WARN content query uri=$_a4_u rc=$_a4_qrc"
+    if [ "$_a4_qrc" != "0" ]; then
+      _A4_QFAIL=$((_A4_QFAIL + 1))
+      apn4_log "WARN content query uri=$_a4_u rc=$_a4_qrc"
+    fi
     _a4_n=$((_a4_n + 1))
   done
   _a4_i=0
@@ -4901,7 +4904,7 @@ EOF
 _apn4_rows_content_locked() {
   command -v content >/dev/null 2>&1 || { apn4_log "WARN 无 content 命令，APN 改写不可用"; return 1; }
   apn4_sweep_stale
-  _A4_SEEN="|"; _A4_NROWS=0
+  _A4_SEEN="|"; _A4_NROWS=0; _A4_QFAIL=0
   # content 每次调用都要拉起一个 JVM（慢设备 0.3~1 秒），而且**并发不等于免费**：
   # 手机上 5 个 JVM 抢 CPU，墙钟反而比只查 1 个还长。所以按「真在用的 SIM 数」查：
   #   · 单卡（绝大多数场景）：只查默认 preferapn = 1 个 JVM（旧版固定 5 个）；
@@ -4917,16 +4920,19 @@ _apn4_rows_content_locked() {
   fi
   if [ "$_a4_sims" -le 1 ]; then
     _apn4_fetch "content://telephony/carriers/preferapn"
-    [ "$_A4_NROWS" -gt 0 ] || _apn4_fetch "content://telephony/carriers/preferapn/subId/1"
+    [ "$_A4_NROWS" -gt 0 ] || [ "$_A4_QFAIL" -gt 0 ] || _apn4_fetch "content://telephony/carriers/preferapn/subId/1"
     return 0
   fi
-  _a4_uris="content://telephony/carriers/preferapn"
+  _a4_uris=""
   _a4_n=1
   while [ "$_a4_n" -le "$_a4_sims" ]; do
     _a4_uris="$_a4_uris content://telephony/carriers/preferapn/subId/$_a4_n"
     _a4_n=$((_a4_n + 1))
   done
+  # 多卡时逐卡 URI 已覆盖实际首选 APN；只有 ROM 不支持 subId URI 时才退回默认 URI，
+  # 避免正常情况下为同一张默认卡额外启动一个 content JVM。
   _apn4_fetch "$_a4_uris"
+  [ "$_A4_NROWS" -gt 0 ] || [ "$_A4_QFAIL" -gt 0 ] || _apn4_fetch "content://telephony/carriers/preferapn"
   return 0
 }
 
