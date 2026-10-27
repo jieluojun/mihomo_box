@@ -445,7 +445,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   // 还有几秒延迟（甚至重启内核期间 JVM 起得很慢、一次 20s 超时被掐掉），只读一次就
   // 很容易把改动前的协议留在界面上——用户看到的就是「关了 IPv6，APN 还写着 IPv4/IPv6」。
   // opts.expect(txt)：这一轮读到什么才算「已经翻篇」（例如关掉 IPv6 时期望不再出现
-  // IPv6）。无 expect 时按连续读数确认；切换后的 fresh 查询会跑完整轮次，弹层初开仍只查一次。
+  // IPv6）。关闭 IPv6 时可重试到目标值；开启后的 Provider 查询在设置命令完成后直接采用首个新鲜结果。
   let apnStatusReadSeq = 0;
   const refreshApnStatus = async (opts) => {
     const readSeq = ++apnStatusReadSeq;
@@ -486,6 +486,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
       if (!txt) { prev = null; continue; }
       painted = true;
       lastObserved = txt;
+      if (opts && opts.acceptFirst) { apnStatus.textContent = txt; return; }
       if (expect) {
         if (expect(txt)) { apnStatus.textContent = txt; return; } // 已确认达到切换目标
       } else {
@@ -807,7 +808,8 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             if (sheetClose && sheetClose.isCurrent()) {
               apnStatus.textContent = '首选 APN：正在重新读取…';
               void refreshApnStatus({
-                fresh: true, tries: 4, gap: 1800,
+                fresh: true, tries: v ? 1 : 4, gap: 1800,
+                acceptFirst: !!v,
                 expect: v6SwitchOk && !v
                   ? (t => /首选 APN「/.test(t) && !/IPv6/i.test(t)) : null,
               });
