@@ -4649,9 +4649,43 @@ APN4_CACHE=$RUNDIR/apn4.json      # apn4-json 的结果缓存（首行时间戳�
 APN4_TTL=60                       # 缓存有效期（秒）：过期才重新拉起 content JVM
 APN4_LOG=$RUNDIR/apn4.log
 APN4_LOCK=$RUNDIR/apn4.lock              # 显式开关与 5s 对账循环可能并发触碰 APN
+APN4_CONTENT_LOCK=$RUNDIR/apn4.content.lock # 序列化本模块所有 Android content JVM 调用
 APN4_ATTACH_LOCK=$RUNDIR/apn4.reattach.lock # svc data off/on 在后台执行，单独覆盖完整重连周期
 APN4_RETRY_FILE=$RUNDIR/apn4.restore.retry  # 内容提供者暂时失败时限频重试（单调时钟厘秒）
 APN4_RETRY_COOL_CS=6000                   # 最多每 60s 重试一次，避免 5s 对账循环反复拉起 content
+
+# 多个 WebUI APN 查询、IPv6 对账与验证回查都可能同时拉起 content JVM。
+# ROM 上 content 并发查询可直接以 139 崩溃；全局串行化，避免 provider/JVM 争用。
+apn4_content_lock_acquire() {
+  _ac_i=0
+  while ! mkdir "$APN4_CONTENT_LOCK" 2>/dev/null; do
+    _ac_i=$((_ac_i + 1))
+    _ac_pid=$(cat "$APN4_CONTENT_LOCK/pid" 2>/dev/null)
+    case "$_ac_pid" in ''|*[!0-9]*) _ac_pid=0 ;; esac
+    if [ "$_ac_pid" -gt 0 ]; then
+      if ! kill -0 "$_ac_pid" 2>/dev/null; then
+        rm -rf "$APN4_CONTENT_LOCK" 2>/dev/null
+        continue
+      fi
+      [ "$_ac_i" -ge 50 ] && return 1
+    elif [ "$_ac_i" -ge 50 ]; then
+      rm -rf "$APN4_CONTENT_LOCK" 2>/dev/null
+      _ac_i=0
+      continue
+    fi
+    nap 0.2
+  done
+  if ! printf '%s\n' "$$" > "$APN4_CONTENT_LOCK/pid" 2>/dev/null; then
+    rm -rf "$APN4_CONTENT_LOCK" 2>/dev/null
+    return 1
+  fi
+  return 0
+}
+
+apn4_content_lock_release() {
+  [ "$(cat "$APN4_CONTENT_LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$APN4_CONTENT_LOCK" 2>/dev/null
+  return 0
+}
 
 # 显式切换 IPv6 会立即对账，后台 5s 监听循环也可能同时看到同一次翻转。
 # 串行化 APN 读改写与数据重连：后拿到锁的一方必须在锁内重新查询，通常会发现
@@ -4720,7 +4754,7 @@ _apn4_parse_row() {
 # content update 在部分 ROM 上成功时 stdout 为空，不能把「无输出」直接当失败，
 # 也不能只看 rc=0（可能实际更新了 0 行）。若返回没有明确的 Updated N rows，
 # 就按 id 回查协议；只有读回与目标一致才确认成功。
-apn4_update_verified() {
+_apn4_update_verified_content_locked() {
   _au_id=$1; _au_p=$2; _au_r=$3
   APN4_UPDATE_DETAIL=""
   _au_out=$(content update --uri content://telephony/carriers \
@@ -4754,6 +4788,18 @@ apn4_update_verified() {
   fi
   APN4_UPDATE_DETAIL="未确认（update rc=$_au_rc, 输出=${_au_out:-无输出}; query rc=$_au_qrc, 实读=${_au_got:-无匹配行}）"
   return 1
+}
+
+apn4_update_verified() {
+  _au_id=$1; _au_p=$2; _au_r=$3
+  if ! apn4_content_lock_acquire; then
+    APN4_UPDATE_DETAIL="content provider 锁忙，跳过本次 update（id=$_au_id）"
+    return 1
+  fi
+  _apn4_update_verified_content_locked "$_au_id" "$_au_p" "$_au_r"
+  _auv_rc=$?
+  apn4_content_lock_release
+  return "$_auv_rc"
 }
 
 # 枚举当前各卡的首选上网 APN，每行输出 "id|apn|protocol|roaming|type"
@@ -4810,7 +4856,7 @@ apn4_sim_count() {
   echo "$_asc_n"
 }
 
-# 查一批 URI 并把解析后的行打到 stdout（并发拉起、逐个收尸）。$1 = URI 列表。
+# 串行查询一批 URI 并把解析后的行打到 stdout，避免并发启动多个 content JVM。$1 = URI 列表。
 # 用全局 _A4_SEEN 做跨批去重、_A4_NROWS 回传本批命中行数。
 _apn4_fetch() {
   _a4_dir=$RUNDIR/.apn4q.$$
@@ -4821,14 +4867,16 @@ _apn4_fetch() {
   # 那种残留由下一轮 apn4_sweep_stale 与 post-fs-data.sh 的开机清理回收）。
   trap 'rm -rf "$_a4_dir" 2>/dev/null' 0
   trap 'exit 1' HUP INT TERM PIPE
-  _a4_n=0; _a4_pids=""
+  # 不并发拉多个 content JVM：双卡 ROM 上并发查询曾导致 content 退出 139，
+  # 查询串行化虽稍慢，但不会与 provider/JVM 争用，更不能读到半更新状态。
+  _a4_n=0
   for _a4_u in $1; do
     content query --uri "$_a4_u" --projection _id:apn:protocol:roaming_protocol:type \
-      > "$_a4_dir/$_a4_n" 2>/dev/null &
-    _a4_pids="$_a4_pids $!"
+      > "$_a4_dir/$_a4_n" 2>/dev/null
+    _a4_qrc=$?
+    [ "$_a4_qrc" = "0" ] || apn4_log "WARN content query uri=$_a4_u rc=$_a4_qrc"
     _a4_n=$((_a4_n + 1))
   done
-  for _a4_p in $_a4_pids; do wait "$_a4_p" 2>/dev/null; done
   _a4_i=0
   while [ "$_a4_i" -lt "$_a4_n" ]; do
     _a4_out=$(cat "$_a4_dir/$_a4_i" 2>/dev/null)
@@ -4851,7 +4899,7 @@ EOF
   return 0
 }
 
-apn4_rows() {
+_apn4_rows_content_locked() {
   command -v content >/dev/null 2>&1 || { apn4_log "WARN 无 content 命令，APN 改写不可用"; return 1; }
   apn4_sweep_stale
   _A4_SEEN="|"; _A4_NROWS=0
@@ -4881,6 +4929,17 @@ apn4_rows() {
   done
   _apn4_fetch "$_a4_uris"
   return 0
+}
+
+apn4_rows() {
+  if ! apn4_content_lock_acquire; then
+    apn4_log "WARN content provider 锁忙，本次 APN 查询跳过"
+    return 1
+  fi
+  _apn4_rows_content_locked
+  _arows_rc=$?
+  apn4_content_lock_release
+  return "$_arows_rc"
 }
 
 # 改协议后需重新附着才生效：自动开关一次移动数据（飞行模式开启时是空操作，
@@ -5127,11 +5186,15 @@ _system_ipv6_sync_body() {
   # 无条件保持 IPv6 可用，导致「eBPF 模式 + 角色 ipv6:false（默认）」时用户想
   # 禁用系统 IPv6 被锁住关不掉。内核只在角色 ipv6 生效时才加 v6 本地路由
   # （requiresIPv6Redirect），角色都不拦 v6 时禁用 IPv6 完全安全。
-  if [ -f "$MODDIR/disable" ] || [ "$(get_setting system_ipv6 false)" = "true" ] ||
-     ebpf_ipv6_redirect_cached; then
-    _si_d=0
+  _si_user=$(get_setting system_ipv6 false)
+  if [ -f "$MODDIR/disable" ]; then
+    _si_d=0; _si_reason=module-disabled
+  elif [ "$_si_user" = "true" ]; then
+    _si_d=0; _si_reason=user-enabled
+  elif ebpf_ipv6_redirect_cached; then
+    _si_d=0; _si_reason=ebpf-redirect
   else
-    _si_d=1
+    _si_d=1; _si_reason=user-disabled
   fi
   _si_prev=""
   [ -f "$IPV6_WANT" ] && IFS= read -r _si_prev < "$IPV6_WANT" 2>/dev/null
@@ -5207,6 +5270,7 @@ _system_ipv6_sync_body() {
   fi
 
   [ "$_si_need" = "0" ] && return 0
+  apn4_log "IPv6/APN 对账：setting=${_si_user:-?} effective_disable=$_si_d reason=$_si_reason prev=${_si_prev:-?} flip=$_si_flip netchg=$_si_netchg"
 
   # —— 蜂窝侧防 v6 泄漏：走 APN（等同「APN 协议=IPv4」），不碰内核 disable_ipv6 ——
   # 见 APN4 子系统注释。触发点：
