@@ -4552,6 +4552,7 @@ ebpf_ipv6_redirect_cached() {
 # 落盘 $IPV6_WANT 记期望值（监听重启删掉重应用），$IPV6_NET 记网络指纹，
 # $IPV6_LAST 记上次追打时间戳。
 IPV6_WANT=$RUNDIR/ipv6.want
+IPV6_SYNC_LOCK=$RUNDIR/ipv6.sync.lock  # 前台开关与周期看门狗串行化，避免同一翻转重复对账
 # 代理侧 IPv6 初始化失败的证据：内容为「内核版本|内核路径」。写在这里＝这台机器
 # 已经证明「开着 ipv6 就起不来 TUN/eBPF」，见 ipv6_proxy_guard 的注释。
 IPV6_PFAIL=$RUNDIR/ipv6.proxyfail
@@ -4648,6 +4649,7 @@ APN4_CACHE=$RUNDIR/apn4.json      # apn4-json 的结果缓存（首行时间戳�
 APN4_TTL=60                       # 缓存有效期（秒）：过期才重新拉起 content JVM
 APN4_LOG=$RUNDIR/apn4.log
 APN4_LOCK=$RUNDIR/apn4.lock              # 显式开关与 5s 对账循环可能并发触碰 APN
+APN4_ATTACH_LOCK=$RUNDIR/apn4.reattach.lock # svc data off/on 在后台执行，单独覆盖完整重连周期
 APN4_RETRY_FILE=$RUNDIR/apn4.restore.retry  # 内容提供者暂时失败时限频重试（单调时钟厘秒）
 APN4_RETRY_COOL_CS=6000                   # 最多每 60s 重试一次，避免 5s 对账循环反复拉起 content
 
@@ -4882,11 +4884,43 @@ apn4_rows() {
 }
 
 # 改协议后需重新附着才生效：自动开关一次移动数据（飞行模式开启时是空操作，
-# 下次附着自然生效）。后台执行，不阻塞调用方。
+# 下次附着自然生效）。后台执行，不阻塞调用方。单独持有覆盖完整 off/sleep/on 的锁：
+# APN 写库锁只覆盖到后台任务启动；若另一条对账随后改 APN，不能再启动第二组 off/on，
+# 当前 worker 最后一次 enable 会按已更新的 APN 重新建链。
 apn4_reattach() {
   command -v svc >/dev/null 2>&1 || { apn4_log "WARN 无 svc，请手动开关一次飞行模式使 APN 协议生效"; return 0; }
-  apn4_log "重新附着数据（svc data off/on）"
-  ( svc data disable >/dev/null 2>&1; sleep 2; svc data enable >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+  now_cs || NOW_CS=0
+  _aat_now=$NOW_CS
+  if ! mkdir "$APN4_ATTACH_LOCK" 2>/dev/null; then
+    _aat_start=""; IFS= read -r _aat_start < "$APN4_ATTACH_LOCK/start" 2>/dev/null
+    case "$_aat_start" in ''|*[!0-9]*) _aat_start="" ;; esac
+    _aat_stale=0
+    if [ -n "$_aat_start" ]; then
+      if [ "$_aat_now" -lt "$_aat_start" ] || [ $((_aat_now - _aat_start)) -ge 3000 ]; then
+        _aat_stale=1   # 超过 30s 或 uptime 回退（重启后遗留）
+      fi
+    fi
+    if [ "$_aat_stale" = "1" ]; then
+      rm -rf "$APN4_ATTACH_LOCK" 2>/dev/null
+      mkdir "$APN4_ATTACH_LOCK" 2>/dev/null || {
+        apn4_log "WARN 移动数据重连锁仍被占用，本次不重复触发"
+        return 0
+      }
+    else
+      apn4_log "移动数据重连已在进行中，本次并入当前重连"
+      return 0
+    fi
+  fi
+  _aat_token="$$-$_aat_now"
+  printf '%s\n' "$_aat_now" > "$APN4_ATTACH_LOCK/start" 2>/dev/null
+  printf '%s\n' "$_aat_token" > "$APN4_ATTACH_LOCK/token" 2>/dev/null
+  (
+    svc data disable >/dev/null 2>&1
+    sleep 2
+    svc data enable >/dev/null 2>&1
+    [ "$(cat "$APN4_ATTACH_LOCK/token" 2>/dev/null)" = "$_aat_token" ] && rm -rf "$APN4_ATTACH_LOCK" 2>/dev/null
+  ) </dev/null >/dev/null 2>&1 &
+  apn4_log "重新附着数据（svc data off/on，重连期间合并重复请求）"
   return 0
 }
 
@@ -5079,7 +5113,7 @@ EOF
   return 0
 }
 
-system_ipv6_sync() {
+_system_ipv6_sync_body() {
   _si_dir=${IPV6_CONF:-/proc/sys/net/ipv6/conf}
   [ -d "$_si_dir" ] || return 0
   # 热点下游交还系统：与期望开关无关，br0 等绝不能停在 disable_ipv6=1。
@@ -5268,6 +5302,42 @@ system_ipv6_sync() {
     fi
   fi
   return 0
+}
+
+# set system_ipv6 与 _switch_loop 可能同时看到同一次翻转。互斥整个对账函数，
+# 让后执行者重新读取 IPV6_WANT/当前 APN 后决定是否需要动作；APN 子锁保护写库，
+# 该锁则避免两个 sync 分别按过期快照作出相反动作。
+system_ipv6_sync() {
+  _sis_wait=0
+  while ! mkdir "$IPV6_SYNC_LOCK" 2>/dev/null; do
+    _sis_wait=$((_sis_wait + 1))
+    _sis_pid=$(cat "$IPV6_SYNC_LOCK/pid" 2>/dev/null)
+    case "$_sis_pid" in ''|*[!0-9]*) _sis_pid=0 ;; esac
+    if [ "$_sis_pid" -gt 0 ]; then
+      if ! kill -0 "$_sis_pid" 2>/dev/null; then
+        rm -rf "$IPV6_SYNC_LOCK" 2>/dev/null
+        continue
+      fi
+      if [ "$_sis_wait" -ge 50 ]; then
+        sw_log "系统 IPv6 对账锁忙（pid=$_sis_pid），本轮跳过"
+        return 0
+      fi
+    elif [ "$_sis_wait" -ge 50 ]; then
+      # mkdir 与 pid 落盘的微小窗口；持续 10s 无 pid 才视为陈旧锁。
+      rm -rf "$IPV6_SYNC_LOCK" 2>/dev/null
+      _sis_wait=0
+      continue
+    fi
+    nap 0.2
+  done
+  if ! printf '%s\n' "$$" > "$IPV6_SYNC_LOCK/pid" 2>/dev/null; then
+    rm -rf "$IPV6_SYNC_LOCK" 2>/dev/null
+    return 0
+  fi
+  _system_ipv6_sync_body
+  _sis_rc=$?
+  [ "$(cat "$IPV6_SYNC_LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$IPV6_SYNC_LOCK" 2>/dev/null
+  return "$_sis_rc"
 }
 
 # 配置里顶层 ipv6 的裸值（true/false/空）。只认顶格键，不会被 dns.ipv6、
