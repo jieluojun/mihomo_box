@@ -4819,7 +4819,6 @@ apn4_apply() {
     return 1
   fi
   _aa_changed=0
-  _aa_attempted=0
   while IFS='|' read -r _aa_id _aa_apn _aa_p _aa_r _aa_t; do
     [ -n "$_aa_id" ] || continue
     case "$_aa_t" in *ims*) apn4_log "跳过 IMS 承载行 id=$_aa_id apn=$_aa_apn type=$_aa_t"; continue ;; esac
@@ -4832,7 +4831,6 @@ apn4_apply() {
     if ! grep -q "^$_aa_id|" "$APN4_STATE" 2>/dev/null; then
       printf '%s|%s|%s|%s\n' "$_aa_id" "$_aa_apn" "$_aa_p" "$_aa_r" >> "$APN4_STATE" 2>/dev/null
     fi
-    _aa_attempted=1
     _aa_res=$(content update --uri content://telephony/carriers \
       --where "_id=$_aa_id" --bind protocol:s:IP --bind roaming_protocol:s:IP 2>&1)
     case "$_aa_res" in
@@ -4845,12 +4843,12 @@ apn4_apply() {
   done <<EOF
 $_aa_rows
 EOF
-  if [ "$_aa_attempted" = "1" ]; then
-    # content update 在部分 ROM 上成功时 stdout 为空；只凭输出判断成功会留下旧缓存。
-    # 只要尝试过写入就先作废缓存，状态行必须重新查询 provider。
+  if [ "$_aa_changed" = "1" ]; then
+    # 改写过的行刚变：APN 读取缓存立刻作废，否则前端「cached 秒画」会把改动前的
+    # 协议再显示一次（用户看到的就是「明明关了 IPv6，APN 还写着 IPv4/IPv6」）
     rm -f "$APN4_CACHE" 2>/dev/null
+    apn4_reattach
   fi
-  [ "$_aa_changed" = "1" ] && apn4_reattach
   return 0
 }
 
@@ -4860,10 +4858,8 @@ apn4_restore() {
   [ -f "$APN4_STATE" ] || return 0
   _ar_changed=0
   _ar_fail=0
-  _ar_attempted=0
   while IFS='|' read -r _ar_id _ar_apn _ar_p _ar_r; do
     [ -n "$_ar_id" ] || continue
-    _ar_attempted=1
     _ar_res=$(content update --uri content://telephony/carriers \
       --where "_id=$_ar_id" --bind "protocol:s:$_ar_p" --bind "roaming_protocol:s:$_ar_r" 2>&1)
     case "$_ar_res" in
@@ -4876,11 +4872,11 @@ apn4_restore() {
     esac
   done < "$APN4_STATE"
   [ "$_ar_fail" = "0" ] && rm -f "$APN4_STATE" 2>/dev/null
-  if [ "$_ar_attempted" = "1" ]; then
-    # update 可能成功但 stdout 为空；写过就清缓存，后续 APN 行读 provider 真值。
+  if [ "$_ar_changed" = "1" ]; then
+    # 同 apn4_apply：还原后缓存必须作废，别让前端先画出还原前的协议
     rm -f "$APN4_CACHE" 2>/dev/null
+    apn4_reattach
   fi
-  [ "$_ar_changed" = "1" ] && apn4_reattach
   return 0
 }
 
