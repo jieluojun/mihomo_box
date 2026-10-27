@@ -409,9 +409,20 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   // 「系统 IPv6」说明：一句话讲清当前状态做了什么，切换时当场改写（不留旧态文案）。
   // 只保留用户能感知的事实：哪些网卡禁用 / APN 协议 / 配置文件里的开关 / IMS 不受影响。
   const v6DescText = on => on
-    ? '已开启：系统 IPv6 保持可用，配置文件中的 IPv6 开关同步打开，Wi-Fi 与蜂窝网卡均可使用 IPv6。代理运行中会自动重启以生效'
-    : '已关闭（默认）：Wi-Fi 等非蜂窝网卡禁用 IPv6，上网 APN 协议改为仅 IPv4，配置文件中的 IPv6 开关同时关闭；不影响 IMS 高清通话与短信。代理运行中会自动重启以生效';
+    ? '已开启：系统 IPv6 可用；代理会尝试同步接管 IPv6，若内核不支持会回退为 IPv4-only。蜂窝实际协议以 APN 状态为准。'
+    : '已关闭（默认）：同步关闭配置里的 IPv6 / AAAA 与入站 IPv6；非蜂窝接口禁用 IPv6，蜂窝侧尝试切为 IPv4（实际状态见下方）。不影响 IMS。代理运行中会自动重启。';
   const v6DescMain = h('span', { text: v6DescText(v6On) });
+  const v6FallbackStatus = h('div', {
+    class: STATUS_LINE_CLASS, style: STATUS_LINE_STYLE,
+    hidden: st.ipv6_proxy !== 'fallback',
+    text: '代理侧：IPv6 接管失败，已回退至 IPv4-only；配置保持关闭，IPv6 流量可能不经代理。',
+  });
+  const paintV6FallbackStatus = () => {
+    const fallback = state.status?.system_ipv6 === 'true' && state.status?.ipv6_proxy === 'fallback';
+    v6FallbackStatus.hidden = !fallback;
+    if (fallback) v6FallbackStatus.textContent = '代理侧：IPv6 接管失败，已回退至 IPv4-only；配置保持关闭，IPv6 流量可能不经代理。';
+    v6DescMain.textContent = v6DescText(state.status?.system_ipv6 === 'true');
+  };
   // 首选 APN 的协议状态（紧跟在说明文字下一行）：系统 IPv6=关 时后端会把上网 APN 的
   // protocol / roaming_protocol 改成仅 IPv4，这里把「现在到底是不是 IPv4」直接摆出来。
   // content 查询每次要拉起一个 JVM，所以只在弹层打开与切换 IPv6 后各取一次，
@@ -717,17 +728,18 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
         // 本机内核在 IPv6 下起不来 TUN/eBPF 时后端会自动回退成仅 IPv4 代理（见
         // scripts/mihomo.sh 的 ipv6_proxy_guard）。这行必须在界面上说清楚，
         // 否则用户只会看到「系统 IPv6 开着但代理不走 v6」，以为坏了。
-        h('div', { class: STATUS_LINE_CLASS, style: APN_LINE_STYLE, hidden: st.ipv6_proxy !== 'fallback',
-          text: '代理侧：本机内核无法在 IPv6 下接管，已回退为仅 IPv4 代理（系统 IPv6 与 IMS 不受影响）' })),
+        v6FallbackStatus),
       h('div', { class: 'f-ctl' }, v6DiagBtn, (() => {
         let sw;
         sw = switchCtl(v6On, async (v) => {
           if (busy) { sw.querySelector('input').checked = !v; return; }
           busy = true;
           const wasDirty = state.dirty;
-          // 说明文字与开关同帧换成目标状态：切完还挂着旧状态的文案，就是在骗人。
+          // 说明文字与开关同帧换成目标状态；开态不承诺代理一定能接管，后端会验证并可能回退。
           v6DescMain.textContent = v6DescText(v);
-          uiToast(v ? '正在启用系统 IPv6：同步配置并重启服务…' : '正在关闭系统 IPv6：同步配置并重启服务…', 3000);
+          v6FallbackStatus.hidden = !v;
+          if (v) v6FallbackStatus.textContent = '正在验证代理侧 IPv6 接管能力…';
+          uiToast(v ? '正在启用系统 IPv6：同步配置并验证代理接管…' : '正在关闭系统 IPv6：同步配置并重启服务…', 3000);
           beginOpToast();
           // 切换会重启内核（含 eBPF 入站重建）：运行时长不在按下瞬间归零起表（核心
           // 还没起来就开始计时＝提前计时）——旧值定格，新核确认活时才从 00:00 起表；
@@ -762,11 +774,11 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
               // 避免旧草稿在下次保存时把同步结果覆盖回去
               try { await loadConfig(); rerenderCurrent(); } catch (e) { /* 重载失败不影响开关 */ }
               if (wasDirty) uiToast('⚠️ 配置已由模块修改并重新载入，先前未保存的编辑已丢弃', 4200);
-              // 本机内核在 IPv6 下起不来时后端只开系统协议栈、不改配置并回 WARN，
-              // toast 必须照实说，不能继续报「配置已同步」
+              // 后端会尝试同步并重启；若代理侧仍无法接管，守卫会自动回退配置。
+              // 仅当后端明确报告回退时才在 toast 中直接说明，常规重启后的最终状态由诊断行展示。
               const skipped = /代理维持仅 IPv4/.test(out);
               const tail = skipped ? '，本机无法在 IPv6 下接管流量，代理维持仅 IPv4'
-                : /服务已重启/.test(out) ? '，配置已同步，服务已重启'
+                : /服务已重启/.test(out) ? (v ? '，已尝试同步代理配置并重启服务' : '，配置已同步，服务已重启')
                   : /服务未运行/.test(out) ? '，配置已同步（服务未运行，下次启动生效）' : '，配置已同步';
               // 服务确实重启了＝提示等新核起表那一帧；没重启（服务未运行等）就立刻弹。
               const v6Msg = (v ? '✅ 系统 IPv6 已启用' : '✅ 系统 IPv6 已禁用') + tail;
@@ -777,7 +789,12 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
               dropPendingUpToast();
               uiToast('⚠️ ' + (out || (r && r.stderr) || '操作失败'), 5000);
             }
-            refreshStatus(false, true).catch(() => { /* 补读失败不影响开关 */ });
+            refreshStatus(false, false).then(paintV6FallbackStatus).catch(() => { /* 补读失败不影响开关 */ });
+            if (v) setTimeout(() => {
+              if (sheetClose && sheetClose.isCurrent()) {
+                refreshStatus(false, false).then(paintV6FallbackStatus).catch(() => {});
+              }
+            }, 2200);
           } finally {
             busy = false;
             // 收尾只留 2.5s 补读短窗。Math.min：把本次 20s 长窗收回，避免一直挂着盖住
@@ -813,6 +830,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   startModPoll();   // 立即取一次轻量状态（不等完整 status），之后每 1.5 秒一次，关闭即停
   void refreshApnStatus();   // 首选 APN 协议/漫游：打开弹层取一次（content 要拉 JVM，不进轮询）
   refreshStatus().then(async () => {
+    paintV6FallbackStatus();
     if (sheetClose && sheetClose.isCurrent()) await refreshModState();   // status 带回的可能是旧值，文案以轻量状态为准
   }).catch(() => {});
 };

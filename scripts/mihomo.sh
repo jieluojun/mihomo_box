@@ -4647,6 +4647,8 @@ APN4_STATE=$RUNDIR/apn4.state
 APN4_CACHE=$RUNDIR/apn4.json      # apn4-json 的结果缓存（首行时间戳，次行 JSON）
 APN4_TTL=60                       # 缓存有效期（秒）：过期才重新拉起 content JVM
 APN4_LOG=$RUNDIR/apn4.log
+APN4_RETRY_FILE=$RUNDIR/apn4.restore.retry  # 内容提供者暂时失败时限频重试（单调时钟厘秒）
+APN4_RETRY_COOL_CS=6000                   # 最多每 60s 重试一次，避免 5s 对账循环反复拉起 content
 
 apn4_log() {
   printf '%s %s\n' "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$*" >> "$APN4_LOG" 2>/dev/null
@@ -4673,6 +4675,45 @@ _apn4_parse_row() {
       }
     }
     END { if (id != "") print id "|" apn "|" p "|" r "|" t }'
+}
+
+# content update 在部分 ROM 上成功时 stdout 为空，不能把「无输出」直接当失败，
+# 也不能只看 rc=0（可能实际更新了 0 行）。若返回没有明确的 Updated N rows，
+# 就按 id 回查协议；只有读回与目标一致才确认成功。
+apn4_update_verified() {
+  _au_id=$1; _au_p=$2; _au_r=$3
+  APN4_UPDATE_DETAIL=""
+  _au_out=$(content update --uri content://telephony/carriers \
+    --where "_id=$_au_id" --bind "protocol:s:$_au_p" --bind "roaming_protocol:s:$_au_r" 2>&1)
+  _au_rc=$?
+  _au_n=$(printf '%s\n' "$_au_out" | awk '{ for (i=1; i<NF; i++) if (tolower($i)=="updated" && $(i+1) ~ /^[0-9]+$/) { print $(i+1); exit } }')
+  case "$_au_n" in ''|*[!0-9]*) _au_n=0 ;; esac
+  if [ "$_au_rc" = "0" ] && [ "$_au_n" -gt 0 ]; then
+    APN4_UPDATE_DETAIL="Updated $_au_n rows"
+    return 0
+  fi
+
+  _au_qout=$(content query --uri content://telephony/carriers \
+    --where "_id=$_au_id" --projection _id:apn:protocol:roaming_protocol:type 2>&1)
+  _au_qrc=$?
+  _au_got=$(printf '%s\n' "$_au_qout" | awk -v want="$_au_id" '
+    /Row:/ {
+      id=""; p=""; r=""
+      for (i=1; i<=NF; i++) {
+        v=$i; sub(/,$/, "", v)
+        if (v ~ /^_id=/) id=substr(v,5)
+        else if (v ~ /^protocol=/) p=substr(v,10)
+        else if (v ~ /^roaming_protocol=/) r=substr(v,18)
+      }
+      if (id == want) { print p "|" r; exit }
+    }
+  ')
+  if [ "$_au_got" = "$_au_p|$_au_r" ]; then
+    APN4_UPDATE_DETAIL="回查确认成功（update rc=$_au_rc, query rc=$_au_qrc）"
+    return 0
+  fi
+  APN4_UPDATE_DETAIL="未确认（update rc=$_au_rc, 输出=${_au_out:-无输出}; query rc=$_au_qrc, 实读=${_au_got:-无匹配行}）"
+  return 1
 }
 
 # 枚举当前各卡的首选上网 APN，每行输出 "id|apn|protocol|roaming|type"
@@ -4831,15 +4872,12 @@ apn4_apply() {
     if ! grep -q "^$_aa_id|" "$APN4_STATE" 2>/dev/null; then
       printf '%s|%s|%s|%s\n' "$_aa_id" "$_aa_apn" "$_aa_p" "$_aa_r" >> "$APN4_STATE" 2>/dev/null
     fi
-    _aa_res=$(content update --uri content://telephony/carriers \
-      --where "_id=$_aa_id" --bind protocol:s:IP --bind roaming_protocol:s:IP 2>&1)
-    case "$_aa_res" in
-      *"Updated"*|*"updated"*)
-        apn4_log "id=$_aa_id apn=$_aa_apn: $_aa_p/$_aa_r -> IP/IP"
-        _aa_changed=1 ;;
-      *)
-        apn4_log "WARN id=$_aa_id 写库失败: ${_aa_res:-无输出}" ;;
-    esac
+    if apn4_update_verified "$_aa_id" IP IP; then
+      apn4_log "id=$_aa_id apn=$_aa_apn: $_aa_p/$_aa_r -> IP/IP ($_APN4_UPDATE_DETAIL)"
+      _aa_changed=1
+    else
+      apn4_log "WARN id=$_aa_id 写库失败: $APN4_UPDATE_DETAIL"
+    fi
   done <<EOF
 $_aa_rows
 EOF
@@ -4859,23 +4897,49 @@ apn4_restore() {
   _ar_changed=0
   _ar_fail=0
   while IFS='|' read -r _ar_id _ar_apn _ar_p _ar_r; do
-    [ -n "$_ar_id" ] || continue
-    _ar_res=$(content update --uri content://telephony/carriers \
-      --where "_id=$_ar_id" --bind "protocol:s:$_ar_p" --bind "roaming_protocol:s:$_ar_r" 2>&1)
-    case "$_ar_res" in
-      *"Updated"*|*"updated"*)
-        apn4_log "还原 id=$_ar_id apn=$_ar_apn: $_ar_p/$_ar_r"
-        _ar_changed=1 ;;
-      *)
-        apn4_log "WARN 还原 id=$_ar_id apn=$_ar_apn 失败: ${_ar_res:-无输出}"
-        _ar_fail=1 ;;
-    esac
+    if [ -z "$_ar_id" ]; then
+      case "$_ar_apn$_ar_p$_ar_r" in '') continue ;; esac
+      apn4_log "WARN APN 状态记录缺少 id，无法安全还原：${_ar_apn:-?}"
+      _ar_fail=1
+      continue
+    fi
+    if apn4_update_verified "$_ar_id" "$_ar_p" "$_ar_r"; then
+      apn4_log "还原 id=$_ar_id apn=$_ar_apn -> $_ar_p/$_ar_r ($_APN4_UPDATE_DETAIL)"
+      _ar_changed=1
+    else
+      apn4_log "WARN 还原 id=$_ar_id apn=$_ar_apn 失败: $APN4_UPDATE_DETAIL"
+      _ar_fail=1
+    fi
   done < "$APN4_STATE"
-  [ "$_ar_fail" = "0" ] && rm -f "$APN4_STATE" 2>/dev/null
+  if [ "$_ar_fail" = "0" ]; then
+    rm -f "$APN4_STATE" "$APN4_RETRY_FILE" 2>/dev/null
+  fi
   if [ "$_ar_changed" = "1" ]; then
     # 同 apn4_apply：还原后缓存必须作废，别让前端先画出还原前的协议
     rm -f "$APN4_CACHE" 2>/dev/null
     apn4_reattach
+  fi
+  return 0
+}
+
+# 系统 IPv6 保持开启但 APN 还原失败时，保留状态并限频重试；显式开关翻转强制
+# 立即试一次，后续由 5s 对账循环最多每 60s 重试，避免每拍重复拉起 content。
+apn4_restore_retry() {
+  [ -f "$APN4_STATE" ] || { rm -f "$APN4_RETRY_FILE" 2>/dev/null; return 0; }
+  _arr_force=${1:-0}
+  now_cs || return 0
+  _arr_now=$NOW_CS; _arr_last=""
+  [ -f "$APN4_RETRY_FILE" ] && IFS= read -r _arr_last < "$APN4_RETRY_FILE" 2>/dev/null
+  case "$_arr_last" in ''|*[!0-9]*) _arr_last="" ;; esac
+  if [ "$_arr_force" != "1" ] && [ -n "$_arr_last" ] && [ "$_arr_now" -ge "$_arr_last" ] &&
+     [ $((_arr_now - _arr_last)) -lt "$APN4_RETRY_COOL_CS" ]; then
+    return 0
+  fi
+  apn4_restore
+  if [ -f "$APN4_STATE" ]; then
+    now_cs && printf '%s\n' "$NOW_CS" > "$APN4_RETRY_FILE" 2>/dev/null
+  else
+    rm -f "$APN4_RETRY_FILE" 2>/dev/null
   fi
   return 0
 }
@@ -5065,7 +5129,7 @@ system_ipv6_sync() {
       apn4_apply
     fi
   else
-    [ "$_si_flip" = "1" ] && apn4_restore
+    apn4_restore_retry "$_si_flip"
   fi
 
   # 修复：只写值不对的网卡（lo 跳过），并把 RA 相关一并置位，堵住重拉起路径
@@ -5185,8 +5249,8 @@ ipv6_proxy_capable() {
 #
 # 处置：发现「配置要 TUN/eBPF 却没起来」时，把**代理侧**的 4 个 v6 开关改回 false
 # （系统协议栈、APN 都不动，系统 IPv6 仍然是开的），记下证据后重启一次。
-# 之后用户再开关系统 IPv6 时，ipv6_proxy_capable 会短路，不再把配置改回 v6，
-# 避免「每切一次就再失败一次」。
+# 故障标记会阻止后台自动重复探测；用户显式再次开启系统 IPv6 时会清掉旧标记、同步配置并重试，
+# 若仍失败，本守卫再次回退并落标记，避免后台无限重试。
 ipv6_proxy_guard() {
   [ "$(get_setting system_ipv6 false)" = "true" ] || return 0
   [ "$(cfg_top_ipv6)" = "true" ] || return 0
@@ -10535,18 +10599,18 @@ case "$cmd" in
         # 1~3 秒起步，带远程 provider 的还得在线拉取，是「开关系统 IPv6 要等很久」
         # 最大的一截。改前没校验过的一律照旧真跑，不给手术护短。
         _s6_fp0=$(config_fingerprint)
-        _s6_skip=0
-        if [ "$_s6_v" = "true" ] && ! ipv6_proxy_capable; then
-          # 本机已证明「开着 ipv6 就起不来 TUN/eBPF」（见 ipv6_proxy_guard）：
-          # 只把系统协议栈开起来，不把配置里的 v6 开关改回去，代理继续按
-          # IPv4-only 跑——总比「内核在跑、流量全直连」强。
-          _s6_chg=0
-          _s6_skip=1
-        else
-          _s6_chg=$(cfg_ipv6_set_all "$_s6_v")
-          case "$_s6_chg" in ''|*[!0-9]*) _s6_chg=0 ;; esac
-          if [ "$_s6_chg" != "0" ] && [ "$_s6_fp0" = "$(cat "$TESTED" 2>/dev/null)" ]; then
-            config_fingerprint > "$TESTED" 2>/dev/null
+        _s6_chg=$(cfg_ipv6_set_all "$_s6_v")
+        case "$_s6_chg" in ''|*[!0-9]*) _s6_chg=0 ;; esac
+        if [ "$_s6_chg" != "0" ] && [ "$_s6_fp0" = "$(cat "$TESTED" 2>/dev/null)" ]; then
+          config_fingerprint > "$TESTED" 2>/dev/null
+        fi
+        # 用户显式打开系统 IPv6 = 请求重试代理侧 IPv6。旧的能力失败标记只
+        # 防止后台循环自动反复试；这里清掉后交给 ipv6_proxy_guard 实测，若仍失败
+        # 它会重新落标记、回退配置为 IPv4-only 并重启，避免静默绕过代理。
+        if [ "$_s6_v" = "true" ] && [ "$(cfg_top_ipv6)" = "true" ]; then
+          if [ -f "$IPV6_PFAIL" ]; then
+            sw_log "用户显式启用系统 IPv6，重试此前失败的代理侧 IPv6 接管"
+            rm -f "$IPV6_PFAIL" 2>/dev/null
           fi
         fi
         system_ipv6_sync
@@ -10557,13 +10621,7 @@ case "$cmd" in
         [ "$(get_setting tproxy false)" = "true" ] && tproxy_sync >/dev/null 2>&1 &
         live_invalidate 2>/dev/null
         ( boot_data_sync ) >/dev/null 2>&1 &
-        # skip 分支的收尾文案不能再说「配置已同步 N 项」——配置一个字都没动
-        if [ "$_s6_skip" = "1" ]; then
-          _s6_done="系统 IPv6 已$_s6_wd；本机在 IPv6 下无法接管流量（TUN/eBPF 起不来），代理维持仅 IPv4，配置文件未改动"
-          echo "WARN: 本机在 IPv6 下无法接管流量（TUN/eBPF 起不来），只开启系统 IPv6，代理维持仅 IPv4；详见 $IPV6_PLOG"
-        else
-          _s6_done="系统 IPv6 已$_s6_wd，配置里的 IPv6 相关开关已同步（$_s6_chg 项）"
-        fi
+        _s6_done="系统 IPv6 已$_s6_wd，配置里的 IPv6 相关开关已同步（$_s6_chg 项）"
         if running; then
           echo "IPv6 相关配置已同步（$_s6_chg 项），正在重启服务…"
           # 刚跑完 system_ipv6_sync（含 APN 侧）：start_core 里的例行再对账是纯
