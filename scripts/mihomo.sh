@@ -2597,30 +2597,39 @@ _start_core_body() {
   # 内核在热重启里不会死——按 core/ 路径扫 /proc，有残留先杀干净再拉新。
   # 无残留时 pgrep 一次即返回，代价可忽略；校验/端口检查都在其后，时序安全。
   core_sweep_stale
-  action_mark mode_begin
-  prepare_proxy_mode || return 1
-  action_mark mode_done
+  if [ "${__MH_INTERNAL_RESTART_PREPARED:-0}" != "1" ]; then
+    action_mark mode_begin
+    prepare_proxy_mode || return 1
+    action_mark mode_done
+  fi
   ulimit -n 65535 2>/dev/null
   # 主页 res 轮询看到这个文件就会显示「启动中」，不必等校验/pid 文件。
   # 所有失败/成功出口都要清掉，避免停住后一直显示启动中。
   : > "$RUNDIR/starting" 2>/dev/null
   # 启动时不自动下载 Geo 数据（含首次启动）；
   # 需要 Geo 时请在 WebUI「内核管理」中手动点击下载。
-  # 配置校验（指纹未变则跳过，重启可省一次完整校验）
-  # 开机自启的重试轮次可跳过校验（MH_SKIP_VERIFY=1）：上一轮死在「校验超时」时，
-  # 说明是开机忙导致 -t 跑不完，而不是配置有错；真有错内核拉起即退，照样被判失败。
-  # 校验与系统 IPv6 准备互不写 config，并发执行；exec 前必须等待两路完成。
-  ( if [ "${MH_SKIP_VERIFY:-0}" != "1" ]; then verify_config; fi ) > "$RUNDIR/start-verify.log" 2>&1 &
-  _sc_verify_pid=$!
-  action_mark verify_started
+  # 普通 restart_core 已在停旧核前完成配置预处理与校验；无模式切换时复用该结果，
+  # 避免启动阶段再次扫描/校验同一份配置。独立 start 仍走原来的并行校验流程。
+  _sc_verify_pid=""
+  _sc_verify_rc=0
+  if [ "${__MH_INTERNAL_RESTART_PREPARED:-0}" != "1" ]; then
+    # 开机自启的重试轮次可跳过校验（MH_SKIP_VERIFY=1）：上一轮死在「校验超时」时，
+    # 说明是开机忙导致 -t 跑不完，而不是配置有错；真有错内核拉起即退，照样被判失败。
+    # 校验与系统 IPv6 准备互不写 config，并发执行；exec 前必须等待两路完成。
+    ( if [ "${MH_SKIP_VERIFY:-0}" != "1" ]; then verify_config; fi ) > "$RUNDIR/start-verify.log" 2>&1 &
+    _sc_verify_pid=$!
+    action_mark verify_started
+  fi
   if [ "${MH_SKIP_IPV6:-0}" != "1" ]; then
     action_mark ipv6_begin
     system_ipv6_sync >/dev/null 2>&1
     action_mark ipv6_done
   fi
-  wait "$_sc_verify_pid"; _sc_verify_rc=$?
-  action_mark verify_done
-  cat "$RUNDIR/start-verify.log" 2>/dev/null
+  if [ -n "$_sc_verify_pid" ]; then
+    wait "$_sc_verify_pid"; _sc_verify_rc=$?
+    action_mark verify_done
+    cat "$RUNDIR/start-verify.log" 2>/dev/null
+  fi
   if [ "$_sc_verify_rc" != "0" ]; then
     rm -f "$RUNDIR/starting" 2>/dev/null
     return 1
@@ -2905,7 +2914,21 @@ _restart_core_body() {
     action_mark tproxy_disabled
   fi
   running && stop_core keep >/dev/null
-  if start_core; then
+  if [ -z "$_rc_mode" ]; then
+    # 普通重启在停旧核前已完成 proxy mode 预处理和配置校验；复用结果，
+    # 避免 start_core 对同一配置重复跑 prepare_proxy_mode / verify_config。
+    _rc_saved_prepared=${__MH_INTERNAL_RESTART_PREPARED-}
+    __MH_INTERNAL_RESTART_PREPARED=1
+    start_core; _rc_start_rc=$?
+    if [ -n "$_rc_saved_prepared" ]; then
+      __MH_INTERNAL_RESTART_PREPARED=$_rc_saved_prepared
+    else
+      unset __MH_INTERNAL_RESTART_PREPARED
+    fi
+  else
+    start_core; _rc_start_rc=$?
+  fi
+  if [ "$_rc_start_rc" = "0" ]; then
     # Tproxy 模式（含普通重启时开关本来就是开的）：等规则真正装上再报成功，
     # 否则前端显示「已切换」但流量还没被接管，用户以为切失败/卡住了。
     if [ "$(get_setting tproxy false)" = "true" ]; then
@@ -5102,34 +5125,39 @@ system_ipv6_sync() {
   done
   # 开启路径的立即生效兜底：非破坏性触发后，再尝试让 netd 重新接管
   if [ "$_si_d" = "0" ] && [ -n "$_si_changed" ]; then
-    # 1) ndc 通知 netd（存在才生效，无则忽略）
+    # 优先通过 netd 通知各接口刷新 IPv6；有 ndc 时不再额外 down/up 蜂窝口，
+    # 避免与 APN 重新附着重复触发移动数据重连，缩短开启系统 IPv6 的等待。
+    _si_ndc=1
     if command -v ndc >/dev/null 2>&1; then
       for _si_if in $_si_changed; do
-        ndc interface ipv6 "$_si_if" enable 2>/dev/null
+        ndc interface ipv6 "$_si_if" enable 2>/dev/null || _si_ndc=0
       done
+    else
+      _si_ndc=0
     fi
-    # 2) 对蜂窝口做一次 down/up，等同手动开关数据，但由脚本自动完成
-    #    wlan 不做：down 会断 WiFi，用户体感差，靠 RS 已足够；蜂窝 down/up 1s 内自恢复
-    _si_ip=""
-    if [ -x /system/bin/ip ]; then _si_ip=/system/bin/ip
-    elif command -v ip >/dev/null 2>&1; then _si_ip=$(command -v ip)
-    fi
-    if [ -n "$_si_ip" ]; then
-      for _si_if in $_si_changed; do
-        case "$_si_if" in
-          rmnet*|ccmni*|wwan*|r_rmnet*)
-            $_si_ip link set "$_si_if" down 2>/dev/null
-            ;;
-        esac
-      done
-      # 批量 down 后统一 up，减少中间态时间
-      for _si_if in $_si_changed; do
-        case "$_si_if" in
-          rmnet*|ccmni*|wwan*|r_rmnet*)
-            $_si_ip link set "$_si_if" up 2>/dev/null
-            ;;
-        esac
-      done
+    # 仅无 ndc 的 ROM 保留蜂窝口 down/up 兜底；Wi-Fi 从不 down。
+    if [ "$_si_ndc" != "1" ]; then
+      _si_ip=""
+      if [ -x /system/bin/ip ]; then _si_ip=/system/bin/ip
+      elif command -v ip >/dev/null 2>&1; then _si_ip=$(command -v ip)
+      fi
+      if [ -n "$_si_ip" ]; then
+        for _si_if in $_si_changed; do
+          case "$_si_if" in
+            rmnet*|ccmni*|wwan*|r_rmnet*)
+              $_si_ip link set "$_si_if" down 2>/dev/null
+              ;;
+          esac
+        done
+        # 批量 down 后统一 up，减少中间态时间
+        for _si_if in $_si_changed; do
+          case "$_si_if" in
+            rmnet*|ccmni*|wwan*|r_rmnet*)
+              $_si_ip link set "$_si_if" up 2>/dev/null
+              ;;
+          esac
+        done
+      fi
     fi
   fi
   printf '%s' "$_si_d" 2>/dev/null > "$IPV6_WANT"
@@ -10568,7 +10596,15 @@ case "$cmd" in
         else
           _s6_done="系统 IPv6 已$_s6_wd，配置里的 IPv6 相关开关已同步（$_s6_chg 项）"
         fi
-        if running; then
+        _s6_running=0; running && _s6_running=1
+        _s6_restart=1
+        # IPv6 开关虽然翻转，但若配置已是目标值且与正在运行的快照完全一致，
+        # 不需要仅为 sysctl/APN 调整重启内核；避免一次无效 stop/start。
+        if [ "$_s6_running" = "1" ] && [ "$_s6_chg" = "0" ] &&
+           [ -f "$RUNDIR/active-config.yaml" ] && cmp -s "$CONFIG" "$RUNDIR/active-config.yaml"; then
+          _s6_restart=0
+        fi
+        if [ "$_s6_running" = "1" ] && [ "$_s6_restart" = "1" ]; then
           echo "IPv6 相关配置已同步（$_s6_chg 项），正在重启服务…"
           # 刚跑完 system_ipv6_sync（含 APN 侧）：start_core 里的例行再对账是纯
           # 重复（还要再付一轮 APN 查询，会把写 pid 拖到数秒之后），跳过。
@@ -10583,7 +10619,11 @@ case "$cmd" in
           echo "OK: $_s6_done，服务已重启"
           exit 0
         fi
-        echo "OK: $_s6_done；服务未运行，下次启动时生效"
+        if [ "$_s6_running" = "1" ]; then
+          echo "OK: $_s6_done；运行配置无变化，服务无需重启"
+        else
+          echo "OK: $_s6_done；服务未运行，下次启动时生效"
+        fi
         exit 0 ;;
     esac
     set_setting "$1" "$2" || exit 1

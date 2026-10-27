@@ -778,16 +778,21 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             v6SwitchOk = ok;
             if (state.status) state.status.system_ipv6 = v ? 'true' : 'false';
             if (ok) {
-              // 后端改过 config.yaml（ipv6 / dns.ipv6 / eBPF 入站接管 IPv6）：重载草稿，
-              // 避免旧草稿在下次保存时把同步结果覆盖回去
-              try { await loadConfig(); rerenderCurrent(); } catch (e) { /* 重载失败不影响开关 */ }
-              if (wasDirty) uiToast('⚠️ 配置已由模块修改并重新载入，先前未保存的编辑已丢弃', 4200);
+              // 只有配置真被改动（或因运行快照不一致而确实重启）才重载草稿；
+              // 配置零改动且无需重启时，跳过一趟 shell/文件读取往返。
+              const configUnchanged = (/配置里的 IPv6 相关开关已同步（0 项）|配置文件未改动/.test(out)
+                && !/服务已重启/.test(out));
+              if (!configUnchanged) {
+                try { await loadConfig(); rerenderCurrent(); } catch (e) { /* 重载失败不影响开关 */ }
+                if (wasDirty) uiToast('⚠️ 配置已由模块修改并重新载入，先前未保存的编辑已丢弃', 4200);
+              }
               // 本机内核在 IPv6 下起不来时后端只开系统协议栈、不改配置并回 WARN，
               // toast 必须照实说，不能继续报「配置已同步」
               const skipped = /代理维持仅 IPv4/.test(out);
               const tail = skipped ? '，本机无法在 IPv6 下接管流量，代理维持仅 IPv4'
                 : /服务已重启/.test(out) ? '，配置已同步，服务已重启'
-                  : /服务未运行/.test(out) ? '，配置已同步（服务未运行，下次启动生效）' : '，配置已同步';
+                  : /服务无需重启/.test(out) ? '，运行配置无变化，无需重启服务'
+                    : /服务未运行/.test(out) ? '，配置已同步（服务未运行，下次启动生效）' : '，配置已同步';
               // 服务确实重启了＝提示等新核起表那一帧；没重启（服务未运行等）就立刻弹。
               const v6Msg = (v ? '✅ 系统 IPv6 已启用' : '✅ 系统 IPv6 已禁用') + tail;
               if (/服务已重启/.test(out)) armUpToast(v6Msg);
