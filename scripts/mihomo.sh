@@ -2597,30 +2597,39 @@ _start_core_body() {
   # 内核在热重启里不会死——按 core/ 路径扫 /proc，有残留先杀干净再拉新。
   # 无残留时 pgrep 一次即返回，代价可忽略；校验/端口检查都在其后，时序安全。
   core_sweep_stale
-  action_mark mode_begin
-  prepare_proxy_mode || return 1
-  action_mark mode_done
+  if [ "${__MH_INTERNAL_RESTART_PREPARED:-0}" != "1" ]; then
+    action_mark mode_begin
+    prepare_proxy_mode || return 1
+    action_mark mode_done
+  fi
   ulimit -n 65535 2>/dev/null
   # 主页 res 轮询看到这个文件就会显示「启动中」，不必等校验/pid 文件。
   # 所有失败/成功出口都要清掉，避免停住后一直显示启动中。
   : > "$RUNDIR/starting" 2>/dev/null
   # 启动时不自动下载 Geo 数据（含首次启动）；
   # 需要 Geo 时请在 WebUI「内核管理」中手动点击下载。
-  # 配置校验（指纹未变则跳过，重启可省一次完整校验）
-  # 开机自启的重试轮次可跳过校验（MH_SKIP_VERIFY=1）：上一轮死在「校验超时」时，
-  # 说明是开机忙导致 -t 跑不完，而不是配置有错；真有错内核拉起即退，照样被判失败。
-  # 校验与系统 IPv6 准备互不写 config，并发执行；exec 前必须等待两路完成。
-  ( if [ "${MH_SKIP_VERIFY:-0}" != "1" ]; then verify_config; fi ) > "$RUNDIR/start-verify.log" 2>&1 &
-  _sc_verify_pid=$!
-  action_mark verify_started
+  # 普通 restart_core 已在停旧核前完成配置预处理与校验；无模式切换时复用该结果，
+  # 避免启动阶段再次扫描/校验同一份配置。独立 start 仍走原来的并行校验流程。
+  _sc_verify_pid=""
+  _sc_verify_rc=0
+  if [ "${__MH_INTERNAL_RESTART_PREPARED:-0}" != "1" ]; then
+    # 开机自启的重试轮次可跳过校验（MH_SKIP_VERIFY=1）：上一轮死在「校验超时」时，
+    # 说明是开机忙导致 -t 跑不完，而不是配置有错；真有错内核拉起即退，照样被判失败。
+    # 校验与系统 IPv6 准备互不写 config，并发执行；exec 前必须等待两路完成。
+    ( if [ "${MH_SKIP_VERIFY:-0}" != "1" ]; then verify_config; fi ) > "$RUNDIR/start-verify.log" 2>&1 &
+    _sc_verify_pid=$!
+    action_mark verify_started
+  fi
   if [ "${MH_SKIP_IPV6:-0}" != "1" ]; then
     action_mark ipv6_begin
     system_ipv6_sync >/dev/null 2>&1
     action_mark ipv6_done
   fi
-  wait "$_sc_verify_pid"; _sc_verify_rc=$?
-  action_mark verify_done
-  cat "$RUNDIR/start-verify.log" 2>/dev/null
+  if [ -n "$_sc_verify_pid" ]; then
+    wait "$_sc_verify_pid"; _sc_verify_rc=$?
+    action_mark verify_done
+    cat "$RUNDIR/start-verify.log" 2>/dev/null
+  fi
   if [ "$_sc_verify_rc" != "0" ]; then
     rm -f "$RUNDIR/starting" 2>/dev/null
     return 1
@@ -2883,11 +2892,24 @@ _restart_core_body() {
   fi
   # 新配置校验失败时不杀死仍可用的旧内核。
   action_mark mode_begin
-  prepare_proxy_mode "$_rc_mode" || return 1
+  if ! prepare_proxy_mode "$_rc_mode"; then
+    # IPv6 开关即使遇到配置准备失败，也要像旧路径一样先落实系统侧开关。
+    [ "${__MH_SYNC_IPV6_DURING_RESTART:-0}" = "1" ] && system_ipv6_sync >/dev/null 2>&1
+    return 1
+  fi
   action_mark mode_done
+  _rc_ipv6_sync_pid=""
+  if [ "${__MH_SYNC_IPV6_DURING_RESTART:-0}" = "1" ]; then
+    # 系统/APN 同步只读配置、不改配置；与配置校验并行，减少串行等待。
+    ( system_ipv6_sync >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+    _rc_ipv6_sync_pid=$!
+  fi
   action_mark restart_verify_begin
-  if [ "${MH_SKIP_VERIFY:-0}" != "1" ]; then verify_config || return 1; fi
+  _rc_verify_rc=0
+  if [ "${MH_SKIP_VERIFY:-0}" != "1" ]; then verify_config || _rc_verify_rc=$?; fi
+  if [ -n "$_rc_ipv6_sync_pid" ]; then wait "$_rc_ipv6_sync_pid" 2>/dev/null; fi
   action_mark restart_verify_done
+  [ "$_rc_verify_rc" = "0" ] || return 1
   # 仅显式选择 TUN/eBPF 时退出 TProxy；先验证，失败仍保留原来的 TProxy 服务。
   if [ "$_rc_mode" = tproxy ]; then
     if [ "$_rc_keep_tp_cfg" != 1 ]; then
@@ -2905,7 +2927,28 @@ _restart_core_body() {
     action_mark tproxy_disabled
   fi
   running && stop_core keep >/dev/null
-  if start_core; then
+  _rc_saved_skip_ipv6=${MH_SKIP_IPV6-}
+  if [ "${__MH_SYNC_IPV6_DURING_RESTART:-0}" = "1" ]; then MH_SKIP_IPV6=1; fi
+  if [ -z "$_rc_mode" ]; then
+    # 普通重启在停旧核前已完成 proxy mode 预处理和配置校验；复用结果，
+    # 避免 start_core 对同一配置重复跑 prepare_proxy_mode / verify_config。
+    _rc_saved_prepared=${__MH_INTERNAL_RESTART_PREPARED-}
+    __MH_INTERNAL_RESTART_PREPARED=1
+    start_core; _rc_start_rc=$?
+    if [ -n "$_rc_saved_prepared" ]; then
+      __MH_INTERNAL_RESTART_PREPARED=$_rc_saved_prepared
+    else
+      unset __MH_INTERNAL_RESTART_PREPARED
+    fi
+  else
+    start_core; _rc_start_rc=$?
+  fi
+  if [ -n "$_rc_saved_skip_ipv6" ]; then
+    MH_SKIP_IPV6=$_rc_saved_skip_ipv6
+  else
+    unset MH_SKIP_IPV6
+  fi
+  if [ "$_rc_start_rc" = "0" ]; then
     # Tproxy 模式（含普通重启时开关本来就是开的）：等规则真正装上再报成功，
     # 否则前端显示「已切换」但流量还没被接管，用户以为切失败/卡住了。
     if [ "$(get_setting tproxy false)" = "true" ]; then
@@ -4647,6 +4690,16 @@ APN4_STATE=$RUNDIR/apn4.state
 APN4_CACHE=$RUNDIR/apn4.json      # apn4-json 的结果缓存（首行时间戳，次行 JSON）
 APN4_TTL=60                       # 缓存有效期（秒）：过期才重新拉起 content JVM
 APN4_LOG=$RUNDIR/apn4.log
+IPV6_TOGGLE_STAGE=$RUNDIR/ipv6-toggle.stage
+
+# 前端在 set system_ipv6 尚未返回时轮询此阶段；APN 改写/还原一结束即通知其刷新状态。
+ipv6_toggle_stage() {
+  [ -n "${MH_IPV6_TOGGLE_TOKEN:-}" ] || return 0
+  case "$MH_IPV6_TOGGLE_TOKEN" in *[!A-Za-z0-9_-]*) return 0 ;; esac
+  printf '%s|%s\n' "$MH_IPV6_TOGGLE_TOKEN" "$1" > "$IPV6_TOGGLE_STAGE.tmp.$$" 2>/dev/null &&
+    mv -f "$IPV6_TOGGLE_STAGE.tmp.$$" "$IPV6_TOGGLE_STAGE" 2>/dev/null
+  return 0
+}
 
 apn4_log() {
   printf '%s %s\n' "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$*" >> "$APN4_LOG" 2>/dev/null
@@ -4819,6 +4872,7 @@ apn4_apply() {
     return 1
   fi
   _aa_changed=0
+  _aa_attempted=0
   while IFS='|' read -r _aa_id _aa_apn _aa_p _aa_r _aa_t; do
     [ -n "$_aa_id" ] || continue
     case "$_aa_t" in *ims*) apn4_log "跳过 IMS 承载行 id=$_aa_id apn=$_aa_apn type=$_aa_t"; continue ;; esac
@@ -4831,6 +4885,7 @@ apn4_apply() {
     if ! grep -q "^$_aa_id|" "$APN4_STATE" 2>/dev/null; then
       printf '%s|%s|%s|%s\n' "$_aa_id" "$_aa_apn" "$_aa_p" "$_aa_r" >> "$APN4_STATE" 2>/dev/null
     fi
+    _aa_attempted=1
     _aa_res=$(content update --uri content://telephony/carriers \
       --where "_id=$_aa_id" --bind protocol:s:IP --bind roaming_protocol:s:IP 2>&1)
     case "$_aa_res" in
@@ -4843,12 +4898,11 @@ apn4_apply() {
   done <<EOF
 $_aa_rows
 EOF
-  if [ "$_aa_changed" = "1" ]; then
-    # 改写过的行刚变：APN 读取缓存立刻作废，否则前端「cached 秒画」会把改动前的
-    # 协议再显示一次（用户看到的就是「明明关了 IPv6，APN 还写着 IPv4/IPv6」）
+  if [ "$_aa_attempted" = "1" ]; then
+    # content update 在部分 ROM 上成功时 stdout 为空；任何写入尝试后都作废旧缓存。
     rm -f "$APN4_CACHE" 2>/dev/null
-    apn4_reattach
   fi
+  [ "$_aa_changed" = "1" ] && apn4_reattach
   return 0
 }
 
@@ -4858,8 +4912,10 @@ apn4_restore() {
   [ -f "$APN4_STATE" ] || return 0
   _ar_changed=0
   _ar_fail=0
+  _ar_attempted=0
   while IFS='|' read -r _ar_id _ar_apn _ar_p _ar_r; do
     [ -n "$_ar_id" ] || continue
+    _ar_attempted=1
     _ar_res=$(content update --uri content://telephony/carriers \
       --where "_id=$_ar_id" --bind "protocol:s:$_ar_p" --bind "roaming_protocol:s:$_ar_r" 2>&1)
     case "$_ar_res" in
@@ -4872,11 +4928,11 @@ apn4_restore() {
     esac
   done < "$APN4_STATE"
   [ "$_ar_fail" = "0" ] && rm -f "$APN4_STATE" 2>/dev/null
-  if [ "$_ar_changed" = "1" ]; then
-    # 同 apn4_apply：还原后缓存必须作废，别让前端先画出还原前的协议
+  if [ "$_ar_attempted" = "1" ]; then
+    # update 可能成功但 stdout 为空；写过就清缓存，避免页面读到还原前协议。
     rm -f "$APN4_CACHE" 2>/dev/null
-    apn4_reattach
   fi
+  [ "$_ar_changed" = "1" ] && apn4_reattach
   return 0
 }
 
@@ -4962,7 +5018,7 @@ EOF
 
 system_ipv6_sync() {
   _si_dir=${IPV6_CONF:-/proc/sys/net/ipv6/conf}
-  [ -d "$_si_dir" ] || return 0
+  if [ ! -d "$_si_dir" ]; then ipv6_toggle_stage apn-ready; return 0; fi
   # 热点下游交还系统：与期望开关无关，br0 等绝不能停在 disable_ipv6=1。
   si_restore_tether_ipv6
   # 保持系统 IPv6 协议栈可用（_si_d=0 → disable_ipv6=0）的三类情况：
@@ -5049,11 +5105,12 @@ system_ipv6_sync() {
       if [ "$_si_cur" != "$_si_net_prev" ]; then
         printf '%s' "$_si_cur" 2>/dev/null > "$_si_net_file"
       fi
+      ipv6_toggle_stage apn-ready
       return 0
     fi
   fi
 
-  [ "$_si_need" = "0" ] && return 0
+  if [ "$_si_need" = "0" ]; then ipv6_toggle_stage apn-ready; return 0; fi
 
   # —— 蜂窝侧防 v6 泄漏：走 APN（等同「APN 协议=IPv4」），不碰内核 disable_ipv6 ——
   # 见 APN4 子系统注释。触发点：
@@ -5067,6 +5124,8 @@ system_ipv6_sync() {
   else
     [ "$_si_flip" = "1" ] && apn4_restore
   fi
+  # 精确通知 UI：APN Provider 更新/还原已完成，可以立即强制重读，不必等代理重启完成。
+  ipv6_toggle_stage apn-ready
 
   # 修复：只写值不对的网卡（lo 跳过），并把 RA 相关一并置位，堵住重拉起路径
   # 开启时要尽量立即生效：关是删地址立即消失，开是等 RA，需主动触发 RS
@@ -5099,34 +5158,39 @@ system_ipv6_sync() {
   done
   # 开启路径的立即生效兜底：非破坏性触发后，再尝试让 netd 重新接管
   if [ "$_si_d" = "0" ] && [ -n "$_si_changed" ]; then
-    # 1) ndc 通知 netd（存在才生效，无则忽略）
+    # 优先通过 netd 通知各接口刷新 IPv6；有 ndc 时不再额外 down/up 蜂窝口，
+    # 避免与 APN 重新附着重复触发移动数据重连，缩短开启系统 IPv6 的等待。
+    _si_ndc=1
     if command -v ndc >/dev/null 2>&1; then
       for _si_if in $_si_changed; do
-        ndc interface ipv6 "$_si_if" enable 2>/dev/null
+        ndc interface ipv6 "$_si_if" enable 2>/dev/null || _si_ndc=0
       done
+    else
+      _si_ndc=0
     fi
-    # 2) 对蜂窝口做一次 down/up，等同手动开关数据，但由脚本自动完成
-    #    wlan 不做：down 会断 WiFi，用户体感差，靠 RS 已足够；蜂窝 down/up 1s 内自恢复
-    _si_ip=""
-    if [ -x /system/bin/ip ]; then _si_ip=/system/bin/ip
-    elif command -v ip >/dev/null 2>&1; then _si_ip=$(command -v ip)
-    fi
-    if [ -n "$_si_ip" ]; then
-      for _si_if in $_si_changed; do
-        case "$_si_if" in
-          rmnet*|ccmni*|wwan*|r_rmnet*)
-            $_si_ip link set "$_si_if" down 2>/dev/null
-            ;;
-        esac
-      done
-      # 批量 down 后统一 up，减少中间态时间
-      for _si_if in $_si_changed; do
-        case "$_si_if" in
-          rmnet*|ccmni*|wwan*|r_rmnet*)
-            $_si_ip link set "$_si_if" up 2>/dev/null
-            ;;
-        esac
-      done
+    # 仅无 ndc 的 ROM 保留蜂窝口 down/up 兜底；Wi-Fi 从不 down。
+    if [ "$_si_ndc" != "1" ]; then
+      _si_ip=""
+      if [ -x /system/bin/ip ]; then _si_ip=/system/bin/ip
+      elif command -v ip >/dev/null 2>&1; then _si_ip=$(command -v ip)
+      fi
+      if [ -n "$_si_ip" ]; then
+        for _si_if in $_si_changed; do
+          case "$_si_if" in
+            rmnet*|ccmni*|wwan*|r_rmnet*)
+              $_si_ip link set "$_si_if" down 2>/dev/null
+              ;;
+          esac
+        done
+        # 批量 down 后统一 up，减少中间态时间
+        for _si_if in $_si_changed; do
+          case "$_si_if" in
+            rmnet*|ccmni*|wwan*|r_rmnet*)
+              $_si_ip link set "$_si_if" up 2>/dev/null
+              ;;
+          esac
+        done
+      fi
     fi
   fi
   printf '%s' "$_si_d" 2>/dev/null > "$IPV6_WANT"
@@ -10398,11 +10462,18 @@ case "$cmd" in
   tun-hotspot-diag)   tun_hotspot_diag ;;
   # 系统 IPv6：手动对账一次 / 查看各网卡实况（正常由监听循环每 IPV6_TICK 秒自动做）
   ipv6-sync)     system_ipv6_sync >/dev/null 2>&1; echo "OK: 系统 IPv6 已按当前开关对账" ;;
+  ipv6-toggle-status)
+    _its_want=$1; _its_token=""; _its_stage=pending
+    case "$_its_want" in ''|*[!A-Za-z0-9_-]*) echo pending; exit 0 ;; esac
+    if [ -r "$IPV6_TOGGLE_STAGE" ]; then IFS='|' read -r _its_token _its_stage < "$IPV6_TOGGLE_STAGE"; fi
+    [ "$_its_token" = "$_its_want" ] || _its_stage=pending
+    echo "$_its_stage" ;;
   ipv6-status)   ipv6_status ;;
   ipv6-guard)    ipv6_proxy_guard ;;
   # APN 协议接管（等效「APN 协议=IPv4」防蜂窝 v6 泄漏，不碰 IMS）：
   apn4-status)   apn4_status ;;
-  apn4-json)     apn4_json ;;
+  # 透传 cached/refresh 模式；不传参数会让强制刷新误走 60s 自动缓存路径。
+  apn4-json)     apn4_json "$1" ;;
   apn4-apply)    apn4_apply  && echo "OK: APN 已按 IPv4 接管（详见 $APN4_LOG）" ;;
   apn4-restore)  apn4_restore && echo "OK: APN 协议已还原（详见 $APN4_LOG）" ;;
   # Tproxy 透明代理：开关主流程 / 手动对账 / 查看状态
@@ -10525,6 +10596,13 @@ case "$cmd" in
           false|off|0) _s6_v=false; _s6_wd=禁用 ;;
           *) echo "ERR: 参数只能是 true / false"; exit 1 ;;
         esac
+        _s6_token=${3:-}
+        case "$_s6_token" in ''|*[!A-Za-z0-9_-]*) unset MH_IPV6_TOGGLE_TOKEN ;;
+          *) mkdir -p "$RUNDIR" 2>/dev/null
+             MH_IPV6_TOGGLE_TOKEN=$_s6_token
+             printf '%s|syncing\n' "$_s6_token" > "$IPV6_TOGGLE_STAGE.tmp.$$" 2>/dev/null &&
+               mv -f "$IPV6_TOGGLE_STAGE.tmp.$$" "$IPV6_TOGGLE_STAGE" 2>/dev/null ;;
+        esac
         set_setting system_ipv6 "$_s6_v"
         # 系统 IPv6＝总开关：切换的同时把配置里的 IPv6 相关开关（顶层 ipv6 /
         # dns.ipv6 / eBPF 入站 local·shared.ipv6）一并改齐（见 cfg_ipv6_set_all），
@@ -10549,7 +10627,6 @@ case "$cmd" in
             config_fingerprint > "$TESTED" 2>/dev/null
           fi
         fi
-        system_ipv6_sync
         # 系统 IPv6 开↔关 = TPROXY 是否劫持 v6，立即对账装卸 v6 规则。放后台不
         # 阻塞返回：start_core 拉起后还会起 tproxy 对账循环、开关监听循环也会
         # 周期兜底，规则是收敛式的；同步串行跑 iptables（60~100 次调用，2~4 秒）
@@ -10564,22 +10641,37 @@ case "$cmd" in
         else
           _s6_done="系统 IPv6 已$_s6_wd，配置里的 IPv6 相关开关已同步（$_s6_chg 项）"
         fi
-        if running; then
+        _s6_running=0; running && _s6_running=1
+        _s6_restart=1
+        # IPv6 开关虽然翻转，但若配置已是目标值且与正在运行的快照完全一致，
+        # 不需要仅为 sysctl/APN 调整重启内核；避免一次无效 stop/start。
+        if [ "$_s6_running" = "1" ] && [ "$_s6_chg" = "0" ] &&
+           [ -f "$RUNDIR/active-config.yaml" ] && cmp -s "$CONFIG" "$RUNDIR/active-config.yaml"; then
+          _s6_restart=0
+        fi
+        if [ "$_s6_running" = "1" ] && [ "$_s6_restart" = "1" ]; then
           echo "IPv6 相关配置已同步（$_s6_chg 项），正在重启服务…"
-          # 刚跑完 system_ipv6_sync（含 APN 侧）：start_core 里的例行再对账是纯
-          # 重复（还要再付一轮 APN 查询，会把写 pid 拖到数秒之后），跳过。
-          MH_SKIP_IPV6=1
-          export MH_SKIP_IPV6
+          # 在 restart_core 的安全预处理之后，把 sysctl/APN 同步与配置校验并行；
+          # start_core 会等同步完成后再拉起新核，避免串行等待且不改变生效顺序。
+          __MH_SYNC_IPV6_DURING_RESTART=1
           if ! restart_core; then
-            unset MH_SKIP_IPV6
+            unset __MH_SYNC_IPV6_DURING_RESTART
+            # lifecycle lock 忙时 restart_core 可能尚未进入主流程；补一次幂等系统同步。
+            system_ipv6_sync
             echo "ERR: $_s6_done，但服务重启失败，请检查配置后手动启动"
             exit 1
           fi
-          unset MH_SKIP_IPV6
+          unset __MH_SYNC_IPV6_DURING_RESTART
           echo "OK: $_s6_done，服务已重启"
           exit 0
         fi
-        echo "OK: $_s6_done；服务未运行，下次启动时生效"
+        # 未运行或无需重启时没有 start_core 可代办，直接同步系统/APN 状态。
+        system_ipv6_sync
+        if [ "$_s6_running" = "1" ]; then
+          echo "OK: $_s6_done；运行配置无变化，服务无需重启"
+        else
+          echo "OK: $_s6_done；服务未运行，下次启动时生效"
+        fi
         exit 0 ;;
     esac
     set_setting "$1" "$2" || exit 1

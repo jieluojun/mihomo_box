@@ -445,46 +445,61 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   // 还有几秒延迟（甚至重启内核期间 JVM 起得很慢、一次 20s 超时被掐掉），只读一次就
   // 很容易把改动前的协议留在界面上——用户看到的就是「关了 IPv6，APN 还写着 IPv4/IPv6」。
   // opts.expect(txt)：这一轮读到什么才算「已经翻篇」（例如关掉 IPv6 时期望不再出现
-  // IPv6）。没有 expect 时退化成「连续两轮读数一致即稳定」，正常打开弹层只查一次。
+  // IPv6）。关闭 IPv6 时可重试到目标值；开启后的 Provider 查询在设置命令完成后直接采用首个新鲜结果。
+  let apnStatusReadSeq = 0;
   const refreshApnStatus = async (opts) => {
+    const readSeq = ++apnStatusReadSeq;
+    const isCurrentRead = () => readSeq === apnStatusReadSeq && modSheetAlive();
     const tries = Math.max(1, (opts && opts.tries) || 1);
     const gap = (opts && opts.gap) || 1500;
     const expect = (opts && opts.expect) || null;
     if (DEMO) { apnStatus.textContent = '首选 APN：演示模式下不可读取'; return; }
     let painted = false;
     let cached = null;
-    try {
-      const c = await cmdline('apn4-json cached', { timeout: 5000 });
-      const jc = parseJsonLoose(c && c.stdout);
-      if (jc && Array.isArray(jc.items) && jc.items.length) {
-        cached = apnLineText(jc); apnStatus.textContent = cached; painted = true;
-      }
-    } catch (e) { /* 没有缓存就走真查 */ }
+    // IPv6 切换后跳过缓存，避免先把变更前的协议显示为当前值。
+    if (!(opts && opts.fresh)) {
+      try {
+        const c = await cmdline('apn4-json cached', { timeout: 5000 });
+        if (!isCurrentRead()) return;
+        const jc = parseJsonLoose(c && c.stdout);
+        if (jc && Array.isArray(jc.items) && jc.items.length) {
+          cached = apnLineText(jc); apnStatus.textContent = cached; painted = true;
+        }
+      } catch (e) { /* 没有缓存就走真查 */ }
+    }
     let prev = null;
+    let lastObserved = '';
     for (let i = 0; i < tries; i++) {
       if (i > 0) {
-        // 弹层被关/被换掉就别再读了（节点还在，但已经没人看）
-        if (sheetClose && !sheetClose.isCurrent()) return;
+        // 弹层被关/被换掉，或有更新的 APN 刷新接管：旧请求不再读写界面。
+        if (!isCurrentRead()) return;
         await new Promise(res => setTimeout(res, gap));
       }
       let txt = '';
       try {
         const r = await cmdline('apn4-json refresh', { timeout: 20000 });
+        if (!isCurrentRead()) return;
         const j = parseJsonLoose(r && r.stdout);
         if (j && j.ok) txt = apnLineText(j);
       } catch (e) { /* 超时/被杀：下一轮再试 */ }
-      if (!txt) continue;
-      apnStatus.textContent = txt;
+      if (!isCurrentRead()) return;
+      if (!txt) { prev = null; continue; }
       painted = true;
+      lastObserved = txt;
+      if (opts && opts.acceptFirst) { apnStatus.textContent = txt; return; }
       if (expect) {
-        if (expect(txt)) return;               // 已经读到期望的读数
+        if (expect(txt)) { apnStatus.textContent = txt; return; } // 已确认达到切换目标
       } else {
-        if (prev !== null && txt === prev) return;          // 连续两轮一致＝稳定
+        if (prev !== null && txt === prev && (!(opts && opts.fresh) || i === tries - 1)) {
+          apnStatus.textContent = txt; return; // 切换后读完整轮次，最后两次一致才确认
+        }
         if (i === 0 && tries > 1 && txt === cached) return; // 与缓存一致＝没变化
       }
+      if (!(opts && opts.fresh)) apnStatus.textContent = txt;
       prev = txt;
     }
     if (!painted) apnStatus.textContent = '首选 APN：读取失败';
+    else if (opts && opts.fresh) apnStatus.textContent = '首选 APN：尚未确认（最新查询：' + lastObserved.replace(/^首选 APN：?\s*/, '') + '）';
   };
   // 诊断按钮工厂（Tproxy / TUN 热点各一个）：与配置源码弹窗一致的圆形诊断
   // 按钮（btn sm circle + 脉搏图标），放在各自开关的左旁。不生效时靠人猜很
@@ -724,6 +739,23 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
         sw = switchCtl(v6On, async (v) => {
           if (busy) { sw.querySelector('input').checked = !v; return; }
           busy = true;
+          // 作废切换前在途的读取，避免旧响应覆盖切换后的状态。
+          apnStatusReadSeq++;
+          const toggleReadSeq = apnStatusReadSeq;
+          apnStatus.textContent = '首选 APN：系统 IPv6 切换中，状态尚未确认…';
+          const apnToggleToken = 'v6' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+          let apnRefreshStarted = false;
+          let stopApnStagePoll = false;
+          const startFreshApnRefresh = () => {
+            if (apnRefreshStarted) return;
+            apnRefreshStarted = true;
+            if (!sheetClose || !sheetClose.isCurrent()) return;
+            apnStatus.textContent = '首选 APN：正在重新读取…';
+            void refreshApnStatus({
+              fresh: true, tries: v ? 1 : 4, gap: 1800, acceptFirst: !!v,
+              expect: !v ? (t => /首选 APN「/.test(t) && !/IPv6/i.test(t)) : null,
+            });
+          };
           const wasDirty = state.dirty;
           // 说明文字与开关同帧换成目标状态：切完还挂着旧状态的文案，就是在骗人。
           v6DescMain.textContent = v6DescText(v);
@@ -753,21 +785,46 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             }).catch(() => {});
           }
           try {
-            const r = await cmdline(`set system_ipv6 ${v}`);
+            const setPromise = cmdline(`set system_ipv6 ${v} ${apnToggleToken}`);
+            // 后端在 APN provider 写入/还原一结束就落 apn-ready 阶段；并行轮询它，
+            // 让 APN 状态刷新在服务重启完成 / IPv6 toast 出现之前启动。
+            void (async () => {
+              const deadline = Date.now() + 90000;
+              while (!stopApnStagePoll && Date.now() < deadline) {
+                if (!sheetClose || !sheetClose.isCurrent()) return;
+                try {
+                  const sr = await cmdline(`ipv6-toggle-status ${apnToggleToken}`, { timeout: 4000 });
+                  if (stopApnStagePoll) return;
+                  if (((sr && sr.stdout) || '').trim() === 'apn-ready') {
+                    if (apnStatusReadSeq === toggleReadSeq) startFreshApnRefresh();
+                    return;
+                  }
+                } catch (e) { /* 读进度失败后继续等，不影响开关 */ }
+                await new Promise(res => setTimeout(res, 350));
+              }
+            })();
+            const r = await setPromise;
+            // 即使进度轮询未赶上，也在处理 toast / 配置回读之前立刻启动 APN 查询。
+            if (!apnRefreshStarted) startFreshApnRefresh();
             const out = ((r && r.stdout) || '').trim();
             const ok = !!r && r.errno === 0 && !/(^|\n)ERR/.test(out);
             if (state.status) state.status.system_ipv6 = v ? 'true' : 'false';
             if (ok) {
-              // 后端改过 config.yaml（ipv6 / dns.ipv6 / eBPF 入站接管 IPv6）：重载草稿，
-              // 避免旧草稿在下次保存时把同步结果覆盖回去
-              try { await loadConfig(); rerenderCurrent(); } catch (e) { /* 重载失败不影响开关 */ }
-              if (wasDirty) uiToast('⚠️ 配置已由模块修改并重新载入，先前未保存的编辑已丢弃', 4200);
+              // 只有配置真被改动（或因运行快照不一致而确实重启）才重载草稿；
+              // 配置零改动且无需重启时，跳过一趟 shell/文件读取往返。
+              const configUnchanged = (/配置里的 IPv6 相关开关已同步（0 项）|配置文件未改动/.test(out)
+                && !/服务已重启/.test(out));
+              if (!configUnchanged) {
+                try { await loadConfig(); rerenderCurrent(); } catch (e) { /* 重载失败不影响开关 */ }
+                if (wasDirty) uiToast('⚠️ 配置已由模块修改并重新载入，先前未保存的编辑已丢弃', 4200);
+              }
               // 本机内核在 IPv6 下起不来时后端只开系统协议栈、不改配置并回 WARN，
               // toast 必须照实说，不能继续报「配置已同步」
               const skipped = /代理维持仅 IPv4/.test(out);
               const tail = skipped ? '，本机无法在 IPv6 下接管流量，代理维持仅 IPv4'
                 : /服务已重启/.test(out) ? '，配置已同步，服务已重启'
-                  : /服务未运行/.test(out) ? '，配置已同步（服务未运行，下次启动生效）' : '，配置已同步';
+                  : /服务无需重启/.test(out) ? '，运行配置无变化，无需重启服务'
+                    : /服务未运行/.test(out) ? '，配置已同步（服务未运行，下次启动生效）' : '，配置已同步';
               // 服务确实重启了＝提示等新核起表那一帧；没重启（服务未运行等）就立刻弹。
               const v6Msg = (v ? '✅ 系统 IPv6 已启用' : '✅ 系统 IPv6 已禁用') + tail;
               if (/服务已重启/.test(out)) armUpToast(v6Msg);
@@ -783,20 +840,9 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             // 收尾只留 2.5s 补读短窗。Math.min：把本次 20s 长窗收回，避免一直挂着盖住
             // 之后真实的「已停止」显示；也不挤掉别处刚按下的更长静默窗。
             if (v6Quiet) restartQuietUntil = Math.min(restartQuietUntil, Date.now() + 2500);
-            // APN 协议刚被改写（关）或还原（开）：APN 状态行跟着刷新，不留旧读数。
-            // 先把这一行改成「正在重新读取」，避免在 APN 库落盘 / 内核重启的几秒里
-            // 一直挂着改动前的协议（「关了系统 IPv6，APN 还写着 IPv4/IPv6」就是这么来的）；
-            // 随后多读几轮，读数稳定即停。
-            if (sheetClose && sheetClose.isCurrent()) {
-              const apnBefore = apnStatus.textContent;
-              apnStatus.textContent = '首选 APN：正在重新读取…';
-              // 关：APN 协议应变成仅 IPv4（读到不含 IPv6 的读数才算翻篇）；
-              // 开：协议按接管前的原值还原，读数与原读数不同即算翻篇。
-              void refreshApnStatus({
-                tries: 4, gap: 1800,
-                expect: v ? (t => t !== apnBefore) : (t => !/IPv6/i.test(t)),
-              });
-            }
+            // 进度轮询若未赶上 APN 更新（或命令异常结束），用命令返回后的新鲜查询兜底。
+            stopApnStagePoll = true;
+            if (!apnRefreshStarted) startFreshApnRefresh();
           }
         });
         return sw;
