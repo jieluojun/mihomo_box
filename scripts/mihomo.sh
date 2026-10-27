@@ -2892,11 +2892,24 @@ _restart_core_body() {
   fi
   # 新配置校验失败时不杀死仍可用的旧内核。
   action_mark mode_begin
-  prepare_proxy_mode "$_rc_mode" || return 1
+  if ! prepare_proxy_mode "$_rc_mode"; then
+    # IPv6 开关即使遇到配置准备失败，也要像旧路径一样先落实系统侧开关。
+    [ "${__MH_SYNC_IPV6_DURING_RESTART:-0}" = "1" ] && system_ipv6_sync >/dev/null 2>&1
+    return 1
+  fi
   action_mark mode_done
+  _rc_ipv6_sync_pid=""
+  if [ "${__MH_SYNC_IPV6_DURING_RESTART:-0}" = "1" ]; then
+    # 系统/APN 同步只读配置、不改配置；与配置校验并行，减少串行等待。
+    ( system_ipv6_sync >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 &
+    _rc_ipv6_sync_pid=$!
+  fi
   action_mark restart_verify_begin
-  if [ "${MH_SKIP_VERIFY:-0}" != "1" ]; then verify_config || return 1; fi
+  _rc_verify_rc=0
+  if [ "${MH_SKIP_VERIFY:-0}" != "1" ]; then verify_config || _rc_verify_rc=$?; fi
+  if [ -n "$_rc_ipv6_sync_pid" ]; then wait "$_rc_ipv6_sync_pid" 2>/dev/null; fi
   action_mark restart_verify_done
+  [ "$_rc_verify_rc" = "0" ] || return 1
   # 仅显式选择 TUN/eBPF 时退出 TProxy；先验证，失败仍保留原来的 TProxy 服务。
   if [ "$_rc_mode" = tproxy ]; then
     if [ "$_rc_keep_tp_cfg" != 1 ]; then
@@ -2914,6 +2927,8 @@ _restart_core_body() {
     action_mark tproxy_disabled
   fi
   running && stop_core keep >/dev/null
+  _rc_saved_skip_ipv6=${MH_SKIP_IPV6-}
+  if [ "${__MH_SYNC_IPV6_DURING_RESTART:-0}" = "1" ]; then MH_SKIP_IPV6=1; fi
   if [ -z "$_rc_mode" ]; then
     # 普通重启在停旧核前已完成 proxy mode 预处理和配置校验；复用结果，
     # 避免 start_core 对同一配置重复跑 prepare_proxy_mode / verify_config。
@@ -2927,6 +2942,11 @@ _restart_core_body() {
     fi
   else
     start_core; _rc_start_rc=$?
+  fi
+  if [ -n "$_rc_saved_skip_ipv6" ]; then
+    MH_SKIP_IPV6=$_rc_saved_skip_ipv6
+  else
+    unset MH_SKIP_IPV6
   fi
   if [ "$_rc_start_rc" = "0" ]; then
     # Tproxy 模式（含普通重启时开关本来就是开的）：等规则真正装上再报成功，
@@ -10581,7 +10601,6 @@ case "$cmd" in
             config_fingerprint > "$TESTED" 2>/dev/null
           fi
         fi
-        system_ipv6_sync
         # 系统 IPv6 开↔关 = TPROXY 是否劫持 v6，立即对账装卸 v6 规则。放后台不
         # 阻塞返回：start_core 拉起后还会起 tproxy 对账循环、开关监听循环也会
         # 周期兜底，规则是收敛式的；同步串行跑 iptables（60~100 次调用，2~4 秒）
@@ -10606,19 +10625,22 @@ case "$cmd" in
         fi
         if [ "$_s6_running" = "1" ] && [ "$_s6_restart" = "1" ]; then
           echo "IPv6 相关配置已同步（$_s6_chg 项），正在重启服务…"
-          # 刚跑完 system_ipv6_sync（含 APN 侧）：start_core 里的例行再对账是纯
-          # 重复（还要再付一轮 APN 查询，会把写 pid 拖到数秒之后），跳过。
-          MH_SKIP_IPV6=1
-          export MH_SKIP_IPV6
+          # 在 restart_core 的安全预处理之后，把 sysctl/APN 同步与配置校验并行；
+          # start_core 会等同步完成后再拉起新核，避免串行等待且不改变生效顺序。
+          __MH_SYNC_IPV6_DURING_RESTART=1
           if ! restart_core; then
-            unset MH_SKIP_IPV6
+            unset __MH_SYNC_IPV6_DURING_RESTART
+            # lifecycle lock 忙时 restart_core 可能尚未进入主流程；补一次幂等系统同步。
+            system_ipv6_sync
             echo "ERR: $_s6_done，但服务重启失败，请检查配置后手动启动"
             exit 1
           fi
-          unset MH_SKIP_IPV6
+          unset __MH_SYNC_IPV6_DURING_RESTART
           echo "OK: $_s6_done，服务已重启"
           exit 0
         fi
+        # 未运行或无需重启时没有 start_core 可代办，直接同步系统/APN 状态。
+        system_ipv6_sync
         if [ "$_s6_running" = "1" ]; then
           echo "OK: $_s6_done；运行配置无变化，服务无需重启"
         else
