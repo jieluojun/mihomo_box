@@ -4647,8 +4647,46 @@ APN4_STATE=$RUNDIR/apn4.state
 APN4_CACHE=$RUNDIR/apn4.json      # apn4-json 的结果缓存（首行时间戳，次行 JSON）
 APN4_TTL=60                       # 缓存有效期（秒）：过期才重新拉起 content JVM
 APN4_LOG=$RUNDIR/apn4.log
+APN4_LOCK=$RUNDIR/apn4.lock              # 显式开关与 5s 对账循环可能并发触碰 APN
 APN4_RETRY_FILE=$RUNDIR/apn4.restore.retry  # 内容提供者暂时失败时限频重试（单调时钟厘秒）
 APN4_RETRY_COOL_CS=6000                   # 最多每 60s 重试一次，避免 5s 对账循环反复拉起 content
+
+# 显式切换 IPv6 会立即对账，后台 5s 监听循环也可能同时看到同一次翻转。
+# 串行化 APN 读改写与数据重连：后拿到锁的一方必须在锁内重新查询，通常会发现
+# APN 已到目标值，从而不再重复 content update / svc data disable-enable。
+apn4_lock_acquire() {
+  _a4l_wait=0
+  while ! mkdir "$APN4_LOCK" 2>/dev/null; do
+    _a4l_wait=$((_a4l_wait + 1))
+    _a4l_pid=$(cat "$APN4_LOCK/pid" 2>/dev/null)
+    case "$_a4l_pid" in ''|*[!0-9]*) _a4l_pid=0 ;; esac
+    if [ "$_a4l_pid" -gt 0 ]; then
+      if ! kill -0 "$_a4l_pid" 2>/dev/null; then
+        rm -rf "$APN4_LOCK" 2>/dev/null
+        continue
+      fi
+      [ "$_a4l_wait" -ge 50 ] && return 1   # 等活锁最多 10s，避免重入并发写 APN
+    else
+      # mkdir 与写入 pid 间有很短窗口；仅在持续等待 10 秒后回收无 pid 的锁。
+      if [ "$_a4l_wait" -ge 50 ]; then
+        rm -rf "$APN4_LOCK" 2>/dev/null
+        _a4l_wait=0
+        continue
+      fi
+    fi
+    nap 0.2
+  done
+  if ! printf '%s\n' "$$" > "$APN4_LOCK/pid" 2>/dev/null; then
+    rm -rf "$APN4_LOCK" 2>/dev/null
+    return 1
+  fi
+  return 0
+}
+
+apn4_lock_release() {
+  [ "$(cat "$APN4_LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$APN4_LOCK" 2>/dev/null
+  return 0
+}
 
 apn4_log() {
   printf '%s %s\n' "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$*" >> "$APN4_LOG" 2>/dev/null
@@ -4853,7 +4891,7 @@ apn4_reattach() {
 }
 
 # 「系统 IPv6=关」：把上网 APN 协议改成 IPv4（幂等；只写漂移的行）
-apn4_apply() {
+_apn4_apply_locked() {
   _aa_rows=$(apn4_rows)
   if [ -z "$_aa_rows" ]; then
     apn4_log "WARN 未查询到首选 APN，APN 未改写（可手动把 APN 协议设为 IPv4，效果相同）"
@@ -4890,9 +4928,18 @@ EOF
   return 0
 }
 
+# 公共入口持锁后再查询 APN，避免显式开关与周期监听并发触发两次重连。
+apn4_apply() {
+  apn4_lock_acquire || { apn4_log "WARN APN 对账锁忙，本轮跳过，等待下一次对账"; return 1; }
+  _a4a_rc=0
+  _apn4_apply_locked || _a4a_rc=$?
+  apn4_lock_release
+  return "$_a4a_rc"
+}
+
 # 「系统 IPv6=开」：按 run/apn4.state 还原 protocol/roaming_protocol
 # state 行格式：id|apn|origProtocol|origRoaming（有行失败则保留文件下次再试）
-apn4_restore() {
+_apn4_restore_locked() {
   [ -f "$APN4_STATE" ] || return 0
   _ar_changed=0
   _ar_fail=0
@@ -4920,6 +4967,14 @@ apn4_restore() {
     apn4_reattach
   fi
   return 0
+}
+
+apn4_restore() {
+  apn4_lock_acquire || { apn4_log "WARN APN 对账锁忙，本轮还原跳过，等待下一次对账"; return 1; }
+  _a4r_rc=0
+  _apn4_restore_locked || _a4r_rc=$?
+  apn4_lock_release
+  return "$_a4r_rc"
 }
 
 # 系统 IPv6 保持开启但 APN 还原失败时，保留状态并限频重试；显式开关翻转强制
