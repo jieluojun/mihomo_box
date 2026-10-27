@@ -442,6 +442,8 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
   };
   const apnLineText = j => {
     if (!j) return '首选 APN：读取失败';
+    if (j.deferred) return '首选 APN：正在更新，稍后自动刷新';
+    if (j.query_error) return '首选 APN：Provider 查询失败，请查看 APN 日志';
     if (!j.content) return '首选 APN：系统缺少 content 命令，无法读取';
     const items = Array.isArray(j.items) ? j.items : [];
     if (!items.length) return '首选 APN：未查询到（多卡/定制 ROM 可能如此）';

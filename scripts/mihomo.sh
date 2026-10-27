@@ -4973,12 +4973,16 @@ _apn4_rows_content_locked() {
     # 拿不到 SIM 状态：退回旧行为（1..4 全查），只求结果正确
     _a4_sims=4
     _apn4_fetch "content://telephony/carriers/preferapn $(i=1; while [ $i -le 4 ]; do printf 'content://telephony/carriers/preferapn/subId/%s ' $i; i=$((i+1)); done)"
+    if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then return 1; fi
+    [ "$_A4_NROWS" -gt 0 ] || [ "$_A4_QFAIL" -eq 0 ] || return 1
     return 0
   fi
   if [ "$_a4_sims" -le 1 ]; then
     _apn4_fetch "content://telephony/carriers/preferapn"
-    if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then return 0; fi
+    if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then return 1; fi
     [ "$_A4_NROWS" -gt 0 ] || [ "$_A4_QFAIL" -gt 0 ] || _apn4_fetch "content://telephony/carriers/preferapn/subId/1"
+    if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then return 1; fi
+    [ "$_A4_NROWS" -gt 0 ] || [ "$_A4_QFAIL" -eq 0 ] || return 1
     return 0
   fi
   _a4_uris=""
@@ -4990,8 +4994,10 @@ _apn4_rows_content_locked() {
   # 多卡时逐卡 URI 已覆盖实际首选 APN；只有 ROM 不支持 subId URI 时才退回默认 URI，
   # 避免正常情况下为同一张默认卡额外启动一个 content JVM。
   _apn4_fetch "$_a4_uris"
-  if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then return 0; fi
+  if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then return 1; fi
   [ "$_A4_NROWS" -gt 0 ] || [ "$_A4_QFAIL" -gt 0 ] || _apn4_fetch "content://telephony/carriers/preferapn"
+  if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then return 1; fi
+  [ "$_A4_NROWS" -gt 0 ] || [ "$_A4_QFAIL" -eq 0 ] || return 1
   return 0
 }
 
@@ -5214,7 +5220,7 @@ apn4_json() {
     # 不显示将被覆盖的旧缓存，也不排队启动 provider 查询；写完后调用方会刷新。
     _aj_cmd=1; command -v content >/dev/null 2>&1 || _aj_cmd=0
     _aj_taken=0; [ -f "$APN4_STATE" ] && _aj_taken=1
-    printf '{"ok":1,"content":%s,"taken":%s,"items":[]}\n' "$_aj_cmd" "$_aj_taken"
+    printf '{"ok":1,"content":%s,"taken":%s,"deferred":1,"items":[]}\n' "$_aj_cmd" "$_aj_taken"
     return 0
   fi
   if [ "$_aj_mode" = "cached" ]; then
@@ -5244,6 +5250,21 @@ apn4_json() {
   _aj_body=""
   _aj_first=1
   if [ "$_aj_cmd" = "1" ]; then
+    _aj_rows=$(apn4_rows)
+    _aj_rows_rc=$?
+    if [ "$_aj_rows_rc" != "0" ]; then
+      if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then
+        printf '{"ok":1,"content":%s,"taken":%s,"deferred":1,"items":[]}\n' "$_aj_cmd" "$_aj_taken"
+      else
+        rm -f "$APN4_CACHE" 2>/dev/null
+        printf '{"ok":1,"content":%s,"taken":%s,"query_error":1,"items":[]}\n' "$_aj_cmd" "$_aj_taken"
+      fi
+      return 0
+    fi
+    if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then
+      printf '{"ok":1,"content":%s,"taken":%s,"deferred":1,"items":[]}\n' "$_aj_cmd" "$_aj_taken"
+      return 0
+    fi
     while IFS='|' read -r _aj_id _aj_apn _aj_p _aj_r _aj_t; do
       [ -n "$_aj_id" ] || continue
       _aj_m=0
@@ -5255,12 +5276,8 @@ apn4_json() {
         "$(_apn4_json_esc "$_aj_p")" "$(_apn4_json_esc "$_aj_r")" \
         "$(_apn4_json_esc "$_aj_t")" "$_aj_m")"
     done <<EOF
-$(apn4_rows)
+$_aj_rows
 EOF
-    if [ "${APN4_CONTENT_WRITER:-0}" != 1 ] && apn4_content_write_pending; then
-      printf '{"ok":1,"content":%s,"taken":%s,"items":[]}\n' "$_aj_cmd" "$_aj_taken"
-      return 0
-    fi
   fi
   _aj_json=$(printf '{"ok":1,"content":%s,"taken":%s,"items":[%s]}' "$_aj_cmd" "$_aj_taken" "$_aj_body")
   _aj_now=$(date +%s 2>/dev/null)
