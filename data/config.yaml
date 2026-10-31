@@ -84,7 +84,7 @@ dns:
     - rule-set:排除域名
     - rule-set:大陆域名
   nameserver-policy:
-    rule-set:海外域名: 
+    rule-set:海外域名:
       - https://8.8.8.8/dns-query
     rule-set:大陆域名:
       - https://223.5.5.5/dns-query
@@ -134,7 +134,7 @@ proxy-providers:
   非免订阅:
     type: http
     <<: *providers
-    url: http://127.0.0.1
+    url:
     override: { additional-prefix: "非免订阅/", dialer-proxy: 链式代理 }
   非免节点:
     type: file
@@ -199,8 +199,8 @@ proxy-groups:
   - name: 中国
     type: select
     include-all: true
-    exclude-type: direct|Http
-    filter: "江苏|浙江|杭州|常州|南京|北京|上海|广东|广州|苏州|杭州|福州|扬州|贵州|兰州|徐州|郑州|广西|河南|河北|重庆|南宁|宿迁|沈阳|四川|安徽|深圳|辽宁|济南|九江|长沙|昆明|武汉|陕西|西宁|芜湖|天津|南昌|成都|山西|太原|保定|湖南|湖北|德阳|山东|十堰|青岛|合肥|云南|西安|内蒙古"
+    exclude-type: direct|Http|Cns
+    filter: 江苏|浙江|杭州|常州|南京|北京|上海|广东|广州|苏州|杭州|福州|扬州|贵州|兰州|徐州|郑州|广西|河南|河北|重庆|南宁|宿迁|沈阳|四川|安徽|深圳|辽宁|济南|九江|长沙|昆明|武汉|陕西|西宁|芜湖|天津|南昌|成都|山西|太原|保定|湖南|湖北|德阳|山东|十堰|青岛|合肥|云南|西安|内蒙古|青海
     icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/CN.png
 
   - name: 香港
@@ -235,7 +235,7 @@ proxy-groups:
     type: select
     include-all: true
     exclude-type: direct
-    filter: "(?i)(新|sg|singapore)"
+    filter: "(?i)新|sg|singapore"
     icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/SG.png
 
   - name: 美国
@@ -249,8 +249,7 @@ proxy-groups:
     type: select
     include-all: true
     exclude-type: direct|dns
-    filter: "(?i)^(?!.*(?:🇭🇰|🇨🇳|🇯🇵|🇰🇷|🇸🇬|🇺🇸|港|hk|hongkong|台|tw|taiwan|日|jp|japan|韩|kr|korea|新|sg|singapore|美|us|unitedstates)).*"
-    exclude-filter: "官网|剩余|到期|江苏|浙江|杭州|常州|南京|北京|上海|广东|广州|苏州|杭州|福州|扬州|贵州|兰州|徐州|郑州|广西|河南|河北|重庆|南宁|宿迁|沈阳|四川|安徽|深圳|辽宁|济南|九江|长沙|昆明|武汉|陕西|西宁|芜湖|天津|南昌|成都|山西|太原|保定|湖南|湖北|德阳|山东|十堰|青岛|合肥|云南|西安|内蒙古"
+    exclude-filter: "(?i)🇭🇰|🇨🇳|🇯🇵|🇰🇷|🇸🇬|🇺🇸|港|hk|hongkong|台|tw|taiwan|日|jp|japan|韩|kr|korea|新|sg|singapore|美|us|unitedstates|江苏|浙江|杭州|常州|南京|北京|上海|广东|广州|苏州|杭州|福州|扬州|贵州|兰州|徐州|郑州|广西|河南|河北|重庆|南宁|宿迁|沈阳|四川|安徽|深圳|辽宁|济南|九江|长沙|昆明|武汉|陕西|西宁|芜湖|天津|南昌|成都|山西|太原|保定|湖南|湖北|德阳|山东|十堰|青岛|合肥|云南|西安|内蒙古|青海"
     icon: https://fastly.jsdelivr.net/gh/Orz-3/mini@master/Color/XD.png
 
 域名集: &domain { type: http, interval: 86400, proxy: 订阅更新, behavior: domain, format: mrs }
@@ -284,7 +283,7 @@ rules:
   - AND,(NETWORK,UDP),(OR,(DST-PORT,443/3478/5349/19302),(RULE-SET,本机地址)),REJECT
   - DOMAIN-REGEX,(wswup.cdn.huya.com)|(cdnws.api.huya.com)|(p2p)|(stun)|(pcdn)|(mcdn)|(torrent)|(tracker)|(httpdns),REJECT-DROP
   - RULE-SET,广告域名,广告出口
-  - RULE-SET,海外域名,国外出口 
+  - RULE-SET,海外域名,国外出口
   - AND,(NETWORK,UDP),(PROCESS-NAME-REGEX,(com.tencent.tmgp.sgame)|(com.tencent.tmgp.cf)),游戏UDP
   - NETWORK,UDP,全部UDP
   - RULE-SET,大陆域名,国内出口
