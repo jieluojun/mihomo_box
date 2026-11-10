@@ -4,6 +4,12 @@ WORKDIR=/data/adb/mihomo_box
 if [ -d "$WORKDIR" ]; then
   mkdir -p "$WORKDIR/run" 2>/dev/null
 
+  # 软重启不会杀掉 detach 到根 cgroup 的 mihomo；先通过主脚本按 core/ 绝对路径
+  # 清除上一会话残留，再移除 core.pid，防止 service.sh 看见旧进程而误判「已运行」。
+  if [ -f "$WORKDIR/scripts/mihomo.sh" ]; then
+    sh "$WORKDIR/scripts/mihomo.sh" core-sweep-stale >/dev/null 2>&1
+  fi
+
   # ⚠ 重启后上一次会话的「已装规则」状态全部失效：内核的 iptables / ip rule /
   # sysctl 已回到出厂态，但 run/ 里的状态文件还在。对账逻辑（_tunhs_sync_body /
   # _tproxy_sync_body）看到 ver=3 的旧状态、且网卡名/参数恰好没变时会「无变化
@@ -32,8 +38,7 @@ if [ -d "$WORKDIR" ]; then
   # 在这里清掉，各服务后续写下的都是本会话的真 pid。
   # ⚠ 例外：热重启（软重启）不满足「上一会话的进程早已不存在」——冷重启进程
   # 必死，热重启只重启框架层，detach 到根 cgroup 的内核/httpd/监听循环都活着。
-  # 这里的 pid 清理只管「pid 数字被复用」的误判问题；活着的残留内核由
-  # start_core/stop_core 的 core_sweep_stale（按 core/ 路径扫 /proc）负责清掉，
+  # 上方先调用 core_sweep_stale 清理旧内核；下面再清 PID，避免 service.sh 短路。
   # httpd 由 web_kill_port_holder、监听循环由 switch_sweep 各自防重入。
   # netmatch.state 同理必须按会话清理：网络匹配的 tick 按「上轮状态 ≠ 本轮状态」
   # 决定是否动作，而开机自启不看网络匹配、无条件拉起内核。若上一会话停在
