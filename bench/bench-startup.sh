@@ -163,6 +163,41 @@ command -v "$CC" >/dev/null 2>&1 || { echo "缺少 C 编译器（$CC），无法
 chmod 755 "$WORKDIR/core/mihomo-jieluojun"
 for n in mihomo-liuran001 mihomo-official; do cp "$WORKDIR/core/mihomo-jieluojun" "$WORKDIR/core/$n"; done
 
+# 回归：core.pid 只指向一份内核时，停止也必须扫描并清理同模块的额外实例。
+echo "· 残留清理回归（PID 文件之外的第二个同模块内核）"
+"$WORKDIR/core/mihomo-jieluojun" --port "$PORT" >/dev/null 2>&1 &
+_SWEEP_PID1=$!
+_SWEEP_PORT2=$((PORT + 1))
+"$WORKDIR/core/mihomo-jieluojun" --port "$_SWEEP_PORT2" >/dev/null 2>&1 &
+_SWEEP_PID2=$!
+sleep 0.2
+printf '%s\n' "$_SWEEP_PID1" > "$WORKDIR/run/core.pid"
+if ! $MH stop >/dev/null 2>&1; then
+  echo "  ✗ stop 在清理残留进程时失败" >&2
+  exit 1
+fi
+wait "$_SWEEP_PID1" 2>/dev/null || :
+wait "$_SWEEP_PID2" 2>/dev/null || :
+if kill -0 "$_SWEEP_PID1" 2>/dev/null || kill -0 "$_SWEEP_PID2" 2>/dev/null; then
+  echo "  ✗ 清理后仍有假内核存活" >&2
+  exit 1
+fi
+echo "  ✓ 两个假内核均已停止"
+
+# 安全回归：相同 comm 但可执行文件不在本模块目录时，不得误杀其他模块进程。
+mkdir -p "$TMP/foreign"
+cp "$WORKDIR/core/mihomo-jieluojun" "$TMP/foreign/mihomo-jieluojun"
+"$TMP/foreign/mihomo-jieluojun" --port "$((PORT + 2))" >/dev/null 2>&1 &
+_SWEEP_FOREIGN=$!
+sleep 0.2
+if ! $MH core-sweep-stale >/dev/null 2>&1 || ! kill -0 "$_SWEEP_FOREIGN" 2>/dev/null; then
+  echo "  ✗ 清理误杀或未能保留外部路径的同名进程" >&2
+  exit 1
+fi
+kill "$_SWEEP_FOREIGN" 2>/dev/null || :
+wait "$_SWEEP_FOREIGN" 2>/dev/null || :
+echo "  ✓ 外部路径同名进程未被误杀"
+
 # ---- 场景 ----
 # run_case <名字> <期望: up|down> <每轮准备命令|-> <命令...>
 #   每轮都会：清掉上一轮的假内核 → 执行准备命令（清缓存/改配置）→ 计时跑一遍。

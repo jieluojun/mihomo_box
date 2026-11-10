@@ -2506,43 +2506,44 @@ prepare_proxy_mode() {
 # 匹配以完整内核路径为准，防止误杀：cmdline 以内核路径开头（裸启动形态），或含
 # setuidgid / setsid / nohup 包装器及内核路径。部分 BusyBox setuidgid 不 exec，
 # 因此也要检查 comm 为 busybox 的候选；包装器候选仍需完整 cmdline 路径匹配。
-# 实现：纯内建读 /proc（零 fork）。
-#   · 先读 comm（<=15 字节）：mihomo* 与已知 BusyBox / setsid / nohup 包装器通过；
-#     再按完整 cmdline 路径严格过滤；
-#   · 每种内核名长度不同，comm 被截断也没关系（只看前缀）。
+# 扫描先用内建 read 读 comm，只有 Mihomo / 已知包装器候选才调用 readlink 并核对
+# 完整模块 core 路径；既覆盖包装启动，也避免按进程名误杀其他模块。
 # 为什么不用 pgrep：Android 的 toybox pgrep -f 要对每个进程做完整 cmdline 匹配，
-# 慢设备上单次 30~80ms，而这段代码在每次 start/stop 的关键路径上；系统缺 pgrep
-# 时的旧兜底更是逐进程 fork 一个 tr（300+ 次 fork，秒级）。全内建扫一遍约 300 次
-# read，通常 <20ms。
+# 慢设备上单次 30~80ms；这里对绝大多数系统进程只读 comm，路径核验仅发生在少量候选上。
+core_pid_is_module_proc() {
+  _cpim_pid=$1
+  case "$_cpim_pid" in ''|*[!0-9]*) return 1 ;; esac
+  _cpim_p="/proc/$_cpim_pid"
+  [ -r "$_cpim_p/comm" ] || return 1
+  _cpim_comm=""
+  IFS= read -r _cpim_comm 2>/dev/null < "$_cpim_p/comm" || return 1
+  # 只检查 Mihomo 本体和已知启动包装器；候选仍须精确命中模块 core 路径。
+  case "$_cpim_comm" in mihomo*|busybox|setsid|nohup) ;; *) return 1 ;; esac
+  _cpim_exe=""
+  if command -v readlink >/dev/null 2>&1; then
+    _cpim_exe=$(readlink "$_cpim_p/exe" 2>/dev/null)
+    case "$_cpim_exe" in
+      "$COREDIR"/mihomo-*|"$MODDIR"/core/mihomo-*) return 0 ;;
+    esac
+  fi
+  _cpim_cmd=""
+  IFS= read -r _cpim_cmd 2>/dev/null < "$_cpim_p/cmdline" || return 1
+  case "$_cpim_cmd" in
+    "$COREDIR"/mihomo-*|"$MODDIR"/core/mihomo-*) return 0 ;;
+    *setuidgid*"$COREDIR"/mihomo-*|*setuidgid*"$MODDIR"/core/mihomo-*) return 0 ;;
+    *setsid*"$COREDIR"/mihomo-*|*setsid*"$MODDIR"/core/mihomo-*) return 0 ;;
+    *nohup*"$COREDIR"/mihomo-*|*nohup*"$MODDIR"/core/mihomo-*) return 0 ;;
+  esac
+  return 1
+}
+
 core_stale_pids() {
   _csp_out=""
   for _csp_p in /proc/[0-9]*; do
     _csp_n=${_csp_p#/proc/}
     [ "$_csp_n" = "$$" ] && continue
-    _csp_comm=""
-    IFS= read -r _csp_comm 2>/dev/null < "$_csp_p/comm" || continue
-    # BusyBox setuidgid 的部分版本不 exec，被包装的内核实际 comm 仍是 busybox；
-    # 因此也检查少量已知启动包装器，再用完整 cmdline 路径严格确认，避免误杀。
-    case "$_csp_comm" in mihomo*|busybox|setsid|nohup) ;; *) continue ;; esac
-    _csp_is_core=0
-    _csp_exe=""
-    if command -v readlink >/dev/null 2>&1; then
-      _csp_exe=$(readlink "$_csp_p/exe" 2>/dev/null)
-      case "$_csp_exe" in
-        "$COREDIR"/mihomo-*|"$MODDIR"/core/mihomo-*) _csp_is_core=1 ;;
-      esac
-    fi
-    if [ "$_csp_is_core" != "1" ]; then
-      _csp_cmd=""
-      IFS= read -r _csp_cmd 2>/dev/null < "$_csp_p/cmdline" || continue
-      case "$_csp_cmd" in
-        "$COREDIR"/mihomo-*|"$MODDIR"/core/mihomo-*) _csp_is_core=1 ;;
-        *setuidgid*"$COREDIR"/mihomo-*|*setuidgid*"$MODDIR"/core/mihomo-*) _csp_is_core=1 ;;
-        *setsid*"$COREDIR"/mihomo-*|*setsid*"$MODDIR"/core/mihomo-*) _csp_is_core=1 ;;
-        *nohup*"$COREDIR"/mihomo-*|*nohup*"$MODDIR"/core/mihomo-*) _csp_is_core=1 ;;
-      esac
-    fi
-    [ "$_csp_is_core" = "1" ] || continue
+    core_pid_is_module_proc "$_csp_n" || continue
+    pid_is_live "$_csp_n" || continue
     _csp_out="$_csp_out $_csp_n"
   done
   _csp_out=${_csp_out# }
@@ -2552,17 +2553,26 @@ core_stale_pids() {
 
 core_sweep_stale() {
   _css_pids=$(core_stale_pids)
-  [ -n "$_css_pids" ] || return 0
-  echo "WARN: 检测到热重启残留的内核进程 (pid:$_css_pids)，先清理再继续"
-  kill $_css_pids 2>/dev/null
-  # 0.8s 预算（与 _stop_core_body 的 TERM→KILL 上限一致）等旧内核退出，
-  # 以 now_cs 真实时钟为准（nap 在 ceil 模式每轮睡 1s，不能按轮数推算）
+  if [ -z "$_css_pids" ]; then
+    # 即使初次扫描为空也复查一次，避免启动器恰好在首轮扫描边界出现。
+    _css_left=$(core_stale_pids)
+    [ -z "$_css_left" ] && return 0
+    _css_pids=$_css_left
+  fi
+  echo "WARN: 检测到本模块 Mihomo 进程 (pid:$_css_pids)，先清理再继续"
+  # 信号发送前再次验明身份，避免 PID 在扫描后被复用时误杀无关进程。
+  for _css_pid in $_css_pids; do
+    core_pid_is_module_proc "$_css_pid" && kill "$_css_pid" 2>/dev/null
+  done
+  # 0.8s 预算（与 _stop_core_body 的 TERM→KILL 上限一致）等待进程退出。
   now_cs
   if [ "$NOW_CS" -gt 0 ]; then _css_dl=$((NOW_CS + 80)); else _css_dl=0; fi
   _css_ticks=0
   while :; do
     _css_alive=0
-    for _css_pid in $_css_pids; do pid_is_live "$_css_pid" && _css_alive=1; done
+    for _css_pid in $_css_pids; do
+      core_pid_is_module_proc "$_css_pid" && pid_is_live "$_css_pid" && _css_alive=1
+    done
     [ "$_css_alive" = "0" ] && break
     [ "$_css_dl" = "0" ] && [ "$_css_ticks" -ge 16 ] && break
     if [ "$_css_dl" != "0" ]; then
@@ -2572,19 +2582,29 @@ core_sweep_stale() {
     nap 0.05; _css_ticks=$((_css_ticks + 1))
   done
   _css_alive=0
-  for _css_pid in $_css_pids; do pid_is_live "$_css_pid" && _css_alive=1; done
+  for _css_pid in $_css_pids; do
+    core_pid_is_module_proc "$_css_pid" && pid_is_live "$_css_pid" && _css_alive=1
+  done
   if [ "$_css_alive" = "1" ]; then
-    kill -9 $_css_pids 2>/dev/null
-    # SIGKILL 后短暂等它真正消失（端口随进程死亡释放），不让新内核撞上 bind
+    # SIGKILL 前再核对身份，绝不把已经复用的 PID 当成旧内核杀掉。
+    for _css_pid in $_css_pids; do
+      core_pid_is_module_proc "$_css_pid" && pid_is_live "$_css_pid" && kill -9 "$_css_pid" 2>/dev/null
+    done
     _css_ticks=0
-    while :; do
+    while [ "$_css_ticks" -lt 8 ]; do
       _css_alive=0
-      for _css_pid in $_css_pids; do pid_is_live "$_css_pid" && _css_alive=1; done
+      for _css_pid in $_css_pids; do
+        core_pid_is_module_proc "$_css_pid" && pid_is_live "$_css_pid" && _css_alive=1
+      done
       [ "$_css_alive" = "0" ] && break
-      [ "$_css_ticks" -ge 8 ] && break
       nap 0.05; _css_ticks=$((_css_ticks + 1))
     done
-    echo "WARN: 残留内核未响应 SIGTERM，已 SIGKILL (pid:$_css_pids)"
+  fi
+  # 最终重新枚举，而不是仅检查首轮 PID；残留时 fail closed，禁止后续启动第二份。
+  _css_left=$(core_stale_pids)
+  if [ -n "$_css_left" ]; then
+    echo "ERR: 本模块 Mihomo 进程仍未退出 (pid:$_css_left)，拒绝启动新实例"
+    return 1
   fi
   return 0
 }
@@ -2608,7 +2628,8 @@ _start_core_body() {
   # 热重启（软重启）防双实例：core.pid 已被 post-fs-data.sh 清掉，但上一会话的
   # 内核在热重启里不会死——按 core/ 路径扫 /proc，有残留先杀干净再拉新。
   # 无残留时 pgrep 一次即返回，代价可忽略；校验/端口检查都在其后，时序安全。
-  core_sweep_stale
+  # 清理不确认成功时绝不能继续拉起新进程，否则会把旧核和新核叠在一起。
+  core_sweep_stale || return 1
   if [ "${__MH_INTERNAL_RESTART_PREPARED:-0}" != "1" ]; then
     action_mark mode_begin
     prepare_proxy_mode || return 1
@@ -2827,42 +2848,49 @@ _stop_core_body() {
   rm -f "$RUNDIR/starting" 2>/dev/null
   if running; then
     pid=$(pid_of)
-    action_mark stop_signal
-    kill "$pid" 2>/dev/null
-    # 非重启先摘 TProxy 跳转，同时等待内核退出，避免流量继续指向死端口。
-    ( [ "$_st_keep" != "keep" ] && [ -f "$TP_STATE" ] && tproxy_unhook_quick ) >/dev/null 2>&1 &
-    _st_unhook_pid=$!
-    _st_ticks=0
-    # 0.8s 上限以 now_cs 真实时钟为准：SIGTERM 后内核正常 0.2~0.6s 退出，
-    # 超时补 SIGKILL（nap 在 ceil 模式每轮睡 1s，不能按轮数推算时长）
-    now_cs
-    if [ "$NOW_CS" -gt 0 ]; then _st_dl=$((NOW_CS + 80)); else _st_dl=0; fi
-    while pid_is_live "$pid"; do
-      [ "$_st_dl" = "0" ] && [ "$_st_ticks" -ge 16 ] && break
-      if [ "$_st_dl" != "0" ]; then
-        now_cs
-        [ "$NOW_CS" -ge "$_st_dl" ] && break
+    if core_pid_is_module_proc "$pid"; then
+      action_mark stop_signal
+      kill "$pid" 2>/dev/null
+      # 非重启先摘 TProxy 跳转，同时等待内核退出，避免流量继续指向死端口。
+      ( [ "$_st_keep" != "keep" ] && [ -f "$TP_STATE" ] && tproxy_unhook_quick ) >/dev/null 2>&1 &
+      _st_unhook_pid=$!
+      _st_ticks=0
+      # 0.8s 上限以 now_cs 真实时钟为准：SIGTERM 后内核正常 0.2~0.6s 退出，
+      # 超时补 SIGKILL（nap 在 ceil 模式每轮睡 1s，不能按轮数推算时长）
+      now_cs
+      if [ "$NOW_CS" -gt 0 ]; then _st_dl=$((NOW_CS + 80)); else _st_dl=0; fi
+      while pid_is_live "$pid"; do
+        [ "$_st_dl" = "0" ] && [ "$_st_ticks" -ge 16 ] && break
+        if [ "$_st_dl" != "0" ]; then
+          now_cs
+          [ "$NOW_CS" -ge "$_st_dl" ] && break
+        fi
+        # 前 200ms 用 20ms 粒度：内核收到 SIGTERM 普遍在 0.2~0.6s 内退出，
+        # 50ms 粒度在「重载」里平均多等 25ms、最坏 50ms，白付在每一次重启上。
+        if [ "$_st_ticks" -lt 10 ]; then nap 0.02; else nap 0.05; fi
+        _st_ticks=$((_st_ticks + 1))
+      done
+      # PID 可能已退出并被系统复用；SIGKILL 前必须再次确认仍是本模块内核。
+      if pid_is_live "$pid" && core_pid_is_module_proc "$pid"; then
+        kill -9 "$pid" 2>/dev/null
       fi
-      # 前 200ms 用 20ms 粒度：内核收到 SIGTERM 普遍在 0.2~0.6s 内退出，
-      # 50ms 粒度在「重载」里平均多等 25ms、最坏 50ms，白付在每一次重启上。
-      if [ "$_st_ticks" -lt 10 ]; then nap 0.02; else nap 0.05; fi
-      _st_ticks=$((_st_ticks + 1))
-    done
-    if pid_is_live "$pid"; then
-      kill -9 "$pid" 2>/dev/null
+      action_mark core_stopped
+      wait "$_st_unhook_pid" 2>/dev/null
+      action_mark unhook_done
+      _st_unhook_done=1
+    else
+      echo "WARN: core.pid=$pid 不再指向本模块 Mihomo，跳过该 PID，避免误杀无关进程"
     fi
-    action_mark core_stopped
-    wait "$_st_unhook_pid" 2>/dev/null
-    action_mark unhook_done
-    _st_unhook_done=1
-    rm -f "$PIDFILE"
   fi
   # 兜底清理：正常路径 1 秒内已退出，无残留；但热重启后 core.pid 已被
   # post-fs-data.sh 清掉而旧内核还活着——running 为假也必须按 /proc 扫一遍，
   # 否则「停止」对残留实例完全失效（表现为关了开关流量仍被旧内核接管）。
   # core_sweep_stale 按 core/ 路径匹配 cmdline，裸内核与 Tproxy 模式下经
   # busybox setuidgid 0:3005 包装启动（cmdline 以 busybox 开头）都能命中。
-  core_sweep_stale
+  core_sweep_stale || {
+    echo "ERR: 内核进程未全部退出，停止/重启已中止"
+    return 1
+  }
   rm -f "$PIDFILE"
   if [ "$_st_keep" = "keep" ]; then
     :   # 重启：规则留给 start_core 对账
@@ -2938,7 +2966,12 @@ _restart_core_body() {
     ( tproxy_sync ) </dev/null >/dev/null 2>&1 &
     action_mark tproxy_disabled
   fi
-  running && stop_core keep >/dev/null
+  if running; then
+    if ! stop_core keep >/dev/null; then
+      echo "ERR: 旧内核未能完全停止，取消重启以避免双实例"
+      return 1
+    fi
+  fi
   _rc_saved_skip_ipv6=${MH_SKIP_IPV6-}
   if [ "${__MH_SYNC_IPV6_DURING_RESTART:-0}" = "1" ]; then MH_SKIP_IPV6=1; fi
   if [ -z "$_rc_mode" ]; then

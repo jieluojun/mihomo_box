@@ -821,8 +821,11 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
               // 本机内核在 IPv6 下起不来时后端只开系统协议栈、不改配置并回 WARN，
               // toast 必须照实说，不能继续报「配置已同步」
               const skipped = /代理维持仅 IPv4/.test(out);
-              const tail = skipped ? '，本机无法在 IPv6 下接管流量，代理维持仅 IPv4'
-                : /服务已重启/.test(out) ? '，配置已同步，服务已重启'
+              const serviceRestarted = /服务已重启/.test(out);
+              const tail = skipped
+                ? '，本机无法在 IPv6 下接管流量，代理维持仅 IPv4' + (serviceRestarted ? '，服务已重启'
+                  : /服务未运行/.test(out) ? '，服务未运行，下次启动生效' : '，服务无需重启')
+                : serviceRestarted ? '，配置已同步，服务已重启'
                   : /服务无需重启/.test(out) ? '，运行配置无变化，无需重启服务'
                     : /服务未运行/.test(out) ? '，配置已同步（服务未运行，下次启动生效）' : '，配置已同步';
               // 服务确实重启了＝提示等新核起表那一帧；没重启（服务未运行等）就立刻弹。
