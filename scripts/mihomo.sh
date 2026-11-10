@@ -5270,9 +5270,10 @@ cfg_top_ipv6() {
     }' "$CONFIG" 2>/dev/null
 }
 
-# 本机能不能在 IPv6 下接管（TUN / eBPF）。返回 1 ＝ 上次已证明不行：
+# 本机能不能在 IPv6 下接管（TUN / eBPF）。返回 1 ＝上次已证明不行：
 # 内核（版本 + 内核路径都相同）在这个配置下起不来 TUN/eBPF 入站，换了内核或
-# 修好后自动失效（key 变了）。
+# 修好后自动失效（key 变了）。此标记只抑制自动重复尝试；用户显式开启系统 IPv6
+# 时会清除标记并重新尝试，失败后仍由 ipv6_proxy_guard 再次保护性回退。
 ipv6_proxy_capable() {
   [ -f "$IPV6_PFAIL" ] || return 0
   _ipc_saved=$(cat "$IPV6_PFAIL" 2>/dev/null)
@@ -5294,8 +5295,8 @@ ipv6_proxy_capable() {
 #
 # 处置：发现「配置要 TUN/eBPF 却没起来」时，把**代理侧**的 4 个 v6 开关改回 false
 # （系统协议栈、APN 都不动，系统 IPv6 仍然是开的），记下证据后重启一次。
-# 之后用户再开关系统 IPv6 时，ipv6_proxy_capable 会短路，不再把配置改回 v6，
-# 避免「每切一次就再失败一次」。
+# 失败标记阻止后台自动循环重试；用户明确再次开启系统 IPv6 时清除标记并重试，
+# 若仍失败，本守卫会重新回退并记录原因，不把一次历史失败永久变成无提示的配置锁。
 ipv6_proxy_guard() {
   [ "$(get_setting system_ipv6 false)" = "true" ] || return 0
   [ "$(cfg_top_ipv6)" = "true" ] || return 0
@@ -10662,6 +10663,14 @@ case "$cmd" in
         # start_core 的 verify_config 命中缓存跳过整轮 mihomo -t。大配置每轮
         # 1~3 秒起步，带远程 provider 的还得在线拉取，是「开关系统 IPv6 要等很久」
         # 最大的一截。改前没校验过的一律照旧真跑，不给手术护短。
+        # 显式开启是用户要求重新尝试，不应被同一内核路径下的历史失败标记永久锁住。
+        # 清除标记后仍会由 ipv6_proxy_guard 实测；若 TUN/eBPF 再次失败，它会回退配置并重建标记。
+        if [ "$_s6_v" = "true" ] && [ -f "$IPV6_PFAIL" ]; then
+          if rm -f "$IPV6_PFAIL" 2>/dev/null; then
+            printf '%s 用户显式开启系统 IPv6：清除历史失败标记，重新尝试代理侧 IPv6\n' \
+              "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" >> "$IPV6_PLOG" 2>/dev/null
+          fi
+        fi
         _s6_fp0=$(config_fingerprint)
         _s6_skip=0
         if [ "$_s6_v" = "true" ] && ! ipv6_proxy_capable; then
