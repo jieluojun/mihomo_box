@@ -2503,14 +2503,12 @@ prepare_proxy_mode() {
 # 代理不通」。因此启动/停止都要按 /proc cmdline 扫一遍本模块内核（core/ 下三种
 # 内核名都算，裸启动与 busybox setuidgid 包装启动都能命中），有残留先杀干净——
 # 启动幂等，热重启多少次也只会有一个内核实例。
-# 匹配语义与旧版 _stop_core_body 兜底清扫一致（锚定，防止误杀）：cmdline 以内核
-# 路径开头（setsid exec 后的裸启动形态），或含「setuidgid <uid:gid> 内核路径」
-# （Tproxy 模式的 busybox 包装形态，个别 busybox 版本 setuidgid 不 exec、路径
-# 留在参数里）。仅是「参数文本里引用了内核路径」的无关进程不会被误杀。
+# 匹配以完整内核路径为准，防止误杀：cmdline 以内核路径开头（裸启动形态），或含
+# setuidgid / setsid / nohup 包装器及内核路径。部分 BusyBox setuidgid 不 exec，
+# 因此也要检查 comm 为 busybox 的候选；包装器候选仍需完整 cmdline 路径匹配。
 # 实现：纯内建读 /proc（零 fork）。
-#   · 先读 comm（<=15 字节，内核只保留文件名前缀）：三种内核名都以 mihomo- 开头，
-#     一次读就能筛掉 99% 的无关进程，且不需要 pgrep；
-#   · comm 命中后再读 cmdline 核对 $COREDIR 路径，避免误杀同名无关进程；
+#   · 先读 comm（<=15 字节）：mihomo* 与已知 BusyBox / setsid / nohup 包装器通过；
+#     再按完整 cmdline 路径严格过滤；
 #   · 每种内核名长度不同，comm 被截断也没关系（只看前缀）。
 # 为什么不用 pgrep：Android 的 toybox pgrep -f 要对每个进程做完整 cmdline 匹配，
 # 慢设备上单次 30~80ms，而这段代码在每次 start/stop 的关键路径上；系统缺 pgrep
@@ -2523,14 +2521,28 @@ core_stale_pids() {
     [ "$_csp_n" = "$$" ] && continue
     _csp_comm=""
     IFS= read -r _csp_comm 2>/dev/null < "$_csp_p/comm" || continue
-    case "$_csp_comm" in mihomo-*) ;; *) continue ;; esac
-    _csp_cmd=""
-    IFS= read -r _csp_cmd 2>/dev/null < "$_csp_p/cmdline" || continue
-    case "$_csp_cmd" in
-      "$COREDIR/mihomo-"*) ;;
-      *"setuidgid"*"$COREDIR/mihomo-"*) ;;
-      *) continue ;;
-    esac
+    # BusyBox setuidgid 的部分版本不 exec，被包装的内核实际 comm 仍是 busybox；
+    # 因此也检查少量已知启动包装器，再用完整 cmdline 路径严格确认，避免误杀。
+    case "$_csp_comm" in mihomo*|busybox|setsid|nohup) ;; *) continue ;; esac
+    _csp_is_core=0
+    _csp_exe=""
+    if command -v readlink >/dev/null 2>&1; then
+      _csp_exe=$(readlink "$_csp_p/exe" 2>/dev/null)
+      case "$_csp_exe" in
+        "$COREDIR"/mihomo-*|"$MODDIR"/core/mihomo-*) _csp_is_core=1 ;;
+      esac
+    fi
+    if [ "$_csp_is_core" != "1" ]; then
+      _csp_cmd=""
+      IFS= read -r _csp_cmd 2>/dev/null < "$_csp_p/cmdline" || continue
+      case "$_csp_cmd" in
+        "$COREDIR"/mihomo-*|"$MODDIR"/core/mihomo-*) _csp_is_core=1 ;;
+        *setuidgid*"$COREDIR"/mihomo-*|*setuidgid*"$MODDIR"/core/mihomo-*) _csp_is_core=1 ;;
+        *setsid*"$COREDIR"/mihomo-*|*setsid*"$MODDIR"/core/mihomo-*) _csp_is_core=1 ;;
+        *nohup*"$COREDIR"/mihomo-*|*nohup*"$MODDIR"/core/mihomo-*) _csp_is_core=1 ;;
+      esac
+    fi
+    [ "$_csp_is_core" = "1" ] || continue
     _csp_out="$_csp_out $_csp_n"
   done
   _csp_out=${_csp_out# }
@@ -10332,6 +10344,7 @@ case "$cmd" in
     lifecycle_action_json "$cmd" "$@"; exit 0 ;;
   _lifecycle-tail)
     sync_state_desc >/dev/null 2>&1; exit 0 ;;
+  core-sweep-stale) core_sweep_stale ;;
   action-trace)
     cat "$RUNDIR/action-latest.trace" 2>/dev/null ;;
   # 管理器「运行」按钮（action.sh）：一个进程内完成 监听/面板保活 + 切换内核 +
@@ -10505,6 +10518,10 @@ case "$cmd" in
     # service.sh 只调用一次本命令：每多调一次 `sh mihomo.sh` 都要重新解析
     # 一份 9000+ 行的脚本，慢设备上单次 100~200ms，纯属白付。
     action_clock; MH_ACTION_BEGIN=$ACTION_MS
+    # 软重启可能不重新执行 post-fs-data，且残留 core.pid 会让 start_core 的
+    # running() 快速路径误认旧内核为本轮服务；在 boot 入口无条件清旧核再启动。
+    core_sweep_stale
+    action_mark boot_stale_core_swept
     # 面板先于一切拉起：面板只是一个 HTTP 服务，不依赖内核、IPv6 或网络。
     # 系统 IPv6 对账（含 APN 协议改写，真机上要 fork 十几次 settings/ip 命令，
     # 首次接管可达数百毫秒）排在它后面 —— 否则开机后要多等这一整段才能打开面板。
