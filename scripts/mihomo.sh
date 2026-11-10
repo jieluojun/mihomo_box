@@ -2503,14 +2503,12 @@ prepare_proxy_mode() {
 # 代理不通」。因此启动/停止都要按 /proc cmdline 扫一遍本模块内核（core/ 下三种
 # 内核名都算，裸启动与 busybox setuidgid 包装启动都能命中），有残留先杀干净——
 # 启动幂等，热重启多少次也只会有一个内核实例。
-# 匹配语义与旧版 _stop_core_body 兜底清扫一致（锚定，防止误杀）：cmdline 以内核
-# 路径开头（setsid exec 后的裸启动形态），或含「setuidgid <uid:gid> 内核路径」
-# （Tproxy 模式的 busybox 包装形态，个别 busybox 版本 setuidgid 不 exec、路径
-# 留在参数里）。仅是「参数文本里引用了内核路径」的无关进程不会被误杀。
+# 匹配以完整内核路径为准，防止误杀：cmdline 以内核路径开头（裸启动形态），或含
+# setuidgid / setsid / nohup 包装器及内核路径。部分 BusyBox setuidgid 不 exec，
+# 因此也要检查 comm 为 busybox 的候选；包装器候选仍需完整 cmdline 路径匹配。
 # 实现：纯内建读 /proc（零 fork）。
-#   · 先读 comm（<=15 字节，内核只保留文件名前缀）：三种内核名都以 mihomo- 开头，
-#     一次读就能筛掉 99% 的无关进程，且不需要 pgrep；
-#   · comm 命中后再读 cmdline 核对 $COREDIR 路径，避免误杀同名无关进程；
+#   · 先读 comm（<=15 字节）：mihomo* 与已知 BusyBox / setsid / nohup 包装器通过；
+#     再按完整 cmdline 路径严格过滤；
 #   · 每种内核名长度不同，comm 被截断也没关系（只看前缀）。
 # 为什么不用 pgrep：Android 的 toybox pgrep -f 要对每个进程做完整 cmdline 匹配，
 # 慢设备上单次 30~80ms，而这段代码在每次 start/stop 的关键路径上；系统缺 pgrep
@@ -2523,12 +2521,16 @@ core_stale_pids() {
     [ "$_csp_n" = "$$" ] && continue
     _csp_comm=""
     IFS= read -r _csp_comm 2>/dev/null < "$_csp_p/comm" || continue
-    case "$_csp_comm" in mihomo-*) ;; *) continue ;; esac
+    # BusyBox setuidgid 的部分版本不 exec，被包装的内核实际 comm 仍是 busybox；
+    # 因此也检查少量已知启动包装器，再用完整 cmdline 路径严格确认，避免误杀。
+    case "$_csp_comm" in mihomo*|busybox|setsid|nohup) ;; *) continue ;; esac
     _csp_cmd=""
     IFS= read -r _csp_cmd 2>/dev/null < "$_csp_p/cmdline" || continue
     case "$_csp_cmd" in
       "$COREDIR/mihomo-"*) ;;
       *"setuidgid"*"$COREDIR/mihomo-"*) ;;
+      *"setsid"*"$COREDIR/mihomo-"*) ;;
+      *"nohup"*"$COREDIR/mihomo-"*) ;;
       *) continue ;;
     esac
     _csp_out="$_csp_out $_csp_n"
@@ -10332,6 +10334,7 @@ case "$cmd" in
     lifecycle_action_json "$cmd" "$@"; exit 0 ;;
   _lifecycle-tail)
     sync_state_desc >/dev/null 2>&1; exit 0 ;;
+  core-sweep-stale) core_sweep_stale ;;
   action-trace)
     cat "$RUNDIR/action-latest.trace" 2>/dev/null ;;
   # 管理器「运行」按钮（action.sh）：一个进程内完成 监听/面板保活 + 切换内核 +
