@@ -753,8 +753,8 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
         // scripts/mihomo.sh 的 ipv6_proxy_guard）。这行必须在界面上说清楚，
         // 否则用户只会看到「系统 IPv6 开着但代理不走 v6」，以为坏了。
         h('div', { class: STATUS_LINE_CLASS, style: APN_LINE_STYLE, hidden: st.ipv6_proxy !== 'fallback',
-          text: '代理侧：本机内核无法在 IPv6 下接管，已回退为仅 IPv4 代理（系统 IPv6 与 IMS 不受影响）'),
-        appV6Status)),
+          text: '代理侧：本机内核无法在 IPv6 下接管，已回退为仅 IPv4 代理（系统 IPv6 与 IMS 不受影响）' }),
+        appV6Status),
       h('div', { class: 'f-ctl' }, v6DiagBtn, (() => {
         let sw;
         sw = switchCtl(v6On, async (v) => {
