@@ -3529,6 +3529,101 @@ tunhs_find_iface() {
   return 1
 }
 
+# Android's Mihomo TUN backend (sing-tun) deliberately installs two priority-9000
+# rules for locally-originated packets whose source is in either half of IPv6:
+#   from ::/1 iif lo goto 9010
+#   from 8000::/1 iif lo goto 9010
+# This preserves physical-network-bound sockets, but also lets an ordinary app
+# explicitly bound to a cellular IPv6 source skip the TUN table. Add a narrower
+# pre-9000 rule for Android application UIDs and Internet global-unicast targets.
+# Mihomo itself runs as uid 0 (or the TProxy service uid <10000), so its IPv6 node
+# connections continue to use the physical rmnet route and cannot loop into TUN.
+# Box4's TProxy implementation uses the analogous owner/mark split; its TUN mode
+# also relies on core auto-route, so copying its FORWARD rules would not fix OUTPUT.
+TUN_APP6_PREF_MIN=8980
+TUN_APP6_PREF_MAX=8989
+TUN_APP6_UID_MIN=10000
+TUN_APP6_UID_MAX=4294967294
+TUN_APP6_STATE=$RUNDIR/tun-app-ipv6.rule
+
+# Remove only our reserved-range rule signature. 8990-8999 belongs to the
+# separate hotspot-direct helper, while TProxy's route rules use 7998/7999.
+tun_app6_rule_cleanup() {
+  [ -n "$TUNHS_IP" ] || _tunhs_bins
+  [ -n "$TUNHS_IP" ] || { rm -f "$TUN_APP6_STATE" 2>/dev/null; return 0; }
+  _ta_rules=$($TUNHS_IP -6 rule show 2>/dev/null)
+  _ta_pref=$TUN_APP6_PREF_MAX
+  while [ "$_ta_pref" -ge "$TUN_APP6_PREF_MIN" ]; do
+    while :; do
+      _tac_table=$(printf '%s\n' "$_ta_rules" | awk -v p="$_ta_pref:" \
+        -v u="uidrange $TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" \
+        '$1 == p && index($0, "to 2000::/3") && index($0, "iif lo") && index($0, u) { for (i=1; i<NF; i++) if ($i == "lookup" || $i == "table") { print $(i+1); exit } }')
+      [ -n "$_tac_table" ] || break
+      $TUNHS_IP -6 rule del pref "$_ta_pref" to 2000::/3 iif lo \
+        uidrange "$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" lookup "$_tac_table" 2>/dev/null || break
+      _ta_rules=$($TUNHS_IP -6 rule show 2>/dev/null)
+    done
+    _ta_pref=$((_ta_pref - 1))
+  done
+  rm -f "$TUN_APP6_STATE" 2>/dev/null
+  return 0
+}
+
+# Keep source-bound app IPv6 inside the active Mihomo IPv6 route table, while
+# allowing the root-owned core to reach IPv6 proxy nodes over the cellular link.
+# Called from the existing TUN reconciliation loop; no-op for IPv4-only configs.
+tun_app6_rule_sync() {
+  _ta_want=$1
+  _ta_iface=$2
+  _tunhs_bins
+  [ -n "$TUNHS_IP" ] || return 1
+  _ta_cfg=$CONFIG
+  [ -r "$RUNDIR/active-config.yaml" ] && _ta_cfg=$RUNDIR/active-config.yaml
+  _ta_ipv6=$(CONFIG="$_ta_cfg" tunhs_cfg_ipv6)
+  if [ "$_ta_want" != "1" ] || [ "$_ta_ipv6" != "true" ] || [ -z "$_ta_iface" ]; then
+    tun_app6_rule_cleanup
+    return 0
+  fi
+  _ta_table=$(CONFIG="$_ta_cfg" tunhs_cfg_tun_field route-table)
+  [ -n "$_ta_table" ] || _ta_table=2022
+  [ "$_ta_table" = "0" ] && _ta_table=2022
+  case "$_ta_table" in ''|*[!0-9]*)
+    tunhs_log "WARN app-v6-route: 无效 TUN route-table=$_ta_table，未加 UID 接管规则"
+    return 1 ;;
+  esac
+  # Do not route into a missing/half-built table during core startup or reload.
+  _ta_routes=$($TUNHS_IP -6 route show table "$_ta_table" 2>/dev/null)
+  printf '%s\n' "$_ta_routes" | awk -v d="$_ta_iface" \
+    '($1 == "default" || $1 == "::/1" || $1 == "8000::/1") { for (i=1; i<NF; i++) if ($i == "dev" && $(i+1) == d) ok=1 } END { exit !ok }' || return 0
+  _ta_rules=$($TUNHS_IP -6 rule show 2>/dev/null)
+  if printf '%s\n' "$_ta_rules" | awk -v t="$_ta_table" -v u="uidrange $TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" \
+    '($1 ~ /^898[0-9]:$/) && index($0, "to 2000::/3") && index($0, "iif lo") && index($0, u) && (index($0, "lookup " t) || index($0, "table " t)) { found=1 } END { exit !found }'; then
+    printf 'table=%s\n' "$_ta_table" > "$TUN_APP6_STATE" 2>/dev/null
+    return 0
+  fi
+  # Route table changed or an old rule vanished: first remove only our signature.
+  tun_app6_rule_cleanup
+  _ta_rules=$($TUNHS_IP -6 rule show 2>/dev/null)
+  _ta_pref=$TUN_APP6_PREF_MAX
+  while [ "$_ta_pref" -ge "$TUN_APP6_PREF_MIN" ]; do
+    if ! printf '%s\n' "$_ta_rules" | grep -q "^$_ta_pref:"; then
+      if $TUNHS_IP -6 rule add pref "$_ta_pref" to 2000::/3 iif lo \
+        uidrange "$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" lookup "$_ta_table" 2>>"$TUNHS_LOG"; then
+        _ta_rules=$($TUNHS_IP -6 rule show 2>/dev/null)
+        if printf '%s\n' "$_ta_rules" | awk -v p="$_ta_pref:" -v t="$_ta_table" -v u="uidrange $TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" \
+          '$1 == p && index($0, "to 2000::/3") && index($0, "iif lo") && index($0, u) && (index($0, "lookup " t) || index($0, "table " t)) { found=1 } END { exit !found }'; then
+          printf 'table=%s\npref=%s\n' "$_ta_table" "$_ta_pref" > "$TUN_APP6_STATE" 2>/dev/null
+          tunhs_log "apply app-v6-route iface=$_ta_iface table=$_ta_table pref=$_ta_pref uid=$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX dst=2000::/3"
+          return 0
+        fi
+      fi
+    fi
+    _ta_pref=$((_ta_pref - 1))
+  done
+  tunhs_log "WARN app-v6-route: 8980-8989 无空闲 IPv6 rule priority，应用源绑定 IPv6 仍可能走蜂窝直连"
+  return 1
+}
+
 tunhs_log() {
   printf '%s %s\n' "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$*" >> "$TUNHS_LOG" 2>/dev/null
   _tl_s=$(wc -c < "$TUNHS_LOG" 2>/dev/null)
@@ -3799,6 +3894,7 @@ tunhs_direct_install() {
 tun_hotspot_orphan_clean() {
   running && return 0
   _tunhs_bins
+  tun_app6_rule_cleanup
   [ -n "$TUNHS_IPT" ] || [ -n "$TUNHS_NFT" ] || return 0
   _to_old=""
   [ -f "$TUNHS_STATE" ] && _to_old=$(grep '^iface=' "$TUNHS_STATE" 2>/dev/null | cut -d= -f2)
@@ -3949,6 +4045,10 @@ _tunhs_sync_body() {
     fi
   fi
   if [ "$_ts_want" = "1" ] && [ "$(tunhs_cfg_ipv6)" = "true" ]; then _ts_v6=on; else _ts_v6=off; fi
+  # Mihomo Android core's 9000 /1 source rules bypass table 2022 for locally
+  # originated sockets already bound to a global IPv6 source. Re-route app UIDs
+  # (not root-owned Mihomo node sockets) through its IPv6 table before those rules.
+  tun_app6_rule_sync "$_ts_want" "$_ts_iface"
   # —— 无变化早退（含「TUN 尚未建好」的等待场景：不拆既有规则，等下轮重试）——
   # ver<3（旧版本状态）一律重建，保证旧规则/旧链被升级清洗。
   # 网卡/ipv6 变化必须重装（在最外层比较）；期望「无直连」（want=0 或
