@@ -3624,6 +3624,231 @@ tun_app6_rule_sync() {
   return 1
 }
 
+# ============================================================
+# 应用 IPv6 出网方向盘（系统 IPv6 开着时，应用 v6 必须有结论：接管 / 阻断）
+# ------------------------------------------------------------
+# 现场：开了「系统 IPv6」后设备拿到 GUA，国内域名（命中 fake-ip-filter → 真解析）
+# 会连 AAAA 一起回到 App（240e:/2408:/2409:…）。此时只要代理侧没有真正接管 v6
+# —— TUN 表里没有指向 tun 网卡的 v6 默认路由（ipv6:false 回退态、内核没拉起 v6
+# 路由）、或 Tproxy 模式「真地址原生」—— 这些连接就顺着物理网卡直接出去了：
+# 既绕过了内核的域名分流，也到不了国内出口的免流节点，直接计成通用流量。
+#
+# 对策（与「系统 IPv6」开关解耦，只看代理侧是否真能接管 v6）：
+#   · 能接管 → pref 898x 的 ip -6 rule 把应用（uid ≥10000）发往 2000::/3 的
+#     流量送进 TUN 路由表，域名规则照常命中（国内出口 / 免流）；
+#   · 不能接管 → 同一条签名的规则指向阻断表（v6 unreachable default）：应用的
+#     IPv6 建连立刻拿到 ENETUNREACH，Happy Eyeballs 毫秒级回落 IPv4，再被 TUN/
+#     TProxy 接管 → 走国内出口（免流）。宁可让 v6 建连失败，也不让它裸奔；
+#   · 系统 IPv6 关 / 内核没跑 / 非 Android → 不干预（设备本就没有 v6 出网，或
+#     别把用户唯一的出网口掐了）。
+# 内核自身（uid 0，含 TProxy 的 root:net_admin）与系统服务（uid <10000）不受
+# 规则约束：国外 IPv6 节点照常拨出，系统的 v6 DNS 也不受影响。
+# 高级开关：module-settings 里 app_ipv6=auto|proxy|block|native（缺省 auto）：
+# proxy=只走接管（接管不了就不管）、block=总是阻断、native=完全不干预（旧行为）。
+# ============================================================
+APP6_BLOCK_TABLE=2023                # 阻断表：只放一条 v6 unreachable default（2022 是 TUN 默认表）
+APP6_STATE=$RUNDIR/app-ipv6.rule     # 应用 IPv6 出网现状（mode=tun|ebpf|block，诊断 / 面板用）
+APP6_PREF_MIN=8980                   # 与 tun_app6 共用同一段签名优先级（8980-8989）
+APP6_PREF_MAX=8989
+
+# Android 专有手段：FIB rule 的 uidrange。OpenWrt 上所有进程的 uid 都 <10000，
+# 按 uid 拦等于把整台路由的 v6 出口掐掉 —— 方向盘只在 Android 上接管。
+APP6_PLAT=""
+app6_android() {
+  [ -n "$APP6_PLAT" ] || APP6_PLAT=$(core_platform)
+  [ "$APP6_PLAT" = "android" ]
+}
+
+# 内核在用配置里 TUN 的 route-table（没写 / 非法按 mihomo 缺省 2022；0 同义）
+app6_tun_table() {
+  _a6_cfg=$CONFIG
+  [ -r "$RUNDIR/active-config.yaml" ] && _a6_cfg=$RUNDIR/active-config.yaml
+  _a6_table=$(CONFIG="$_a6_cfg" tunhs_cfg_tun_field route-table)
+  [ -n "$_a6_table" ] || _a6_table=2022
+  [ "$_a6_table" = "0" ] && _a6_table=2022
+  case "$_a6_table" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$_a6_table"
+  return 0
+}
+
+# 代理侧是否真的在接管 IPv6：TUN 已起 && 内核在用配置 ipv6:true && TUN 路由表里
+# 有指向该网卡的 v6 默认路由（mihomo 也用 ::/1 + 8000::/1 两段做 v6 分流）。
+# 能接管 → 输出 TUN 路由表号；否则空输出 + 返回 1。
+app6_takeover_table() {
+  [ "$1" = "1" ] || return 1
+  [ -n "$2" ] || return 1
+  _a6_cfg=$CONFIG
+  [ -r "$RUNDIR/active-config.yaml" ] && _a6_cfg=$RUNDIR/active-config.yaml
+  [ "$(CONFIG="$_a6_cfg" tunhs_cfg_ipv6)" = "true" ] || return 1
+  _a6_table=$(app6_tun_table) || return 1
+  $TUNHS_IP -6 route show table "$_a6_table" 2>/dev/null | awk -v d="$2" \
+    '($1 == "default" || $1 == "::/1" || $1 == "8000::/1") { for (i = 1; i < NF; i++) if ($i == "dev" && $(i+1) == d) ok = 1 } END { exit !ok }' || return 1
+  printf '%s\n' "$_a6_table"
+  return 0
+}
+
+# 阻断表就绪：只放一条 v6 unreachable default。命中是 ENETUNREACH（不是丢包等
+# 超时），App 的 Happy Eyeballs 会在毫秒级改走 IPv4，体感上无等待。
+app6_block_table_ensure() {
+  [ -n "$TUNHS_IP" ] || return 1
+  if [ -n "$($TUNHS_IP -6 route show table "$APP6_BLOCK_TABLE" 2>/dev/null)" ]; then
+    return 0
+  fi
+  $TUNHS_IP -6 route add unreachable default table "$APP6_BLOCK_TABLE" 2>>"$TUNHS_LOG" || return 1
+  return 0
+}
+
+# 找一条我们自己的规则（8980-8989 + to 2000::/3 + iif lo + uidrange）：
+# 输出 "<pref> <table>"，没有则空 + 返回 1。
+app6_rule_find() {
+  _a6_rules=$($TUNHS_IP -6 rule show 2>/dev/null)
+  [ -n "$_a6_rules" ] || return 1
+  _a6_hit=$(printf '%s\n' "$_a6_rules" | awk \
+    -v u="uidrange $TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" \
+    '($1 ~ /^898[0-9]:$/) && index($0, "to 2000::/3") && index($0, "iif lo") && index($0, u) {
+       p = $1; sub(/:$/, "", p)
+       for (i = 1; i < NF; i++) if ($i == "lookup" || $i == "table") { print p, $(i+1); exit }
+     }')
+  [ -n "$_a6_hit" ] || return 1
+  printf '%s\n' "$_a6_hit"
+  return 0
+}
+
+# 装一条指向 $1 表的规则（$2=mode，写进状态文件）。$1 表已存在则只刷新状态；
+# 否则先清掉我们任何旧签名的规则，再在 8980-8989 里挑一个空闲 pref。
+app6_rule_install() {
+  _ai_table=$1
+  _ai_mode=$2
+  case "$_ai_table" in ''|*[!0-9]*) return 1 ;; esac
+  _ai_have=$(app6_rule_find)
+  if [ -n "$_ai_have" ]; then
+    _ai_hpref=${_ai_have%% *}
+    _ai_htable=${_ai_have##* }
+    if [ "$_ai_htable" = "$_ai_table" ]; then
+      printf 'mode=%s\ntable=%s\npref=%s\n' "$_ai_mode" "$_ai_table" "$_ai_hpref" > "$APP6_STATE" 2>/dev/null
+      return 0
+    fi
+  fi
+  tun_app6_rule_cleanup
+  _ai_rules=$($TUNHS_IP -6 rule show 2>/dev/null)
+  _ai_pref=$APP6_PREF_MAX
+  while [ "$_ai_pref" -ge "$APP6_PREF_MIN" ]; do
+    if ! printf '%s\n' "$_ai_rules" | grep -q "^$_ai_pref:"; then
+      if $TUNHS_IP -6 rule add pref "$_ai_pref" to 2000::/3 iif lo \
+        uidrange "$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" lookup "$_ai_table" 2>>"$TUNHS_LOG"; then
+        printf 'mode=%s\ntable=%s\npref=%s\n' "$_ai_mode" "$_ai_table" "$_ai_pref" > "$APP6_STATE" 2>/dev/null
+        return 0
+      fi
+    fi
+    _ai_pref=$((_ai_pref - 1))
+  done
+  return 1
+}
+
+# 拆除：清签名规则 + 清阻断表 + 删状态文件（停机 / 关系统 IPv6 / 非 Android 用）
+app6_teardown() {
+  [ -n "$TUNHS_IP" ] || _tunhs_bins
+  if [ -n "$TUNHS_IP" ]; then
+    tun_app6_rule_cleanup
+    $TUNHS_IP -6 route flush table "$APP6_BLOCK_TABLE" 2>/dev/null
+  fi
+  rm -f "$APP6_STATE" 2>/dev/null
+  return 0
+}
+
+# 方向盘主流程（对账式，幂等）：$1=TUN 是否就绪(1/0)  $2=TUN 网卡名
+app_ipv6_egress_sync() {
+  _ae_want=$1
+  _ae_iface=$2
+  _tunhs_bins
+  [ -n "$TUNHS_IP" ] || return 1
+  setting_v app_ipv6 auto; _ae_mode=$SV
+  case "$_ae_mode" in auto|proxy|block|native) ;; *) _ae_mode=auto ;; esac
+  # 不干预：用户要原生 / 系统 IPv6 关（设备没有 v6 出网，也不会漏）/
+  # 内核没在跑（别把用户唯一的出网口掐了）/ 非 Android（见 app6_android 注释）
+  if [ "$_ae_mode" = "native" ] || [ "$(get_setting system_ipv6 false)" != "true" ] ||
+     ! running || ! app6_android; then
+    app6_teardown
+    return 0
+  fi
+  # —— ① TUN 真的在接管 v6：应用 v6 送进 TUN 路由表 ——
+  _ae_table=""
+  if [ "$_ae_mode" != "block" ]; then
+    # 不能写成 `[ … ] && _ae_table=$(…)`：命令替换失败时整个 AND 列表返回非零，
+    # 调用方一旦开了 set -e 就会被这条「探测不到 v6 接管」直接带崩。
+    _ae_table=$(app6_takeover_table "$_ae_want" "$_ae_iface") || _ae_table=""
+    if [ -n "$_ae_table" ]; then
+      # 能接管：应用 v6 进 TUN，域名规则照常命中（国内出口 / 免流）。
+      # 顺手清掉上一轮可能留下的阻断表，避免表里留着 unreachable 误导诊断。
+      if tun_app6_rule_sync "$_ae_want" "$_ae_iface"; then
+        $TUNHS_IP -6 route flush table "$APP6_BLOCK_TABLE" 2>/dev/null
+        { printf 'mode=tun\n'; cat "$TUN_APP6_STATE" 2>/dev/null; } > "$APP6_STATE" 2>/dev/null
+        return 0
+      fi
+      tunhs_log "WARN app-v6: TUN 已有 v6 路由但接管规则没装上，改走阻断（不让它直连漏出）"
+    fi
+  fi
+  # —— ② eBPF 入站自己在拦 v6（启用角色的 ipv6 生效）：已被接管，无需插手 ——
+  if [ "$_ae_mode" != "block" ] && ebpf_ipv6_redirect_cached; then
+    app6_teardown
+    printf 'mode=ebpf\n' > "$APP6_STATE" 2>/dev/null
+    return 0
+  fi
+  # —— ③ 本模块根本没有接管任何流量（纯手动端口 / TUN 还没建出来）→ 不干预 ——
+  # 那种情况下应用流量本就不进内核，掐掉 v6 只会断网，不是漏。
+  if [ "$_ae_want" != "1" ] && [ "$(get_setting tproxy false)" != "true" ] &&
+     ! ebpf_listener_active; then
+    app6_teardown
+    return 0
+  fi
+  # —— ④ 只接受管、不接受阻断（app_ipv6=proxy）：接管不了就交还系统 ——
+  if [ "$_ae_mode" = "proxy" ]; then
+    app6_teardown
+    return 0
+  fi
+  # —— ⑤ 剩下的都是「系统有 v6、但没有任何一路在接管 v6」→ 阻断，逼 App 回落 v4 ——
+  # 手写配置把 tun.route-table 也写成 2023 时不能往里灌 unreachable：那等于把
+  # 内核自己的 v6 路由表炸掉。宁可不阻断，也要留着内核的表。
+  _ae_tuntable=$(app6_tun_table) || _ae_tuntable=""
+  if [ "$_ae_tuntable" = "$APP6_BLOCK_TABLE" ]; then
+    tunhs_log "WARN app-v6: tun.route-table=$_ae_tuntable 与阻断表同号，跳过阻断（请换一个 route-table）"
+    app6_teardown
+    return 1
+  fi
+  if ! app6_block_table_ensure; then
+    tunhs_log "WARN app-v6: 阻断表 $APP6_BLOCK_TABLE 写入失败，应用 IPv6 仍会直连（通用流量）"
+    app6_teardown
+    return 1
+  fi
+  if app6_rule_install "$APP6_BLOCK_TABLE" block; then
+    _ae_pref=$(grep '^pref=' "$APP6_STATE" 2>/dev/null | cut -d= -f2)
+    tunhs_log "apply app-v6-block table=$APP6_BLOCK_TABLE pref=${_ae_pref:-?} uid=$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX dst=2000::/3（代理侧未接管 v6：应用 v6 建连立即失败并回落 IPv4）"
+    return 0
+  fi
+  tunhs_log "WARN app-v6: 8980-8989 无空闲 IPv6 rule priority，应用 IPv6 仍会直连（通用流量）"
+  return 1
+}
+
+# 现状短串（诊断 / 面板用）：
+#   tun  = TUN 在接管 v6（应用 v6 进内核，按域名规则分流）
+#   ebpf = eBPF 入站在接管 v6
+#   block= 没人接管 v6，已阻断（App 回落 IPv4 再被接管）
+#   off  = 不干预（系统 IPv6 关 / 内核未运行 / 本模块没接管流量）
+# 只读状态文件，零 fork 零 ip 调用（面板轮询每次都会走这里）；文件缺失按 off 处理
+# （对账还没跑过，或已拆除）。
+app_ipv6_egress_state() {
+  _as_mode=off
+  if [ -r "$APP6_STATE" ]; then
+    while IFS= read -r _as_l || [ -n "$_as_l" ]; do
+      case "$_as_l" in
+        mode=tun|mode=block|mode=ebpf) _as_mode=${_as_l#mode=} ;;
+      esac
+    done < "$APP6_STATE"
+  fi
+  printf '%s\n' "$_as_mode"
+  return 0
+}
+
 tunhs_log() {
   printf '%s %s\n' "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$*" >> "$TUNHS_LOG" 2>/dev/null
   _tl_s=$(wc -c < "$TUNHS_LOG" 2>/dev/null)
@@ -3894,7 +4119,7 @@ tunhs_direct_install() {
 tun_hotspot_orphan_clean() {
   running && return 0
   _tunhs_bins
-  tun_app6_rule_cleanup
+  app6_teardown          # 含 tun_app6_rule_cleanup（应用 v6 接管/阻断规则一并清掉）
   [ -n "$TUNHS_IPT" ] || [ -n "$TUNHS_NFT" ] || return 0
   _to_old=""
   [ -f "$TUNHS_STATE" ] && _to_old=$(grep '^iface=' "$TUNHS_STATE" 2>/dev/null | cut -d= -f2)
@@ -4048,7 +4273,8 @@ _tunhs_sync_body() {
   # Mihomo Android core's 9000 /1 source rules bypass table 2022 for locally
   # originated sockets already bound to a global IPv6 source. Re-route app UIDs
   # (not root-owned Mihomo node sockets) through its IPv6 table before those rules.
-  tun_app6_rule_sync "$_ts_want" "$_ts_iface"
+  # 接管不了 v6 时同一条规则改为指向阻断表，让应用回落 IPv4（见 app_ipv6_egress_sync）。
+  app_ipv6_egress_sync "$_ts_want" "$_ts_iface"
   # —— 无变化早退（含「TUN 尚未建好」的等待场景：不拆既有规则，等下轮重试）——
   # ver<3（旧版本状态）一律重建，保证旧规则/旧链被升级清洗。
   # 网卡/ipv6 变化必须重装（在最外层比较）；期望「无直连」（want=0 或
@@ -4383,6 +4609,16 @@ tun_hotspot_diag() {
     fi
     echo "== TUN 热点直连专用表 $TUNHS_TABLE =="
     $TUNHS_IP route show table "$TUNHS_TABLE" 2>&1
+    echo "== 应用 IPv6 出网（app-ipv6：$(app_ipv6_egress_state)）=="
+    # 管道末尾是 sed，退出码恒为 0，「(无)」分支得靠变量判空才打得出来
+    _dg_a6s=$(sed 's/^/  /' "$APP6_STATE" 2>/dev/null)
+    _dg_a6r=$($TUNHS_IP -6 rule show 2>/dev/null | grep -E '^898[0-9]:' | sed 's/^/  /')
+    _dg_a6t=$($TUNHS_IP -6 route show table "$APP6_BLOCK_TABLE" 2>/dev/null | sed 's/^/  /')
+    echo "  状态文件：${_dg_a6s:-  (无)}"
+    echo "  ip -6 rule（8980-8989）："
+    echo "${_dg_a6r:-  (无)}"
+    echo "  ip -6 route table $APP6_BLOCK_TABLE（阻断表，仅 block 态应有内容）："
+    echo "${_dg_a6t:-  (空)}"
   else echo "(无 ip 命令)"; fi
   if [ -n "$TUNHS_IPT" ]; then
     echo "== iptables FORWARD（相关行） =="
@@ -5468,6 +5704,10 @@ ipv6_status() {
   # 代理侧结论（on/off/fallback）放在最前面：这是「开了系统 IPv6 之后代理不接管」
   # 的第一判断点，见 ipv6_proxy_guard。
   echo "代理侧 IPv6：$(ipv6_proxy_state)（on=TUN/eBPF 也在接管 v6；fallback=本机内核起不来，已回退仅 IPv4；off=系统 IPv6 关）"
+  echo "应用 IPv6 出网：$(app_ipv6_egress_state)（tun=TUN 接管 v6，按域名规则分流；ebpf=eBPF 入站接管 v6；block=阻断，App 回落 IPv4 再被接管；off=未干预）"
+  if [ -f "$APP6_STATE" ]; then
+    echo "  规则：$(tr '\n' ' ' < "$APP6_STATE" 2>/dev/null)"
+  fi
   if [ -f "$IPV6_PLOG" ]; then
     echo "回退记录（最近 3 条）："
     tail -n 3 "$IPV6_PLOG" 2>/dev/null | sed 's/^/  /'
@@ -8911,6 +9151,9 @@ MH_STATUS_CFG
   jv "$_sj_hp";   printf '%s\n' "\"hotspot_proxy\": \"$J\","
   jv "$_sj_v6";   printf '%s\n' "\"system_ipv6\": \"$J\","
   printf '%s\n' "\"ipv6_locked_by\": $_sj_v6lock,"
+  # 应用 IPv6 出网方向盘（只读 run/app-ipv6.rule，零 ip 调用）：
+  # tun=送进内核按规则分流 / block=阻断回落 IPv4 再被接管 / off=未干预
+  jv "$(app_ipv6_egress_state)"; printf '%s\n' "\"app_ipv6\": \"$J\","
   jv "$_sj_tp";   printf '%s\n' "\"tproxy\": \"$J\","
   jv "$_sj_tps";  printf '%s\n' "\"tproxy_state\": \"$J\","
   printf '%s\n' "\"config_exists\": $_sj_cfg,"
@@ -9029,7 +9272,9 @@ mod_state_json() {
   jv "$_ms_tps"; _ms_b=$J
   jv "$_ms_hp";  _ms_c=$J
   jv "$_ms_tp";  _ms_d=$J
-  printf '{"tun_hotspot":"%s","tproxy_state":"%s","hotspot_proxy":"%s","tproxy":"%s"}\n' "$_ms_a" "$_ms_b" "$_ms_c" "$_ms_d"
+  # 应用 IPv6 出网方向盘（面板「系统 IPv6」下的状态行；只读状态文件，零 fork）
+  jv "$(app_ipv6_egress_state)"; _ms_e=$J
+  printf '{"tun_hotspot":"%s","tproxy_state":"%s","hotspot_proxy":"%s","tproxy":"%s","app_ipv6":"%s"}\n' "$_ms_a" "$_ms_b" "$_ms_c" "$_ms_d" "$_ms_e"
 }
 
 BOOT_DATA_CACHE=$RUNDIR/boot_data.json

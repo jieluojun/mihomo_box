@@ -412,6 +412,25 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
     ? '已开启：系统 IPv6 保持可用，配置文件中的 IPv6 开关同步打开，Wi-Fi 与蜂窝网卡均可使用 IPv6。代理运行中会自动重启以生效'
     : '已关闭（默认）：Wi-Fi 等非蜂窝网卡禁用 IPv6，上网 APN 协议改为仅 IPv4，配置文件中的 IPv6 开关同时关闭；不影响 IMS 高清通话与短信。代理运行中会自动重启以生效';
   const v6DescMain = h('span', { text: v6DescText(v6On) });
+  // 应用 IPv6 出网方向盘（后端 app_ipv6_egress_sync）：系统 IPv6 开着时，应用的
+  // IPv6 连接要么被送进内核按域名规则分流（tun，国内照走国内出口／免流），要么被
+  // 立刻掐断逼它回落 IPv4 再被接管（block）。两者都不会让国内 v6 直连出去计通用
+  // 流量；off 表示当前不需要干预（系统 IPv6 关 / 内核未运行 / 对账还没落盘）。
+  const appV6Text = (m, on) => {
+    if (!on) return '应用 IPv6：系统 IPv6 已关，设备无 IPv6 出网';
+    if (m === 'tun') return '应用 IPv6：已接管（TUN 接管 v6，按域名规则分流——国内走国内出口）';
+    if (m === 'ebpf') return '应用 IPv6：已接管（eBPF 入站接管 v6，按域名规则分流）';
+    if (m === 'block') return '应用 IPv6：已阻断（内核未接管 v6，App 的 IPv6 会立刻回落 IPv4 再被接管）';
+    return '应用 IPv6：未干预（内核未运行，或对账尚未落盘）';
+  };
+  const appV6Status = h('div', { class: STATUS_LINE_CLASS, style: APN_LINE_STYLE, text: appV6Text(st.app_ipv6, v6On) });
+  // 开关切换与 mod-state 短轮询共用的刷新口：值来自后端状态文件（1.5s 一拍），
+  // 「系统 IPv6」是否开着按当前已知状态取，切完开关立刻跟手，不用等整页 status。
+  const refreshAppV6Line = () => {
+    if (!appV6Status) return;
+    const st2 = state.status || {};
+    appV6Status.textContent = appV6Text(st2.app_ipv6, st2.system_ipv6 === 'true');
+  };
   // 首选 APN 的协议状态（紧跟在说明文字下一行）：系统 IPv6=关 时后端会把上网 APN 的
   // protocol / roaming_protocol 改成仅 IPv4，这里把「现在到底是不是 IPv4」直接摆出来。
   // content 查询每次要拉起一个 JVM，所以只在弹层打开与切换 IPv6 后各取一次，
@@ -570,10 +589,11 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
       const j = parseJsonLoose(r && r.stdout);
       if (!j || !modSheetAlive()) return;
       if (!state.status) state.status = {};
-      for (const k of ['tun_hotspot', 'tproxy_state', 'hotspot_proxy', 'tproxy']) {
+      for (const k of ['tun_hotspot', 'tproxy_state', 'hotspot_proxy', 'tproxy', 'app_ipv6']) {
         if (j[k] != null && (force || !(k === 'tproxy' && tpBusy))) state.status[k] = j[k];
       }
       hsStatus.textContent = tunHsStatusText();
+      refreshAppV6Line();
       if (force || !tpBusy) {
         tpStatus.textContent = tproxyStatusText();
         if (tpSwInput && (force || !tpBusy)) tpSwInput.checked = state.status.tproxy === 'true';
@@ -733,7 +753,8 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
         // scripts/mihomo.sh 的 ipv6_proxy_guard）。这行必须在界面上说清楚，
         // 否则用户只会看到「系统 IPv6 开着但代理不走 v6」，以为坏了。
         h('div', { class: STATUS_LINE_CLASS, style: APN_LINE_STYLE, hidden: st.ipv6_proxy !== 'fallback',
-          text: '代理侧：本机内核无法在 IPv6 下接管，已回退为仅 IPv4 代理（系统 IPv6 与 IMS 不受影响）' })),
+          text: '代理侧：本机内核无法在 IPv6 下接管，已回退为仅 IPv4 代理（系统 IPv6 与 IMS 不受影响）'),
+        appV6Status)),
       h('div', { class: 'f-ctl' }, v6DiagBtn, (() => {
         let sw;
         sw = switchCtl(v6On, async (v) => {
@@ -809,6 +830,7 @@ if (modSettingsBtn) modSettingsBtn.onclick = () => {
             const out = ((r && r.stdout) || '').trim();
             const ok = !!r && r.errno === 0 && !/(^|\n)ERR/.test(out);
             if (state.status) state.status.system_ipv6 = v ? 'true' : 'false';
+            refreshAppV6Line();
             if (ok) {
               // 只有配置真被改动（或因运行快照不一致而确实重启）才重载草稿；
               // 配置零改动且无需重启时，跳过一趟 shell/文件读取往返。
