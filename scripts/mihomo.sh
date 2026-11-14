@@ -4086,6 +4086,14 @@ app_ipv6_route_hook() {   # $1=TUN 网卡名  $2=路由表号
   # 标了就自己钻进 TUN 形成回环 —— 这是本链唯一不能出错的一条。
   $TUNHS_IP6T -w -t mangle -A "$APP6_ROUTE_CHAIN" \
     -m owner --uid-owner 0-$((TUN_APP6_UID_MIN - 1)) -j RETURN 2>>"$TUNHS_LOG" || _arh_ok=0
+  # —— DNS 查询（dport 53）也送进 TUN：应用查 [::1]:53 要 AAAA，没有这条 ——
+  # 规则 DNS 查询不进 TUN，mihomo 核心的 dns-hijack 也劫持不到，应用拿不到
+  # AAAA，就不会发起 v6 连接，zashboard 里就看不到 v6 源 IP。参考 boxproxy
+  # 的 append_tun_dns_rules（把 dport 53 打 mark 送进策略路由表）。
+  $TUNHS_IP6T -w -t mangle -A "$APP6_ROUTE_CHAIN" \
+    -p udp --dport 53 -j MARK --set-xmark "$APP6_ROUTE_MARK" 2>>"$TUNHS_LOG" || _arh_ok=0
+  $TUNHS_IP6T -w -t mangle -A "$APP6_ROUTE_CHAIN" \
+    -p tcp --dport 53 -j MARK --set-xmark "$APP6_ROUTE_MARK" 2>>"$TUNHS_LOG" || _arh_ok=0
   # 目标段与「送进内核」那一路保持一致（真 GUA 2000::/3 + DNS fake-ip6 段）
   for _arh_d in $_arh_dsts; do
     $TUNHS_IP6T -w -t mangle -A "$APP6_ROUTE_CHAIN" -d "$_arh_d" \
