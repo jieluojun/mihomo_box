@@ -28,6 +28,9 @@ if [ -d "$WORKDIR" ]; then
         "$WORKDIR/run/tproxy.state" "$WORKDIR/run/tproxy.cfg" \
         "$WORKDIR/run/tproxy.miss" "$WORKDIR/run/tproxy.fail" \
         "$WORKDIR/run/ipv6.want" "$WORKDIR/run/ipv6.net" "$WORKDIR/run/ipv6.last" \
+        "$WORKDIR/run/app-ipv6.state" "$WORKDIR/run/tun-app-ipv6.rule" \
+        "$WORKDIR/run/app-ipv6-block.state" "$WORKDIR/run/app-ipv6.uidrange" \
+        "$WORKDIR/run/app-ipv6-route.state" "$WORKDIR/run/app-ipv6-dns.state" \
         2>/dev/null
   # 同理清掉全部 pid / 启动中标记：run/ 在 /data 上跨重启保留，而上一会话的
   # 进程早已不存在，这些 pid 数字会被本轮开机的无关进程复用。各判活函数若

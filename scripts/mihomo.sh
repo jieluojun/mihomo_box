@@ -2905,6 +2905,11 @@ _stop_core_body() {
     #    运行状态算期望终态，与「停完立刻再启动」的竞态天然安全（内核重新在跑
     #    时期望算回 on，规则照装）；开关监听循环的周期对账照旧兜底。
     [ "$_st_unhook_done" = "1" ] || { [ -f "$TP_STATE" ] && tproxy_unhook_quick; }
+    # 内核已停：应用 IPv6 的兜底拦截必须同步摘掉（内核不在就谈不上「绕过内核」，
+    # 留着它只会让应用的 v6 一直被 REJECT）。后面两个后台对账也会各自再算一次。
+    app_ipv6_route_sync >/dev/null 2>&1
+    app_ipv6_dns_sync >/dev/null 2>&1
+    app_ipv6_block_sync >/dev/null 2>&1
     ( tun_hotspot_sync ) </dev/null >/dev/null 2>&1 &
     ( tproxy_sync ) </dev/null >/dev/null 2>&1 &
   fi
@@ -3546,8 +3551,11 @@ TUN_APP6_UID_MIN=10000
 TUN_APP6_UID_MAX=4294967294
 TUN_APP6_STATE=$RUNDIR/tun-app-ipv6.rule
 
-# Remove only our reserved-range rule signature. 8990-8999 belongs to the
-# separate hotspot-direct helper, while TProxy's route rules use 7998/7999.
+# Remove only our rule signature (pref band + `iif lo` + app uidrange), whatever
+# destination prefix it carries — the target set is rebuilt from the running
+# config on every reconcile, so a stale `to` must not survive a range change.
+# 8990-8999 belongs to the separate hotspot-direct helper, while TProxy's route
+# rules use 7998/7999.
 tun_app6_rule_cleanup() {
   [ -n "$TUNHS_IP" ] || _tunhs_bins
   [ -n "$TUNHS_IP" ] || { rm -f "$TUN_APP6_STATE" 2>/dev/null; return 0; }
@@ -3555,17 +3563,78 @@ tun_app6_rule_cleanup() {
   _ta_pref=$TUN_APP6_PREF_MAX
   while [ "$_ta_pref" -ge "$TUN_APP6_PREF_MIN" ]; do
     while :; do
-      _tac_table=$(printf '%s\n' "$_ta_rules" | awk -v p="$_ta_pref:" \
+      _tac_hit=$(printf '%s\n' "$_ta_rules" | awk -v p="$_ta_pref:" \
         -v u="uidrange $TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" \
-        '$1 == p && index($0, "to 2000::/3") && index($0, "iif lo") && index($0, u) { for (i=1; i<NF; i++) if ($i == "lookup" || $i == "table") { print $(i+1); exit } }')
-      [ -n "$_tac_table" ] || break
-      $TUNHS_IP -6 rule del pref "$_ta_pref" to 2000::/3 iif lo \
+        '$1 == p && index($0, "iif lo") && index($0, u) {
+           d = ""; t = ""
+           for (i = 1; i < NF; i++) if ($i == "to") d = $(i+1)
+           for (i = 1; i < NF; i++) if ($i == "lookup" || $i == "table") t = $(i+1)
+           if (d != "" && t != "") { print d, t; exit }
+         }')
+      [ -n "$_tac_hit" ] || break
+      _tac_dst=${_tac_hit%% *}
+      _tac_table=${_tac_hit##* }
+      $TUNHS_IP -6 rule del pref "$_ta_pref" to "$_tac_dst" iif lo \
         uidrange "$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" lookup "$_tac_table" 2>/dev/null || break
       _ta_rules=$($TUNHS_IP -6 rule show 2>/dev/null)
     done
     _ta_pref=$((_ta_pref - 1))
   done
   rm -f "$TUN_APP6_STATE" 2>/dev/null
+  return 0
+}
+
+# 应用 IPv6 出网现状（诊断 / 面板用）：
+#   tun    = 已送进 TUN 路由表，由内核按规则分流（国内 → 国内出口，国外 → 国外出口）
+#   tproxy = TProxy 在接管 IPv6
+#   ebpf   = eBPF 入站在接管 IPv6
+#   wait   = 内核的 v6 路由还没拉起来，等下一轮对账（这段窗口不许裸奔出网）
+#   fail   = 规则装不上（优先级段被占 / ip 报错），需要人来查
+#   off    = 未干预（系统 IPv6 关 / 内核未运行 / 配置未开 IPv6）
+# 状态文件 = 纯读，面板轮询零 fork 零 ip 调用；文件缺失按 off 处理。
+APP6_STATE=$RUNDIR/app-ipv6.state
+app_ipv6_state_set() {   # $1=mode  其余=key=value（写进状态文件，诊断可见）
+  _as6_mode=$1; shift
+  {
+    printf 'mode=%s\n' "$_as6_mode"
+    for _as6_kv in "$@"; do printf '%s\n' "$_as6_kv"; done
+  } > "$APP6_STATE" 2>/dev/null
+  return 0
+}
+app_ipv6_state() {
+  _as6_v=off
+  if [ -r "$APP6_STATE" ]; then
+    while IFS= read -r _as6_l || [ -n "$_as6_l" ]; do
+      case "$_as6_l" in mode=*) _as6_v=${_as6_l#mode=} ;; esac
+    done < "$APP6_STATE"
+  fi
+  # TProxy 在接管 v6 时以它为准：两条链路每轮都会对账，最后写状态文件的不一定
+  # 是接管方（net-sync 里 TUN 与 TProxy 的先后按模式互换）。纯内建读，零 fork
+  # —— 面板 1.5s 一次轮询会走到这里。
+  if [ -r "$TP_STATE" ]; then
+    while IFS= read -r _as6_l || [ -n "$_as6_l" ]; do
+      case "$_as6_l" in v6=on) _as6_v=tproxy; break ;; esac
+    done < "$TP_STATE"
+  fi
+  printf '%s\n' "$_as6_v"
+  return 0
+}
+
+# 需要送进内核的 IPv6 目标段（一行一个 CIDR）：
+#   · 真 GUA 2000::/3：国内 240e:/2408:/2409:… 与国外 v6 都在这里，必须进内核才能
+#     命中「大陆域名 / 大陆地址 → 国内出口（免流）」，否则直连出去计通用流量；
+#   · DNS fake-ip6 段（dns.fake-ip-range6，内核缺省 fd11:4455:fdea:4000::/64）：
+#     AAAA 假地址只有进内核才能换回域名再按规则分流；落进 2000::/3 时不重复装。
+# 只读内核在用配置（run/active-config.yaml），与内核此刻的真实行为对齐。
+app_ipv6_targets() {
+  _ait_cfg=$CONFIG
+  [ -r "$RUNDIR/active-config.yaml" ] && _ait_cfg=$RUNDIR/active-config.yaml
+  printf '%s\n' "2000::/3"
+  _ait_f6=$(CONFIG="$_ait_cfg" tproxy_fakeip6_range 2>/dev/null)
+  case "$_ait_f6" in
+    [23][0-9a-fA-F]*) ;;                 # 首位 2/3 = 已落在 2000::/3 内，不必再装一条
+    *:*) printf '%s\n' "$_ait_f6" ;;
+  esac
   return 0
 }
 
@@ -3582,46 +3651,654 @@ tun_app6_rule_sync() {
   _ta_ipv6=$(CONFIG="$_ta_cfg" tunhs_cfg_ipv6)
   if [ "$_ta_want" != "1" ] || [ "$_ta_ipv6" != "true" ] || [ -z "$_ta_iface" ]; then
     tun_app6_rule_cleanup
+    # TUN 不是接管方时可能是 eBPF 在接管 v6；都不是才记为「未干预」。
+    if ebpf_ipv6_redirect_cached; then
+      app_ipv6_state_set ebpf
+    else
+      app_ipv6_state_set off
+    fi
     return 0
   fi
   _ta_table=$(CONFIG="$_ta_cfg" tunhs_cfg_tun_field route-table)
   [ -n "$_ta_table" ] || _ta_table=2022
   [ "$_ta_table" = "0" ] && _ta_table=2022
   case "$_ta_table" in ''|*[!0-9]*)
-    tunhs_log "WARN app-v6-route: 无效 TUN route-table=$_ta_table，未加 UID 接管规则"
+    tunhs_log "WARN app-v6: 无效 TUN route-table=$_ta_table，应用 IPv6 未送进内核"
+    app_ipv6_state_set fail table="$_ta_table"
     return 1 ;;
   esac
+  # fwmark 那一路（app_ipv6_route_*）在干活时，这批 uidrange 规则就不必装了：
+  # 897x 的 fwmark 规则优先级更高、会先命中，8980-8989 纯属摆设。更关键的是
+  # 「规则在位、状态 tun」这个显示会继续骗人 —— 真机上就是它骗了我们一轮：
+  # 8988/8989 好好装着，应用的 v6 照样从物理网卡出去（内核的 fib6 不认 uid
+  # 选择器）。这里让位给 fwmark，状态里如实记 via=fwmark。
+  _ta_mk=$(app_ipv6_route_have)
+  case "$_ta_mk" in
+    on*)
+      tun_app6_rule_cleanup
+      app_ipv6_state_set tun iface="$_ta_iface" table="$_ta_table" \
+        pref="$(app_ipv6_route_field pref "$_ta_mk")" \
+        dsts="$(app_ipv6_targets | tr '\n' ',' | sed 's/,$//')" \
+        via=fwmark
+      return 0 ;;
+  esac
+  # 本机 ip 不认 uidrange（Android 自带的 toybox ip 就不认）→ 这批规则一条都装
+  # 不上，别每轮白撞一次：记 fail(nouidrange)，交给兜底拦截（app_ipv6_block_*）
+  # 把应用 v6 挡回 IPv4 —— 反正「送不进内核」的结果是一样的，只是手段从分流变
+  # 成回退，绝不会让国内 v6 直连出去计通用流量。
+  if ! app_ipv6_uidrange_ok; then
+    tun_app6_rule_cleanup
+    app_ipv6_state_set fail iface="$_ta_iface" table="$_ta_table" reason=nouidrange
+    return 1
+  fi
   # Do not route into a missing/half-built table during core startup or reload.
+  # 记 wait 而不是静默 return：这段窗口里内核还没接管 v6，诊断要能看出来，
+  # 监听循环下一拍（≈5s）会接着对账，路由一出现就装上。
   _ta_routes=$($TUNHS_IP -6 route show table "$_ta_table" 2>/dev/null)
-  printf '%s\n' "$_ta_routes" | awk -v d="$_ta_iface" \
-    '($1 == "default" || $1 == "::/1" || $1 == "8000::/1") { for (i=1; i<NF; i++) if ($i == "dev" && $(i+1) == d) ok=1 } END { exit !ok }' || return 0
+  if ! printf '%s\n' "$_ta_routes" | awk -v d="$_ta_iface" \
+    '($1 == "default" || $1 == "::/1" || $1 == "8000::/1") { for (i=1; i<NF; i++) if ($i == "dev" && $(i+1) == d) ok=1 } END { exit !ok }'; then
+    app_ipv6_state_set wait iface="$_ta_iface" table="$_ta_table"
+    return 0
+  fi
+  # —— 期望：每条目标段各一条 8980-8989 段规则，全部指向 TUN 路由表 ——
+  _ta_dsts=$(app_ipv6_targets)
   _ta_rules=$($TUNHS_IP -6 rule show 2>/dev/null)
-  if printf '%s\n' "$_ta_rules" | awk -v t="$_ta_table" -v u="uidrange $TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" \
-    '($1 ~ /^898[0-9]:$/) && index($0, "to 2000::/3") && index($0, "iif lo") && index($0, u) && (index($0, "lookup " t) || index($0, "table " t)) { found=1 } END { exit !found }'; then
+  _ta_have=$(printf '%s\n' "$_ta_rules" | awk -v u="uidrange $TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" \
+    '($1 ~ /^898[0-9]:$/) && index($0, "iif lo") && index($0, u) {
+       d = ""; t = ""
+       for (i = 1; i < NF; i++) if ($i == "to") d = $(i+1)
+       for (i = 1; i < NF; i++) if ($i == "lookup" || $i == "table") t = $(i+1)
+       if (d != "") print d, t
+     }')
+  _ta_match=1
+  for _ta_dst in $_ta_dsts; do
+    printf '%s\n' "$_ta_have" | awk -v d="$_ta_dst" -v t="$_ta_table" \
+      '$1 == d && $2 == t { ok = 1 } END { exit !ok }' || _ta_match=0
+  done
+  # 目标段变了（内核的 fake-ip6 段改过）或多装了旧段 → 也算不一致，整段重装。
+  # 「多装」必须按我们签名规则的条数比，而不是按命中的条数比 —— 否则改了
+  # fake-ip6 段之后旧段那条规则会永久留在 8980-8989 里（真机观察：fd11 那条
+  # 残留在表上，重启内核前不会有人拆它）。
+  _ta_want_n=$(printf '%s\n' "$_ta_dsts" | grep -c . || true)
+  _ta_have_n=$(printf '%s\n' "$_ta_have" | grep -c . || true)
+  [ "$_ta_want_n" = "$_ta_have_n" ] || _ta_match=0
+  if [ "$_ta_match" = "1" ]; then
+    _ta_prefs=$(printf '%s\n' "$_ta_rules" | awk -v t="$_ta_table" \
+      -v u="uidrange $TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" \
+      '($1 ~ /^898[0-9]:$/) && index($0, "iif lo") && index($0, u) && (index($0, "lookup " t) || index($0, "table " t)) { p = $1; sub(/:$/, "", p); printf "%s ", p }')
+    app_ipv6_state_set tun iface="$_ta_iface" table="$_ta_table" \
+      pref="$(printf '%s' "$_ta_prefs" | sed 's/^ //; s/ *$//; s/ /,/g')" \
+      dsts="$(printf '%s' "$_ta_dsts" | tr '\n' ',' | sed 's/,$//')"
     printf 'table=%s\n' "$_ta_table" > "$TUN_APP6_STATE" 2>/dev/null
     return 0
   fi
   # Route table changed or an old rule vanished: first remove only our signature.
   tun_app6_rule_cleanup
   _ta_rules=$($TUNHS_IP -6 rule show 2>/dev/null)
-  _ta_pref=$TUN_APP6_PREF_MAX
-  while [ "$_ta_pref" -ge "$TUN_APP6_PREF_MIN" ]; do
-    if ! printf '%s\n' "$_ta_rules" | grep -q "^$_ta_pref:"; then
-      if $TUNHS_IP -6 rule add pref "$_ta_pref" to 2000::/3 iif lo \
-        uidrange "$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" lookup "$_ta_table" 2>>"$TUNHS_LOG"; then
-        _ta_rules=$($TUNHS_IP -6 rule show 2>/dev/null)
-        if printf '%s\n' "$_ta_rules" | awk -v p="$_ta_pref:" -v t="$_ta_table" -v u="uidrange $TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" \
-          '$1 == p && index($0, "to 2000::/3") && index($0, "iif lo") && index($0, u) && (index($0, "lookup " t) || index($0, "table " t)) { found=1 } END { exit !found }'; then
-          printf 'table=%s\npref=%s\n' "$_ta_table" "$_ta_pref" > "$TUN_APP6_STATE" 2>/dev/null
-          tunhs_log "apply app-v6-route iface=$_ta_iface table=$_ta_table pref=$_ta_pref uid=$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX dst=2000::/3"
-          return 0
+  _ta_prefs=""
+  _ta_ok=1
+  for _ta_dst in $_ta_dsts; do
+    _ta_pref=$TUN_APP6_PREF_MAX
+    _ta_done=0
+    while [ "$_ta_pref" -ge "$TUN_APP6_PREF_MIN" ]; do
+      if ! printf '%s\n' "$_ta_rules" | grep -q "^$_ta_pref:"; then
+        if $TUNHS_IP -6 rule add pref "$_ta_pref" to "$_ta_dst" iif lo \
+          uidrange "$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" lookup "$_ta_table" 2>>"$TUNHS_LOG"; then
+          _ta_rules=$($TUNHS_IP -6 rule show 2>/dev/null)
+          if printf '%s\n' "$_ta_rules" | awk -v p="$_ta_pref:" -v t="$_ta_table" -v d="$_ta_dst" \
+            -v u="uidrange $TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" \
+            '$1 == p && index($0, "to " d) && index($0, "iif lo") && index($0, u) && (index($0, "lookup " t) || index($0, "table " t)) { found=1 } END { exit !found }'; then
+            _ta_prefs="$_ta_prefs $_ta_pref"
+            _ta_done=1
+            break
+          fi
         fi
       fi
-    fi
-    _ta_pref=$((_ta_pref - 1))
+      _ta_pref=$((_ta_pref - 1))
+    done
+    [ "$_ta_done" = "1" ] || _ta_ok=0
   done
-  tunhs_log "WARN app-v6-route: 8980-8989 无空闲 IPv6 rule priority，应用源绑定 IPv6 仍可能走蜂窝直连"
+  if [ "$_ta_ok" = "1" ]; then
+    app_ipv6_state_set tun iface="$_ta_iface" table="$_ta_table" \
+      pref="$(printf '%s' "$_ta_prefs" | sed 's/^ //; s/ *$//; s/ /,/g')" \
+      dsts="$(printf '%s' "$_ta_dsts" | tr '\n' ',' | sed 's/,$//')"
+    printf 'table=%s\n' "$_ta_table" > "$TUN_APP6_STATE" 2>/dev/null
+    tunhs_log "apply app-v6 iface=$_ta_iface table=$_ta_table pref=$(printf '%s' "$_ta_prefs" | sed 's/^ //; s/ *$//; s/ /,/g') uid=$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX dst=$(printf '%s' "$_ta_dsts" | tr '\n' ' ')"
+    return 0
+  fi
+  tunhs_log "WARN app-v6: 8980-8989 无空闲 IPv6 rule priority 或规则添加失败，应用 IPv6 仍可能直连出网（通用流量）"
+  app_ipv6_state_set fail iface="$_ta_iface" table="$_ta_table"
   return 1
+}
+
+# 本机的 ip 认不认 uidrange 选择器（结果按 ip 路径缓存）。
+#   Android 自带的 /system/bin/ip 是 toybox：它的 `ip rule` 只支持
+#   from/to/pref/tos/fwmark/realms/table/iif/type，遇到 uidrange 会直接打印用法
+#   并以非零退出 —— 也就是说上面那批规则在这类设备上一条都装不上，而且每轮对账
+#   都会再撞一次。探一次就够：装不上就彻底走兜底拦截（app_ipv6_block_*）。
+# 探测用文档段 2001:db8::/32（永远不会有真实流量）+ 8979（不与 8980-8989、
+# 8990-8999、9000-9010、netd 的 10000+ 冲突），成功立刻自删。
+APP6_UIDR_CACHE=$RUNDIR/app-ipv6.uidrange
+app_ipv6_uidrange_ok() {
+  [ -n "${TUNHS_IP:-}" ] || _tunhs_bins
+  [ -n "$TUNHS_IP" ] || return 1
+  case "$(cat "$APP6_UIDR_CACHE" 2>/dev/null)" in
+    "yes $TUNHS_IP") return 0 ;;
+    "no $TUNHS_IP")  return 1 ;;
+  esac
+  _a6u_err=$($TUNHS_IP -6 rule add pref 8979 to 2001:db8::/32 iif lo \
+    uidrange "$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" lookup 2022 2>&1)
+  if [ -n "$_a6u_err" ]; then
+    $TUNHS_IP -6 rule del pref 8979 to 2001:db8::/32 iif lo \
+      uidrange "$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" lookup 2022 2>/dev/null
+    # 只有「不认这个选择器」才缓存：优先级被占之类的临时失败留着下轮再试
+    case "$_a6u_err" in
+      *uidrange*|*"usage: ip rule"*|*Invalid*|*invalid*|*unknown*|*Unknown*|*"not supported"*) ;;
+      *) return 1 ;;
+    esac
+    printf 'no %s\n' "$TUNHS_IP" > "$APP6_UIDR_CACHE" 2>/dev/null
+    tunhs_log "WARN app-v6: 本机 ip 不支持 uidrange 选择器（$(printf '%s' "$_a6u_err" | head -n 1 | tr '\n' ' ')），应用 IPv6 改由兜底拦截（回退 IPv4）"
+    return 1
+  fi
+  $TUNHS_IP -6 rule del pref 8979 to 2001:db8::/32 iif lo \
+    uidrange "$TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX" lookup 2022 2>/dev/null
+  printf 'yes %s\n' "$TUNHS_IP" > "$APP6_UIDR_CACHE" 2>/dev/null
+  return 0
+}
+
+# ============================================================
+# 应用 IPv6 兜底拦截：谁都没接管时，宁可让 v6 立刻失败，也绝不让它裸奔出网
+# ------------------------------------------------------------
+# 背景（这次真机的坑）：TUN 模式下内核（mihomo/sing-tun）的 auto-route 只为
+# IPv4 装了「本机新连接 → TUN 路由表」的规则（iif lo src 0.0.0.0/32）；IPv6 侧
+# 是反过来的两条 goto —— iif lo src ::/1 与 iif lo src 8000::/1 一律跳过 TUN
+# 表（合起来就是整个 ::/0）。于是应用发起的 IPv6 连接（含命中 fake-ip-filter
+# 真解析出来的国内 AAAA：240e:/2408:/2409:…）一律直连出物理网卡：既绕过内核的
+# 域名/地址分流，也到不了国内出口的免流节点，免流时计成通用流量。
+#   tun_app6_rule_sync 用更高优先级（8980<9000）的 ip -6 rule 把应用 v6 抢先
+# 送回 TUN 表，但那依赖 ip 的 uidrange —— toybox 的 ip 不认它，装不上就是零条。
+# 这一层不依赖 uidrange：接管方缺席时，用 -m owner（Android 内核自带 xt_owner，
+# TProxy 的 v6 链路已在用）把 uid≥10000 的应用 IPv6 外发直接 REJECT，App 的
+# Happy Eyeballs 立刻回退 IPv4，走内核按规则分流 —— 也就是用户要的那句：
+# 「要么进内核按规则分流，要么立刻失败让 App 回退 IPv4」。
+APP6_BLOCK_STATE=$RUNDIR/app-ipv6-block.state
+APP6_BLOCK_CHAIN=MIHOMO_APP6_BLOCK
+
+app_ipv6_block_have() {   # "on iface=<tun>" / "off"（纯读状态文件，稳态零 iptables 调用）
+  _abh_v=off
+  [ -r "$APP6_BLOCK_STATE" ] && IFS= read -r _abh_v < "$APP6_BLOCK_STATE" 2>/dev/null
+  printf '%s\n' "${_abh_v:-off}"
+  return 0
+}
+app_ipv6_block_onoff() {   # 给诊断用：on / off
+  case "$(app_ipv6_block_have)" in on*) echo on ;; *) echo off ;; esac
+}
+app_ipv6_block_want() {
+  # 系统 IPv6 关着：设备根本没有 v6 出网，没什么可拦的
+  [ "$(get_setting system_ipv6 false)" = "true" ] || return 1
+  # 内核没在跑：不存在「绕过内核」这回事，拦了只是让应用断网
+  running || return 1
+  # eBPF 入站在接管 v6 时不能拦：它的重定向发生在 TC 层，出网网卡就是物理网卡，
+  # 只看出网网卡会把 eBPF 的 v6 一起掐死。
+  ebpf_ipv6_redirect_cached && return 1
+  return 0
+}
+# 期望态整行（带 TUN 网卡名：网卡换了/刚建出来要重装放行规则）
+app_ipv6_block_want_line() {
+  app_ipv6_block_want || { echo off; return 0; }
+  _abw_i=$(tunhs_find_iface 2>/dev/null)
+  echo "on iface=${_abw_i:-none}"
+}
+app_ipv6_block_unhook() {
+  [ -n "${TUNHS_IP6T:-}" ] || _tunhs_bins
+  if [ -n "$TUNHS_IP6T" ]; then
+    while $TUNHS_IP6T -w -t filter -D OUTPUT -j "$APP6_BLOCK_CHAIN" 2>/dev/null; do :; done
+    $TUNHS_IP6T -w -t filter -F "$APP6_BLOCK_CHAIN" 2>/dev/null
+    $TUNHS_IP6T -w -t filter -X "$APP6_BLOCK_CHAIN" 2>/dev/null
+  fi
+  echo off > "$APP6_BLOCK_STATE" 2>/dev/null
+  return 0
+}
+
+app_ipv6_block_hook() {   # $1=TUN 网卡名（none=没有 TUN）
+  [ -n "${TUNHS_IP6T:-}" ] || _tunhs_bins
+  [ -n "$TUNHS_IP6T" ] || return 1
+  _ab_iface=${1:-none}
+  _ab_dsts=$(app_ipv6_targets)
+  $TUNHS_IP6T -w -t filter -N "$APP6_BLOCK_CHAIN" 2>/dev/null
+  $TUNHS_IP6T -w -t filter -F "$APP6_BLOCK_CHAIN" 2>/dev/null || { app_ipv6_block_unhook; return 1; }
+  # 探测 REJECT 是否可用（少数内核没编 ip6t_REJECT）：整链改 DROP
+  _ab_act=REJECT
+  if $TUNHS_IP6T -w -t filter -A "$APP6_BLOCK_CHAIN" -d 2001:db8::/32 -j REJECT --reject-with icmp6-adm-prohibited 2>>"$TUNHS_LOG"; then
+    $TUNHS_IP6T -w -t filter -F "$APP6_BLOCK_CHAIN" 2>/dev/null
+  else
+    _ab_act=DROP
+  fi
+  _ab_ok=1
+  # —— 先放行「已经进内核」的出网：这才是本链的关键 ——
+  # 不看规则装没装、不看状态文件怎么记，只看这一刻包到底从哪块网卡出去：
+  #   · -o <TUN 网卡>：TUN 模式，v6 已进内核由规则分流（国内 → 国内出口）；
+  #   · -o lo：TProxy 模式，被 mark 的包走 local default dev lo 回注内核。
+  # 真机上见过规则装得好好的（8988/8989 都在位、状态 tun）v6 仍然直连出物理网卡
+  # —— 内核的 IPv6 策略路由未必认 uid 选择器。用出网网卡做判据就不吃这一套。
+  if [ "$_ab_iface" != "none" ]; then
+    $TUNHS_IP6T -w -t filter -A "$APP6_BLOCK_CHAIN" -o "$_ab_iface" -j RETURN 2>>"$TUNHS_LOG" || _ab_ok=0
+  fi
+  $TUNHS_IP6T -w -t filter -A "$APP6_BLOCK_CHAIN" -o lo -j RETURN 2>>"$TUNHS_LOG" || _ab_ok=0
+  # 内核自身与系统服务（uid < 10000）一律放行：内核的 IPv6 节点出网（uid 0）与
+  # IMS/电话等系统进程不能拦 —— 拦了国外 v6 节点全断。
+  $TUNHS_IP6T -w -t filter -A "$APP6_BLOCK_CHAIN" \
+    -m owner --uid-owner 0-$((TUN_APP6_UID_MIN - 1)) -j RETURN 2>>"$TUNHS_LOG" || _ab_ok=0
+  # 剩下的就是「应用的 v6 要从物理网卡裸奔出去」：目标段与「送进内核」那一路
+  # 保持一致（真 GUA 2000::/3 + DNS fake-ip6 段）
+  for _ab_d in $_ab_dsts; do
+    if [ "$_ab_act" = "REJECT" ]; then
+      $TUNHS_IP6T -w -t filter -A "$APP6_BLOCK_CHAIN" -d "$_ab_d" \
+        -j REJECT --reject-with icmp6-adm-prohibited 2>>"$TUNHS_LOG" || _ab_ok=0
+    else
+      $TUNHS_IP6T -w -t filter -A "$APP6_BLOCK_CHAIN" -d "$_ab_d" -j DROP 2>>"$TUNHS_LOG" || _ab_ok=0
+    fi
+  done
+  if [ "$_ab_ok" = "1" ]; then
+    $TUNHS_IP6T -w -t filter -C OUTPUT -j "$APP6_BLOCK_CHAIN" 2>/dev/null \
+      || $TUNHS_IP6T -w -t filter -I OUTPUT -j "$APP6_BLOCK_CHAIN" 2>>"$TUNHS_LOG" || _ab_ok=0
+  fi
+  if [ "$_ab_ok" != "1" ]; then
+    # -m owner 不可用（或 iptables 被拒）时只能放行：没有 uid 判据就拦，
+    # 等于连内核自己的 IPv6 节点一起拦死，宁可漏也不能把整台机断网。
+    tunhs_log "WARN app-v6-block: 拦截链安装失败（本机 ip6tables 不支持 -m owner？），应用 IPv6 仍会直连出网"
+    app_ipv6_block_unhook
+    return 1
+  fi
+  echo "on iface=$_ab_iface" > "$APP6_BLOCK_STATE" 2>/dev/null
+  tunhs_log "app-v6-block: 应用 IPv6 裸奔已拦（uid $TUN_APP6_UID_MIN-$TUN_APP6_UID_MAX → $(printf '%s' "$_ab_dsts" | tr '\n' ' ') → $_ab_act；放行 -o $_ab_iface/-o lo，TUN/TPROXY 接管的不动）"
+  return 0
+}
+
+# 对账入口：期望变了才动 iptables；装着的（全量轮）顺手验一次跳转还在
+app_ipv6_block_sync() {
+  _abs_w=$(app_ipv6_block_want_line)
+  _abs_h=$(app_ipv6_block_have)
+  if [ "$_abs_w" = "$_abs_h" ]; then
+    if [ "${_abs_w#on}" != "$_abs_w" ] && [ "${_SW_QUICK:-0}" != "1" ]; then
+      [ -n "${TUNHS_IP6T:-}" ] || _tunhs_bins
+      [ -z "$TUNHS_IP6T" ] || $TUNHS_IP6T -w -t filter -C OUTPUT -j "$APP6_BLOCK_CHAIN" 2>/dev/null \
+        || app_ipv6_block_hook "${_abs_w#on iface=}"
+    fi
+    return 0
+  fi
+  case "$_abs_w" in
+    off) app_ipv6_block_unhook ;;
+    *)   app_ipv6_block_hook "${_abs_w#on iface=}" ;;
+  esac
+  return 0
+}
+
+# ============================================================
+# 应用 IPv6 送进内核（第二层）：mangle 打 fwmark + ip -6 rule fwmark → TUN 表
+# ------------------------------------------------------------
+# 为什么还要第二层：tun_app6_rule_sync 那批规则依赖 ip -6 rule 的 uidrange 选择器，
+# 真机上规则装得好好在位（8988/8989、状态 tun），可应用的 v6 SYN 照样从 rmnet 出去
+# —— 内核的 IPv6 策略路由（fib6）未必按 uid 选择器匹配（uidrange 是 IPv4 FIB 先有
+# 的东西，IPv6 侧不少安卓内核没实现）。「规则装上了」不等于「规则生效」，判据必须
+# 换成不依赖 uid 的东西。
+#
+# 这一层的做法：
+#   1) ip6tables -t mangle -A OUTPUT … -j MARK --set-xmark <mark>
+#      —— uid 判据交给 -m owner（xt_owner 在安卓内核是标配，兜底拦截那一链已验证）
+#   2) ip -6 rule add pref 897x fwmark <mark> lookup <TUN 表>
+#      —— fwmark 是 fib6 从一开始就支持的选择器，没有「认不认」的问题
+# 关键在内核的 ip6table_mangle：OUTPUT 钩子跑完发现 mark 变了会强制重查路由
+# （ip6_route_me_harder），重查时 flowi_mark 已带上我们的 mark，fwmark 规则必中。
+#
+# 与兜底拦截（app_ipv6_block_*）的关系：这一层装上了，应用 v6 就从 TUN 出去，
+# 兜底链的 -o <TUN> RETURN 会放行它，REJECT 计数不再涨；这一层装不上（无 mangle
+# 表 / 无 -m owner / ip 不吃 fwmark），兜底链继续把应用 v6 挡回 IPv4。两者都
+# 满足「绝不从物理网卡裸奔出去」。
+APP6_ROUTE_MARK_VALUE=0x2000000                     # bit 25：避开 netd 与模块自己的 0x1000000（TProxy）
+APP6_ROUTE_MARK="$APP6_ROUTE_MARK_VALUE/$APP6_ROUTE_MARK_VALUE"
+APP6_ROUTE_MARK_SHORT=2000000                       # 在 ip -6 rule show 的文本里认自己（无前导零）
+APP6_ROUTE_CHAIN=MIHOMO_APP6_ROUTE
+APP6_ROUTE_STATE=$RUNDIR/app-ipv6-route.state
+APP6_ROUTE_PREFS="8978 8977 8976 8975"              # 私有段：8980-8989 是 uidrange 那批，8979 是探测位
+APP6_ROUTE_PREF_LO=8970
+APP6_ROUTE_PREF_HI=8979
+
+app_ipv6_route_have() {   # "on iface=<tun> table=<t> pref=<p>" / "off"（纯读状态文件）
+  _arh_v=off
+  [ -r "$APP6_ROUTE_STATE" ] && IFS= read -r _arh_v < "$APP6_ROUTE_STATE" 2>/dev/null
+  printf '%s\n' "${_arh_v:-off}"
+  return 0
+}
+app_ipv6_route_onoff() {   # 给诊断用：on / off
+  case "$(app_ipv6_route_have)" in on*) echo on ;; *) echo off ;; esac
+}
+app_ipv6_route_field() {   # $1=key  $2="on iface=… table=… pref=…"
+  printf '%s' "$2" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -n 1
+}
+# 内核 TUN 的 v6 路由表号（配置没写就是 2022）
+app_ipv6_route_table() {
+  _art_cfg=$CONFIG
+  [ -r "$RUNDIR/active-config.yaml" ] && _art_cfg=$RUNDIR/active-config.yaml
+  _art_t=$(CONFIG="$_art_cfg" tunhs_cfg_tun_field route-table)
+  case "$_art_t" in ''|0) _art_t=2022 ;; esac
+  case "$_art_t" in *[!0-9]*) _art_t="" ;; esac
+  printf '%s' "$_art_t"
+}
+# 期望态整行：系统 IPv6 开 + 内核在跑 + 配置开 IPv6 + 有 TUN 网卡 + 该 TUN 的
+# v6 默认路由确实在表里。最后一条是硬条件：路由表空着就把应用 v6 标进 TUN 表，
+# 结果是黑洞（连「直连出去」都不如，那种情况至少还有兜底拦截接着）。
+app_ipv6_route_want_line() {
+  [ "$(get_setting system_ipv6 false)" = "true" ] || { echo off; return 0; }
+  running || { echo off; return 0; }
+  # eBPF 入站接管 v6 时不能插手：它的重定向在 TC 层，再往 TUN 表送会打架
+  ebpf_ipv6_redirect_cached && { echo off; return 0; }
+  [ -n "${TUNHS_IP:-}" ] || _tunhs_bins
+  [ -n "$TUNHS_IP" ] || { echo off; return 0; }
+  _arw_cfg=$CONFIG
+  [ -r "$RUNDIR/active-config.yaml" ] && _arw_cfg=$RUNDIR/active-config.yaml
+  [ "$(CONFIG="$_arw_cfg" tunhs_cfg_ipv6)" = "true" ] || { echo off; return 0; }
+  _arw_i=$(tunhs_find_iface 2>/dev/null)
+  [ -n "$_arw_i" ] || { echo off; return 0; }
+  _arw_t=$(app_ipv6_route_table)
+  [ -n "$_arw_t" ] || { echo off; return 0; }
+  _arw_r=$($TUNHS_IP -6 route show table "$_arw_t" 2>/dev/null)
+  if ! printf '%s\n' "$_arw_r" | awk -v d="$_arw_i" \
+      '($1 == "default" || $1 == "::/1" || $1 == "8000::/1") { for (i = 1; i < NF; i++) if ($i == "dev" && $(i + 1) == d) ok = 1 } END { exit !ok }'; then
+    echo off; return 0
+  fi
+  # pref 沿用上一次装出来的（同一 TUN/表不变就不重装），没有才从段首取
+  _arw_p=$(app_ipv6_route_field pref "$(app_ipv6_route_have)")
+  [ -n "$_arw_p" ] || _arw_p=${APP6_ROUTE_PREFS%% *}
+  echo "on iface=$_arw_i table=$_arw_t pref=$_arw_p"
+}
+# 我们自己在位的 fwmark 规则 pref（带我们的 mark 文本才算，绝不碰别人的规则）
+app_ipv6_route_rule_pref() {
+  [ -n "${TUNHS_IP:-}" ] || return 0
+  $TUNHS_IP -6 rule show 2>/dev/null | awk -v lo="$APP6_ROUTE_PREF_LO" -v hi="$APP6_ROUTE_PREF_HI" -v m="$APP6_ROUTE_MARK_SHORT" '
+    {
+      p = $1; sub(/:$/, "", p)
+      if (p + 0 < lo + 0 || p + 0 > hi + 0) next
+      for (i = 1; i <= NF; i++) if ($i == "fwmark" && index($(i + 1), m)) { print p; exit }
+    }'
+  return 0
+}
+app_ipv6_route_unhook() {
+  [ -n "${TUNHS_IP6T:-}" ] || _tunhs_bins
+  if [ -n "$TUNHS_IP6T" ]; then
+    while $TUNHS_IP6T -w -t mangle -D OUTPUT -j "$APP6_ROUTE_CHAIN" 2>/dev/null; do :; done
+    $TUNHS_IP6T -w -t mangle -F "$APP6_ROUTE_CHAIN" 2>/dev/null || :
+    $TUNHS_IP6T -w -t mangle -X "$APP6_ROUTE_CHAIN" 2>/dev/null || :
+  fi
+  if [ -n "$TUNHS_IP" ]; then
+    _aru_t=$(app_ipv6_route_field table "$(app_ipv6_route_have)")
+    [ -n "$_aru_t" ] || _aru_t=2022
+    $TUNHS_IP -6 route del local default dev lo table "$_aru_t" 2>/dev/null || true
+    for _aru_p in $(app_ipv6_route_rule_pref); do
+      [ -n "$_aru_p" ] && $TUNHS_IP -6 rule del pref "$_aru_p" 2>/dev/null
+    done
+  fi
+  echo off > "$APP6_ROUTE_STATE" 2>/dev/null
+  return 0
+}
+app_ipv6_route_hook() {   # $1=TUN 网卡名  $2=路由表号
+  _arh_iface=${1:-}
+  _arh_table=${2:-2022}
+  [ -n "$_arh_iface" ] || return 1
+  [ -n "${TUNHS_IP6T:-}" ] || _tunhs_bins
+  [ -n "$TUNHS_IP6T" ] && [ -n "$TUNHS_IP" ] || return 1
+  # mangle 表不在（少数内核没编 ip6table_mangle）就谈不上 OUTPUT 重查路由
+  $TUNHS_IP6T -w -t mangle -L -n >/dev/null 2>&1 || return 1
+  _arh_dsts=$(app_ipv6_targets)
+  [ -n "$_arh_dsts" ] || return 1
+  # —— 1) 策略路由：只认 fwmark。不带 iif、不带 uid ——
+  # 不带 iif 是刻意的：ip6_route_me_harder 重查时 flowi_iif 未必还是 lo，带上
+  # iif lo 有可能永远匹配不上（sing-tun 用的是 iifname，同一类风险）。
+  _arh_pref=""
+  for _arh_p in $APP6_ROUTE_PREFS; do
+    if $TUNHS_IP -6 rule add pref "$_arh_p" fwmark "$APP6_ROUTE_MARK" lookup "$_arh_table" 2>>"$TUNHS_LOG"; then
+      _arh_pref=$_arh_p; break
+    fi
+    # 少数 ip（含部分 toybox）只吃单个数值，不认 mark/mask 写法
+    if $TUNHS_IP -6 rule add pref "$_arh_p" fwmark "$APP6_ROUTE_MARK_VALUE" lookup "$_arh_table" 2>>"$TUNHS_LOG"; then
+      _arh_pref=$_arh_p; break
+    fi
+  done
+  if [ -z "$_arh_pref" ]; then
+    tunhs_log "WARN app-v6-route: fwmark 策略路由装不上，应用 IPv6 仍由兜底拦截挡回 IPv4（不裸奔）"
+    return 1
+  fi
+  # —— 1.5) 环回默认路由：与 boxproxy 保持一致，给 fake-ip6 / 环回流量提供 lo 出口 ——
+  # boxproxy 在策略路由表里加 local default dev lo，确保发往 fake-ip6 的流量能被
+  # 内核正确路由到本地（mihomo 在 TUN 里做 fake-ip 回解）。没有这一条，fake-ip6
+  # 流量可能被送进 TUN 却找不到回程路径，导致应用 v6 连接建不起来。
+  if ! $TUNHS_IP -6 route show table "$_arh_table" 2>/dev/null | busybox grep -q '^local default dev lo\b'; then
+    $TUNHS_IP -6 route add local default dev lo table "$_arh_table" 2>>"$TUNHS_LOG" || true
+  fi
+  # —— 2) mangle 打标链 ——
+  $TUNHS_IP6T -w -t mangle -N "$APP6_ROUTE_CHAIN" 2>/dev/null
+  $TUNHS_IP6T -w -t mangle -F "$APP6_ROUTE_CHAIN" 2>/dev/null || { app_ipv6_route_unhook; return 1; }
+  _arh_ok=1
+  # 已经从 TUN / 回环出去的不用再标（内核回给 TUN 客户端的包、本地 DNS、TProxy 回注）
+  $TUNHS_IP6T -w -t mangle -A "$APP6_ROUTE_CHAIN" -o "$_arh_iface" -j RETURN 2>>"$TUNHS_LOG" || _arh_ok=0
+  $TUNHS_IP6T -w -t mangle -A "$APP6_ROUTE_CHAIN" -o lo -j RETURN 2>>"$TUNHS_LOG" || _arh_ok=0
+  # 内核自身与系统服务（uid < 10000）不打标：内核的 IPv6 节点出网必须走物理网卡，
+  # 标了就自己钻进 TUN 形成回环 —— 这是本链唯一不能出错的一条。
+  $TUNHS_IP6T -w -t mangle -A "$APP6_ROUTE_CHAIN" \
+    -m owner --uid-owner 0-$((TUN_APP6_UID_MIN - 1)) -j RETURN 2>>"$TUNHS_LOG" || _arh_ok=0
+  # 目标段与「送进内核」那一路保持一致（真 GUA 2000::/3 + DNS fake-ip6 段）
+  for _arh_d in $_arh_dsts; do
+    $TUNHS_IP6T -w -t mangle -A "$APP6_ROUTE_CHAIN" -d "$_arh_d" \
+      -j MARK --set-xmark "$APP6_ROUTE_MARK" 2>>"$TUNHS_LOG" || _arh_ok=0
+  done
+  if [ "$_arh_ok" = "1" ]; then
+    $TUNHS_IP6T -w -t mangle -C OUTPUT -j "$APP6_ROUTE_CHAIN" 2>/dev/null \
+      || $TUNHS_IP6T -w -t mangle -I OUTPUT -j "$APP6_ROUTE_CHAIN" 2>>"$TUNHS_LOG" || _arh_ok=0
+  fi
+  if [ "$_arh_ok" != "1" ]; then
+    # 装链失败必须把 1) 那条规则一起撤掉：光有规则没人打标，等于埋一颗
+    # 「哪天有人打了同样的 mark 就把应用 v6 送进 TUN 表」的雷。
+    tunhs_log "WARN app-v6-route: mangle 打标链安装失败（本机 ip6tables 不支持 -m owner / -j MARK？），应用 IPv6 仍由兜底拦截挡回 IPv4"
+    app_ipv6_route_unhook
+    return 1
+  fi
+  echo "on iface=$_arh_iface table=$_arh_table pref=$_arh_pref" > "$APP6_ROUTE_STATE" 2>/dev/null
+  tunhs_log "app-v6-route: 应用 IPv6 由 fwmark 送进内核（mark $APP6_ROUTE_MARK → 表 $_arh_table pref $_arh_pref；目标 $(printf '%s' "$_arh_dsts" | tr '\n' ' ')）"
+  return 0
+}
+# 对账入口：期望变了才动 iptables/ip rule；装着的（全量轮）顺手验一次还在不在
+app_ipv6_route_sync() {
+  _ars_w=$(app_ipv6_route_want_line)
+  _ars_h=$(app_ipv6_route_have)
+  if [ "$_ars_w" != "$_ars_h" ]; then
+    app_ipv6_route_unhook
+    case "$_ars_w" in
+      off) ;;
+      *)
+        _ars_i=$(app_ipv6_route_field iface "$_ars_w")
+        _ars_t=$(app_ipv6_route_field table "$_ars_w")
+        app_ipv6_route_hook "$_ars_i" "${_ars_t:-2022}" || return 0 ;;
+    esac
+    return 0
+  fi
+  case "$_ars_w" in off) return 0 ;; esac
+  [ "${SW_QUICK:-0}" = "1" ] && return 0
+  [ -n "${TUNHS_IP6T:-}" ] || _tunhs_bins
+  [ -n "$TUNHS_IP6T" ] || return 0
+  # 外部（fw4 reload、别的模块清表、手动 ip -6 rule del）拆过就自愈重装
+  if ! $TUNHS_IP6T -w -t mangle -C OUTPUT -j "$APP6_ROUTE_CHAIN" 2>/dev/null \
+     || [ -z "$(app_ipv6_route_rule_pref)" ]; then
+    app_ipv6_route_unhook
+    app_ipv6_route_hook "$(app_ipv6_route_field iface "$_ars_w")" "$(app_ipv6_route_field table "$_ars_w")" || return 0
+  fi
+  return 0
+}
+
+# ============================================================
+# 应用 IPv6 的 DNS 源头：把发往 [::1]:53 的查询交给内核自己的 DNS
+# ------------------------------------------------------------
+# 真机观察：应用每发起一次 v6 连接，就先往 [::1]:53 发一条 AAAA 查询（出网网卡是
+# lo，兜底拦截按「已经进内核/回环」放行了它），拿到 AAAA 之后的 SYN 才被兜底拦下。
+# 这个 ::1:53 并不是内核的 DNS，配置里的 dns.ipv6:false 管不到它 —— 于是应用
+# 拿得到 AAAA，白搭一次往返，免流场景下还是一次徒劳的尝试。
+#
+# 这里把它 DNAT 到内核自己的 DNS 监听端口，让「要不要给 AAAA」回到配置手里：
+#   · dns.ipv6: false（当前配置）→ 不返回 AAAA，应用直接走 IPv4，零 v6 尝试；
+#   · dns.ipv6: true            → 返回 AAAA，由上面的 fwmark 那层送进内核分流。
+# 也就是说本链只负责「谁来回答」，不替用户决定「用不用 v6」。
+#
+# 安全边界（三条，缺一不装）：
+#   1) ip6tables 的 nat 表得真的可用（不少安卓内核没编 IPv6 NAT）；
+#   2) 配置里 dns.listen 必须是双栈通配（:1053 / [::]:1053）—— 写 0.0.0.0:1053
+#      时 ::1:1053 没人应答，接管过去等于把 DNS 引到黑洞；
+#   3) /proc/net/{tcp,udp}6 里确实有进程在 :: 或 ::1 的那个端口上监听。
+# 任何一条不满足就整链不装，保持现状（现状只是多一次往返，不会漏流量）。
+APP6_DNS_STATE=$RUNDIR/app-ipv6-dns.state
+APP6_DNS_CHAIN=MIHOMO_DNS6_HIJACK
+
+app_ipv6_dns_have() {   # "on port=<p>" / "off"（纯读状态文件）
+  _adh_v=off
+  [ -r "$APP6_DNS_STATE" ] && IFS= read -r _adh_v < "$APP6_DNS_STATE" 2>/dev/null
+  printf '%s\n' "${_adh_v:-off}"
+  return 0
+}
+app_ipv6_dns_onoff() {   # 给诊断用：on / off
+  case "$(app_ipv6_dns_have)" in on*) echo on ;; *) echo off ;; esac
+}
+# 内核 DNS 监听端口：只认「也能在 ::1 上应答」的写法，其余一律当作不可接管
+app_ipv6_dns_port() {
+  _adp_cfg=$CONFIG
+  [ -r "$RUNDIR/active-config.yaml" ] && _adp_cfg=$RUNDIR/active-config.yaml
+  [ -f "$_adp_cfg" ] || return 1
+  _adp_l=$(awk '
+    /^[^ \t#-]/ { inb = ($1 == "dns:") }
+    inb {
+      l = $0; sub(/[ \t]*#.*$/, "", l)
+      if (l ~ /^[ \t]*listen:[ \t]*/) {
+        sub(/^[ \t]*listen:[ \t]*/, "", l); gsub(/["\047]/, "", l); print l; exit
+      }
+    }' "$_adp_cfg" 2>/dev/null)
+  [ -n "$_adp_l" ] || return 1
+  case "$_adp_l" in
+    \[*\]:*) _adp_h=${_adp_l%%\]:*}; _adp_h=${_adp_h#\[}; _adp_p=${_adp_l##*:} ;;
+    *)       _adp_h=${_adp_l%:*};    _adp_p=${_adp_l##*:} ;;
+  esac
+  # 只接受双栈通配：空主机（:1053）或 [::]（[::]:1053）
+  case "$_adp_h" in ''|::) ;; *) return 1 ;; esac
+  case "$_adp_p" in ''|*[!0-9]*) return 1 ;; esac
+  echo "$_adp_p"
+  return 0
+}
+# 真的有人在 :: / ::1 的这个端口上监听？（tcp6 LISTEN=0A，udp6=07）
+app_ipv6_dns_listening() {   # $1=port
+  _adl_p=$(printf '%04X' "$1" 2>/dev/null)
+  case "$_adl_p" in ''|*[!0-9A-Fa-f]*) return 1 ;; esac
+  for _adl_f in "${APP6_DNS_PROC:-/proc/net}"/udp6 "${APP6_DNS_PROC:-/proc/net}"/tcp6; do
+    [ -r "$_adl_f" ] || continue
+    if awk -v p="$_adl_p" '
+      NR > 1 {
+        split($2, a, ":")
+        if (toupper(a[2]) != p) next
+        la = toupper(a[1])
+        if (la != "00000000000000000000000000000000" && la != "00000000000000000000000001000000") next
+        if ($4 == "0A" || $4 == "07") { ok = 1; exit }
+      }
+      END { exit !ok }' "$_adl_f" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+# IPv6 NAT 能力探测（结果缓存：不少安卓内核没编 ip6table_nat，探测一次就够，
+# 免得每轮对账都去列一遍 nat 表）。能力没有就整链不装 —— 没有 nat 就无从 DNAT。
+APP6_DNS_NAT_CACHE=$RUNDIR/app-ipv6.dnsnat
+app_ipv6_dns_nat_ok() {
+  [ -n "${TUNHS_IP6T:-}" ] || _tunhs_bins
+  [ -n "$TUNHS_IP6T" ] || return 1
+  case "$(cat "$APP6_DNS_NAT_CACHE" 2>/dev/null)" in
+    "yes $TUNHS_IP6T") return 0 ;;
+    "no $TUNHS_IP6T")  return 1 ;;
+  esac
+  if $TUNHS_IP6T -w -t nat -L -n >/dev/null 2>&1; then
+    printf 'yes %s\n' "$TUNHS_IP6T" > "$APP6_DNS_NAT_CACHE" 2>/dev/null
+    return 0
+  fi
+  printf 'no %s\n' "$TUNHS_IP6T" > "$APP6_DNS_NAT_CACHE" 2>/dev/null
+  return 1
+}
+app_ipv6_dns_want_line() {
+  [ "$(get_setting system_ipv6 false)" = "true" ] || { echo off; return 0; }
+  running || { echo off; return 0; }
+  ebpf_ipv6_redirect_cached && { echo off; return 0; }
+  [ -n "${TUNHS_IP6T:-}" ] || _tunhs_bins
+  [ -n "$TUNHS_IP6T" ] || { echo off; return 0; }
+  app_ipv6_dns_nat_ok || { echo off; return 0; }
+  _adw_p=$(app_ipv6_dns_port) || { echo off; return 0; }
+  [ -n "$_adw_p" ] || { echo off; return 0; }
+  app_ipv6_dns_listening "$_adw_p" || { echo off; return 0; }
+  echo "on port=$_adw_p"
+}
+app_ipv6_dns_unhook() {
+  [ -n "${TUNHS_IP6T:-}" ] || _tunhs_bins
+  if [ -n "$TUNHS_IP6T" ]; then
+    while $TUNHS_IP6T -w -t nat -D OUTPUT -d ::1 -p udp --dport 53 -j "$APP6_DNS_CHAIN" 2>/dev/null; do :; done
+    while $TUNHS_IP6T -w -t nat -D OUTPUT -d ::1 -p tcp --dport 53 -j "$APP6_DNS_CHAIN" 2>/dev/null; do :; done
+    $TUNHS_IP6T -w -t nat -F "$APP6_DNS_CHAIN" 2>/dev/null || :
+    $TUNHS_IP6T -w -t nat -X "$APP6_DNS_CHAIN" 2>/dev/null || :
+  fi
+  echo off > "$APP6_DNS_STATE" 2>/dev/null
+  return 0
+}
+app_ipv6_dns_hook() {   # $1=内核 DNS 端口
+  _adh_port=${1:-}
+  case "$_adh_port" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "${TUNHS_IP6T:-}" ] || _tunhs_bins
+  [ -n "$TUNHS_IP6T" ] || return 1
+  $TUNHS_IP6T -w -t nat -L -n >/dev/null 2>&1 || return 1
+  $TUNHS_IP6T -w -t nat -N "$APP6_DNS_CHAIN" 2>/dev/null
+  $TUNHS_IP6T -w -t nat -F "$APP6_DNS_CHAIN" 2>/dev/null || { app_ipv6_dns_unhook; return 1; }
+  _adh_ok=1
+  # 内核自身与系统服务（uid < 10000）不接管：内核自己的 DNS 出口（含 DoH 前的
+  # bootstrap）不能被指回自己，否则 DNS 死循环。
+  $TUNHS_IP6T -w -t nat -A "$APP6_DNS_CHAIN" \
+    -m owner --uid-owner 0-$((TUN_APP6_UID_MIN - 1)) -j RETURN 2>>"$TUNHS_LOG" || _adh_ok=0
+  for _adh_pr in udp tcp; do
+    $TUNHS_IP6T -w -t nat -A "$APP6_DNS_CHAIN" -p "$_adh_pr" -d ::1 --dport 53 \
+      -j DNAT --to-destination "[::1]:$_adh_port" 2>>"$TUNHS_LOG" || _adh_ok=0
+  done
+  if [ "$_adh_ok" = "1" ]; then
+    for _adh_pr in udp tcp; do
+      $TUNHS_IP6T -w -t nat -C OUTPUT -d ::1 -p "$_adh_pr" --dport 53 -j "$APP6_DNS_CHAIN" 2>/dev/null \
+        || $TUNHS_IP6T -w -t nat -I OUTPUT -d ::1 -p "$_adh_pr" --dport 53 -j "$APP6_DNS_CHAIN" 2>>"$TUNHS_LOG" || _adh_ok=0
+    done
+  fi
+  if [ "$_adh_ok" != "1" ]; then
+    tunhs_log "WARN app-v6-dns: [::1]:53 接管失败（本机 ip6tables 无 nat 表 / 不支持 DNAT？），维持现状"
+    app_ipv6_dns_unhook
+    return 1
+  fi
+  echo "on port=$_adh_port" > "$APP6_DNS_STATE" 2>/dev/null
+  tunhs_log "app-v6-dns: 应用的 IPv6 DNS（[::1]:53）已交回内核应答（→ [::1]:$_adh_port；是否返回 AAAA 由配置 dns.ipv6 决定）"
+  return 0
+}
+app_ipv6_dns_sync() {
+  _ads_w=$(app_ipv6_dns_want_line)
+  _ads_h=$(app_ipv6_dns_have)
+  if [ "$_ads_w" != "$_ads_h" ]; then
+    app_ipv6_dns_unhook
+    case "$_ads_w" in
+      off) ;;
+      *)   app_ipv6_dns_hook "${_ads_w#on port=}" || return 0 ;;
+    esac
+    return 0
+  fi
+  case "$_ads_w" in off) return 0 ;; esac
+  [ "${SW_QUICK:-0}" = "1" ] && return 0
+  [ -n "${TUNHS_IP6T:-}" ] || _tunhs_bins
+  [ -n "$TUNHS_IP6T" ] || return 0
+  $TUNHS_IP6T -w -t nat -C OUTPUT -d ::1 -p udp --dport 53 -j "$APP6_DNS_CHAIN" 2>/dev/null \
+    || { app_ipv6_dns_unhook; app_ipv6_dns_hook "${_ads_w#on port=}" || return 0; }
+  return 0
 }
 
 tunhs_log() {
@@ -3895,6 +4572,9 @@ tun_hotspot_orphan_clean() {
   running && return 0
   _tunhs_bins
   tun_app6_rule_cleanup
+  app_ipv6_route_unhook
+  app_ipv6_dns_unhook
+  app_ipv6_block_unhook
   [ -n "$TUNHS_IPT" ] || [ -n "$TUNHS_NFT" ] || return 0
   _to_old=""
   [ -f "$TUNHS_STATE" ] && _to_old=$(grep '^iface=' "$TUNHS_STATE" 2>/dev/null | cut -d= -f2)
@@ -4048,7 +4728,16 @@ _tunhs_sync_body() {
   # Mihomo Android core's 9000 /1 source rules bypass table 2022 for locally
   # originated sockets already bound to a global IPv6 source. Re-route app UIDs
   # (not root-owned Mihomo node sockets) through its IPv6 table before those rules.
+  # 应用 IPv6 送进内核：先走不依赖 uid 选择器的 fwmark 那一路（app_ipv6_route_*）。
+  app_ipv6_route_sync
+  # 应用 IPv6 DNS 的源头：把 [::1]:53 交回内核应答（详见 app_ipv6_dns_* 的注释）
+  app_ipv6_dns_sync
+  # 上面那一路装不上时自动退回 uidrange 规则（tun_app6_rule_sync 内部按
+  # app_ipv6_route_have 判断）；再装不上（本机 ip 不认 uidrange / 内核 v6 路由
+  # 未就绪 / 优先级被占）时，这里兜住：应用 v6 一律不许裸奔出网
+  # （详见 app_ipv6_block_* 的注释）
   tun_app6_rule_sync "$_ts_want" "$_ts_iface"
+  app_ipv6_block_sync
   # —— 无变化早退（含「TUN 尚未建好」的等待场景：不拆既有规则，等下轮重试）——
   # ver<3（旧版本状态）一律重建，保证旧规则/旧链被升级清洗。
   # 网卡/ipv6 变化必须重装（在最外层比较）；期望「无直连」（want=0 或
@@ -4383,7 +5072,49 @@ tun_hotspot_diag() {
     fi
     echo "== TUN 热点直连专用表 $TUNHS_TABLE =="
     $TUNHS_IP route show table "$TUNHS_TABLE" 2>&1
+    # 应用 IPv6 出网：这一节回答「开了系统 IPv6 之后，App 的 v6 到底进没进内核」。
+    # 不进内核 = 国内 v6 直连出去，免流时计成通用流量。
+    echo "== 应用 IPv6 出网（$(app_ipv6_state)）=="
+    echo "  状态文件：$(tr '\n' ' ' < "$APP6_STATE" 2>/dev/null)"
+    echo "  目标段：$(app_ipv6_targets | tr '\n' ' ' 2>/dev/null)"
+    echo "  策略路由（8980-8989，应用 uid ≥10000 的 v6 接管规则）："
+    # 管道末尾是 sed，退出码恒为 0，「(无)」分支只能靠判空打印
+    _dg_a6r=$($TUNHS_IP -6 rule show 2>/dev/null | grep -E '^898[0-9]:' | sed 's/^/  /')
+    echo "${_dg_a6r:-  (无)}"
+    # 哪个 ip 在干活：Android 自带的 /system/bin/ip 是指向 toybox 的符号链接，
+    # 而 toybox 的 ip rule 不认 uidrange —— 上面那批接管规则在它手里一条都装
+    # 不上（诊断里看到 toybox 就等于解释了「为什么 v6 接管规则是空的」）
+    _dg_ipl=$(readlink "$TUNHS_IP" 2>/dev/null)
+    _dg_tv=$(toybox --version 2>/dev/null | head -n 1)
+    echo "  ip 命令：$TUNHS_IP${_dg_ipl:+ → $_dg_ipl}${_dg_tv:+ ($_dg_tv)}"
+    echo "  uidrange 选择器：$(cat "$APP6_UIDR_CACHE" 2>/dev/null || echo '(未探测)')"
   else echo "(无 ip 命令)"; fi
+  # 兜底拦截链：没有接管方时应用 v6 就靠它挡住（诊断里必须能看到它在不在）
+  if [ -n "$TUNHS_IP6T" ]; then
+    # 应用 IPv6 送进内核（fwmark）：装在位 ≠ 生效，这里要能看到规则、链、跳转三者都在
+    echo "== 应用 IPv6 送内核（fwmark → TUN 表；$(app_ipv6_route_have)）=="
+    echo "  mark=$APP6_ROUTE_MARK  pref 段=$APP6_ROUTE_PREFS"
+    echo "  策略路由（8970-8979 里带我们 mark 的）："
+    _dg_a6m=""
+    if [ -n "$TUNHS_IP" ]; then
+      _dg_a6m=$($TUNHS_IP -6 rule show 2>/dev/null | grep -E '^897[0-9]:' | grep -- "$APP6_ROUTE_MARK_SHORT" | sed 's/^/  /')
+    fi
+    echo "${_dg_a6m:-  (无)}"
+    echo "  mangle 打标链："
+    $TUNHS_IP6T -w -t mangle -S "$APP6_ROUTE_CHAIN" 2>&1 | sed 's/^/  /' || echo "  (无)"
+    echo "  mangle OUTPUT 跳转："
+    $TUNHS_IP6T -w -t mangle -S OUTPUT 2>/dev/null | grep -- "$APP6_ROUTE_CHAIN" | sed 's/^/  /' || echo "  (无)"
+    echo "== 应用 IPv6 DNS 接管（$(app_ipv6_dns_have)）=="
+    echo "  内核 DNS 端口：$(app_ipv6_dns_port 2>/dev/null || echo '(配置非双栈通配 / 读不到)')"
+    echo "  nat 接管链："
+    $TUNHS_IP6T -w -t nat -S "$APP6_DNS_CHAIN" 2>&1 | sed 's/^/  /' || echo "  (无)"
+    echo "  nat OUTPUT 跳转："
+    $TUNHS_IP6T -w -t nat -S OUTPUT 2>/dev/null | grep -- "$APP6_DNS_CHAIN" | sed 's/^/  /' || echo "  (无)"
+    echo "== 应用 IPv6 兜底拦截（$(app_ipv6_block_have)）==（只拦从物理网卡裸奔出去的应用 v6）"
+    $TUNHS_IP6T -w -t filter -S "$APP6_BLOCK_CHAIN" 2>&1 | sed 's/^/  /' || echo "  (无)"
+    echo "  filter OUTPUT 跳转："
+    $TUNHS_IP6T -w -t filter -S OUTPUT 2>/dev/null | grep -- "$APP6_BLOCK_CHAIN" | sed 's/^/  /' || echo "  (无)"
+  fi
   if [ -n "$TUNHS_IPT" ]; then
     echo "== iptables FORWARD（相关行） =="
     $TUNHS_IPT -S FORWARD 2>&1 | grep -Ei 'mihomo|Meta|tunhs|tetherctrl' || echo "(无相关规则)"
@@ -5464,10 +6195,198 @@ ipv6_proxy_state() {
 # 系统 IPv6 速览（诊断/自检用）：期望值、上次漂移追打、各网卡实况。
 # 关态下若某块网卡显示 0：它刚被 netd 放开，下一拍对账（≤IPV6_TICK 秒）就会
 # 追回，除非正处于 60s 冷却窗口 —— 这是排查「飞行模式后 v6 泄露」的第一手现场。
+# ============================================================
+# ipv6-diag：一键把「应用 IPv6 到底进没进内核」的全部判据导出成一份文本
+# ------------------------------------------------------------
+# 排查这一类问题要在真机上反复取计数器、反复贴截图，光是「哪条命令的哪个参数
+# 在本机不被支持」就会来回好几轮（ip -6 rule 的 uidrange、ip6tables legacy 不
+# 接受 -L -n -v -Z、ip route get 的 uid 参数……）。这里一次把全部判据跑齐，
+# 结果同时打到标准输出与 $RUNDIR/ipv6-diag.txt —— 直接把文件拿出来贴就行。
+#
+# 用法：
+#   mihomo.sh ipv6-diag          # 取一份当前快照
+#   mihomo.sh ipv6-diag -z       # 先把兜底拦截链计数归零，再取快照；
+#                                # 用 2 分钟后不带 -z 再取一份，两份相减就是
+#                                # 「这段时间里漏了多少」（legacy ip6tables 的
+#                                # -Z 不能与 -L -n -v 连用，必须单独调用）
+IPV6_DIAG_OUT=$RUNDIR/ipv6-diag.txt
+
+# 跑一条命令并把输出收进诊断：标题 + 输出 + 退出码（管道/重定向一律用 sh -c 包）
+_id_sh() {   # $1=小标题  $2=整条 shell 命令行
+  printf -- '---- %s ----\n' "$1"
+  # 把命令原样打出来：拿快照的人能直接复跑某一条，不必回来问「这一节到底跑了什么」
+  printf '$ %s\n' "$2"
+  _id_rc=0
+  _id_o=$(sh -c "$2" 2>&1) || _id_rc=$?
+  printf '%s\n' "${_id_o:-  (无输出)}"
+  [ "$_id_rc" -ne 0 ] && printf '  (退出码 %s)\n' "$_id_rc"
+  echo
+  return 0
+}
+
+ipv6_diag() {
+  _id_zero=0
+  case "${1:-}" in -z|--zero) _id_zero=1 ;; esac
+  _tunhs_bins
+  {
+    echo "mihomo_box 应用 IPv6 诊断快照"
+    echo "时间：$(date '+%F %T %z' 2>/dev/null)"
+    echo "归零后重采：$_id_zero（0=否 1=本次已先把计数归零）"
+    echo
+    echo "############ 现状摘要（ipv6-status） ############"
+    ipv6_status 2>&1 || :
+    echo
+    echo "############ 工具链 ############"
+    printf 'ip      : %s\n' "${TUNHS_IP:-(未找到)}"
+    printf 'ip6tables: %s\n' "${TUNHS_IP6T:-(未找到)}"
+    if [ -n "$TUNHS_IP" ]; then
+      printf 'ip 版本 : %s\n' "$($TUNHS_IP -V 2>&1 | head -n 1)"
+      printf 'ip 链接 : %s\n' "$(readlink "$TUNHS_IP" 2>/dev/null || echo '(不是符号链接)')"
+      printf 'ip 认 uidrange : %s\n' "$(cat "$APP6_UIDR_CACHE" 2>/dev/null || echo '(未探测)')"
+    fi
+    if [ -n "$TUNHS_IP6T" ]; then
+      printf 'ip6tables 版本: %s\n' "$($TUNHS_IP6T --version 2>&1 | head -n 1)"
+      printf 'mangle 表可用 : %s\n' "$($TUNHS_IP6T -w -t mangle -L -n >/dev/null 2>&1 && echo 是 || echo 否)"
+      printf 'nat 表可用    : %s\n' "$($TUNHS_IP6T -w -t nat -L -n >/dev/null 2>&1 && echo 是 || echo 否)"
+    fi
+    echo
+
+    echo "############ 兜底拦截链（谁都没接管时靠它挡住裸奔） ############"
+    if [ -n "$TUNHS_IP6T" ]; then
+      if [ "$_id_zero" = "1" ]; then
+        # legacy ip6tables 的 -Z 是独立命令，不能写成 -L -n -v -Z（会报
+        # "Illegal option `--numeric' with this command"），必须单独调一次
+        $TUNHS_IP6T -w -t filter -Z "$APP6_BLOCK_CHAIN" 2>&1 && echo "（计数已归零）"
+        echo
+      fi
+      _id_sh "链规则与计数器（$APP6_BLOCK_CHAIN）" \
+        "$TUNHS_IP6T -w -t filter -L $APP6_BLOCK_CHAIN -n -v"
+      _id_sh "filter OUTPUT 里的跳转" \
+        "$TUNHS_IP6T -w -t filter -S OUTPUT | grep -- $APP6_BLOCK_CHAIN"
+    else
+      echo "(无 ip6tables)"
+    fi
+    echo
+
+    echo "############ 送进内核（fwmark 那一路，不依赖 uid 选择器） ############"
+    printf '状态文件：%s\n' "$(app_ipv6_route_have)"
+    printf 'mark：%s   pref 段：%s\n' "$APP6_ROUTE_MARK" "$APP6_ROUTE_PREFS"
+    if [ -n "$TUNHS_IP" ]; then
+      _id_sh "策略路由（8970-8999，含我们的 fwmark 与 uidrange 那批）" \
+        "$TUNHS_IP -6 rule show | grep -E '^89[78][0-9]:|^900[0-9]:|^9010:'"
+      _id_sh "TUN 路由表 $(app_ipv6_route_table) 的 v6 路由" \
+        "$TUNHS_IP -6 route show table $(app_ipv6_route_table)"
+    else
+      echo "(无 ip)"
+    fi
+    if [ -n "$TUNHS_IP6T" ]; then
+      _id_sh "mangle 打标链（$APP6_ROUTE_CHAIN）" \
+        "$TUNHS_IP6T -w -t mangle -S $APP6_ROUTE_CHAIN"
+      _id_sh "mangle OUTPUT 里的跳转" \
+        "$TUNHS_IP6T -w -t mangle -S OUTPUT | grep -- $APP6_ROUTE_CHAIN"
+    fi
+    echo
+
+    echo "############ 路由判决（这一节决定 v6 到底从哪块网卡出去） ############"
+    if [ -n "$TUNHS_IP" ]; then
+      # 取一个真正在用 v6 的应用 uid：判据要贴近真实流量，不要用拍脑袋的 uid
+      _id_uid=$(awk 'NR > 1 { u = $8 + 0; if (u >= 10000) { print u; exit } }' /proc/net/tcp6 2>/dev/null) || _id_uid=""
+      [ -n "$_id_uid" ] || _id_uid=10123
+      printf '采样用的应用 uid：%s（来自 /proc/net/tcp6；没有 v6 socket 时取 10123）\n' "$_id_uid"
+      echo
+      _id_sh "国内 v6 目标（2400:3200::1）带 uid 判决" \
+        "$TUNHS_IP -6 route get 2400:3200::1 uid $_id_uid"
+      _id_sh "国内 v6 目标（2400:3200::1）不带 uid 判决" \
+        "$TUNHS_IP -6 route get 2400:3200::1"
+      _id_sh "国外 v6 目标（2606:4700:4700::1111）带 uid 判决" \
+        "$TUNHS_IP -6 route get 2606:4700:4700::1111 uid $_id_uid"
+    else
+      echo "(无 ip)"
+    fi
+    echo
+
+    echo "############ 应用 IPv6 DNS 的源头 ############"
+    printf '状态文件：%s\n' "$(app_ipv6_dns_have)"
+    printf '内核 DNS 端口（dns.listen）：%s\n' "$(app_ipv6_dns_port 2>/dev/null || echo '(配置非双栈通配 / 读不到)')"
+    printf '该端口在 ::1 上有人监听：%s\n' "$(app_ipv6_dns_port >/dev/null 2>&1 && app_ipv6_dns_listening "$(app_ipv6_dns_port)" && echo 是 || echo 否)"
+    _id_sh "谁在 IPv6 的 53 端口上（/proc/net/udp6，本地端口 0035）" \
+      "awk 'NR > 1 && \$4 == \"07\" { split(\$2, a, \":\"); if (toupper(a[2]) == \"0035\") print \"  uid=\" \$8 \" 本地=\" \$2 \" inode=\" \$10 } END { print \"  (以上为全部)\" }' /proc/net/udp6"
+    if [ -n "$TUNHS_IP6T" ]; then
+      _id_sh "nat 接管链（$APP6_DNS_CHAIN）" \
+        "$TUNHS_IP6T -w -t nat -S $APP6_DNS_CHAIN"
+      _id_sh "nat OUTPUT 里的跳转" \
+        "$TUNHS_IP6T -w -t nat -S OUTPUT | grep -- $APP6_DNS_CHAIN"
+    fi
+    echo
+
+    echo "############ v6 socket 归属（谁在真的用 IPv6） ############"
+    _id_sh "tcp6：按 uid 计数（字段 8 是 uid）" \
+      "awk 'NR > 1 { print \$8 }' /proc/net/tcp6 | sort -n | uniq -c"
+    _id_sh "udp6：按 uid 计数" \
+      "awk 'NR > 1 { print \$8 }' /proc/net/udp6 | sort -n | uniq -c"
+    _id_sh "tcp6：已建立连接（st=01）按 uid 计数" \
+      "awk 'NR > 1 && \$4 == \"01\" { print \$8 }' /proc/net/tcp6 | sort -n | uniq -c"
+    # 光有 uid 计数还不够回答「是不是有国内 v6 在跑」：要把对端地址解出来。
+    # /proc/net/tcp6 的 local/remote 是 4 个 32 位字、**每个字内部字节倒序**的十六进制，
+    # 直接贴给人看等于没贴，这里还原成正常的冒分 IPv6。
+    _id_sh "tcp6：已建立连接的 uid → 对端（前 40 条）" \
+      "awk 'function h2d(h,  i, c, v, d) { d = 0; h = tolower(h); for (i = 1; i <= length(h); i++) { c = substr(h, i, 1); v = index(\"0123456789abcdef\", c) - 1; d = d * 16 + v } return d } function v6(hex,  i, w, out) { out = \"\"; for (i = 1; i <= length(hex); i += 8) { w = substr(hex, i, 8); out = out substr(w, 7, 2) substr(w, 5, 2) substr(w, 3, 2) substr(w, 1, 2) } return out } function fmt(hex,  i, g, out, sep, p) { out = \"\"; for (i = 1; i <= 32; i += 4) { g = substr(hex, i, 4); sep = (out == \"\" ? \"\" : \":\"); out = out sep g } if (substr(out, 1, 25) == \"0000:0000:0000:0000:0000:\" && tolower(substr(out, 26, 4)) == \"ffff\") { p = h2d(substr(out, 31, 2)) \".\" h2d(substr(out, 33, 2)) \".\" h2d(substr(out, 36, 2)) \".\" h2d(substr(out, 38, 2)); return \"::ffff:\" p } return out } NR > 1 && \$4 == \"01\" { split(\$3, a, \":\"); n++; if (n <= 40) print \"  uid=\" \$8 \"  \" fmt(v6(a[1])) \":\" h2d(a[2]) } END { print \"  (已建立连接共 \" n + 0 \" 条，最多列 40 条)\" }' /proc/net/tcp6"
+    echo
+
+    echo "############ 进程与网卡 ############"
+    _id_sh "内核进程（uid 决定兜底拦截要不要豁免它）" \
+      "ps -A -o uid,pid,comm 2>/dev/null | grep -i mihomo || echo '  (ps 不可用或内核未运行)'"
+    # uid 既决定兜底拦截要不要豁免它，也决定 fwmark 那一路要不要打标：把 uid 翻译成
+    # 进程名，上面的「按 uid 计数」才有意义（否则只知道「uid 1000 有 3 条 v6」）。
+    _id_sh "uid → 进程名对照（ps -A -o uid,comm 去重）" \
+      "ps -A -o uid,comm 2>/dev/null | awk 'NR > 1 && !(\$1 in s) { s[\$1] = 1; print \"  uid=\" \$1 \"  \" \$2 }'"
+    _id_sh "上网网卡的 disable_ipv6" \
+      "for f in /proc/sys/net/ipv6/conf/*/disable_ipv6; do printf '  %s: ' \"\${f%/disable_ipv6}\"; cat \"\$f\" 2>/dev/null || echo '?'; done"
+    echo
+
+    echo "############ 怎么读这份快照 ############"
+    echo "  · 「送进内核」= on 且 mangle 链/跳转/897x 规则三者齐全 → 应用 v6 走 TUN；"
+    echo "  · 兜底拦截链里 -o <TUN 网卡> 那行在涨 → v6 进了内核；REJECT 那两行在涨 →"
+    echo "    还有应用 v6 要从物理网卡出去（已被拒，App 会回退 IPv4，不会漏免流）；"
+    echo "  · 想看一段时间内的增量：ipv6-diag -z 归零 → 用 2 分钟 → ipv6-diag 再取一份。"
+  } > "$IPV6_DIAG_OUT" 2>&1
+  cat "$IPV6_DIAG_OUT" 2>/dev/null
+  echo
+  echo "已写入：$IPV6_DIAG_OUT"
+  return 0
+}
+
 ipv6_status() {
   # 代理侧结论（on/off/fallback）放在最前面：这是「开了系统 IPv6 之后代理不接管」
   # 的第一判断点，见 ipv6_proxy_guard。
   echo "代理侧 IPv6：$(ipv6_proxy_state)（on=TUN/eBPF 也在接管 v6；fallback=本机内核起不来，已回退仅 IPv4；off=系统 IPv6 关）"
+  echo "应用 IPv6 出网：$(app_ipv6_state)（tun=已送进 TUN 由规则分流；tproxy=TProxy 在接管 v6；ebpf=eBPF 入站接管 v6；wait=内核 v6 路由未就绪；fail=规则没装上；off=未干预）"
+  if [ -f "$APP6_STATE" ]; then
+    echo "  规则：$(tr '\n' ' ' < "$APP6_STATE" 2>/dev/null)"
+  fi
+  # 送进内核的手段：fwmark 那一路不依赖内核的 IPv6 策略路由认不认 uid 选择器
+  _iv_rte=$(app_ipv6_route_onoff)
+  echo "应用 IPv6 送内核：$_iv_rte（on=用 mangle 打 fwmark + ip -6 rule fwmark 送进 TUN 表；off=退回 uidrange 规则或兜底拦截）"
+  if [ "$_iv_rte" = "on" ]; then
+    echo "  规则：$(app_ipv6_route_have)（mark $APP6_ROUTE_MARK）"
+  fi
+  # DNS 源头：[::1]:53 由谁应答，决定应用拿不拿得到 AAAA
+  _iv_dns=$(app_ipv6_dns_onoff)
+  echo "应用 IPv6 DNS（[::1]:53）：$_iv_dns（on=已交回内核应答，给不给 AAAA 由配置 dns.ipv6 决定；off=本机无 IPv6 NAT / 内核 DNS 没在 ::1 上监听）"
+  if [ "$_iv_dns" != "on" ]; then
+    if _iv_dl=$(app_ipv6_dns_port) && [ -n "$_iv_dl" ]; then
+      echo "  → 内核 DNS 端口 $_iv_dl 尚未在 ::1 上监听（等内核起来后自动生效）"
+    else
+      echo "  → 配置里 dns.listen 不是双栈通配，接管过去会成黑洞，故未接管；改成 :<端口> 或 [::]:<端口> 后自动生效"
+    fi
+  fi
+  # 兜底拦截是「免流时不漏通用流量」的最后一关：接管方缺席时应用 v6 直接被
+  # REJECT（App 回退 IPv4），所以「出网=off/fail/wait」且这里是 on 才是安全的。
+  _iv_blk=$(app_ipv6_block_onoff)
+  echo "应用 IPv6 兜底拦截：$_iv_blk（on=应用的 IPv6 只要不是从 TUN/lo 出网就被拒，App 立刻回退 IPv4；off=系统 IPv6 关 / 内核未运行 / eBPF 在接管 v6）"
+  if [ "$_iv_blk" = "on" ]; then
+    echo "  → 国内 v6 不会直连出网（不计通用流量）：要么从 TUN 进内核按规则分流，要么立刻失败改用 IPv4"
+  fi
   if [ -f "$IPV6_PLOG" ]; then
     echo "回退记录（最近 3 条）："
     tail -n 3 "$IPV6_PLOG" 2>/dev/null | sed 's/^/  /'
@@ -5649,8 +6568,9 @@ tproxy_detect() {
 }
 
 # DNS fake-ip 的 IPv6 段（mihomo 缺省 fd11:4455:fdea:4000::/64）。
-# 真 240e: GUA 必须走原生；只把这一段送进 TPROXY，否则 test-ipv6 的 AAAA
-# 是 fake-ip，包从真实网卡发出去就黑洞（TUN 会进虚拟网卡所以能测到）。
+# 这一段始终要送进 TPROXY：AAAA 假地址只有进内核才能换回域名再按规则分流，
+# 从真实网卡发出去就是黑洞（TUN 会进虚拟网卡所以能测得到）。
+# 真 GUA（240e:/2408:/2409:…）过去是放行的，现在默认一并接管，见 tproxy_ipv6_scope。
 tproxy_fakeip6_range() {
   _f6=""
   if [ -f "$CONFIG" ]; then
@@ -5670,7 +6590,7 @@ tproxy_fakeip6_range() {
   esac
 }
 
-# 系统 IPv6 打开时：真地址原生，只劫持 fake-ip6。
+# 系统 IPv6 打开时：TProxy 入站能接管 IPv6。
 # $1 = toplevel|listener  $2 = 监听地址（- 表示缺省）
 tproxy_v6_want() {
   [ "$(get_setting system_ipv6 false)" = "true" ] || return 1
@@ -5679,6 +6599,19 @@ tproxy_v6_want() {
     listener) case "$2" in "*"|"::") return 0 ;; esac ;;
   esac
   return 1
+}
+
+# TProxy 接管 IPv6 的范围（module-settings: tproxy_ipv6，缺省 all）：
+#   all    = 真 GUA 与 fake-ip6 一并送进 TPROXY，按内核规则分流。国内域名命中
+#            dns.fake-ip-filter 走真解析，拿到的 AAAA 就是真 GUA（240e:/2408:/
+#            2409:…），放行出去就绕过内核、免流时计成通用流量 —— 所以要接管；
+#   fakeip = 旧行为：只劫持 fake-ip6，真 GUA 放行出物理网卡（仅调试用）。
+tproxy_ipv6_scope() {
+  case "$(get_setting tproxy_ipv6 all)" in
+    fakeip|native) printf '%s\n' fakeip ;;
+    *) printf '%s\n' all ;;
+  esac
+  return 0
 }
 
 # TProxy 端口是否已在监听（内核真正就绪才装规则，避免把流量导向空端口）。
@@ -6433,6 +7366,7 @@ tproxy_nft_write() {
       ;;
   esac
   _tn_mark="meta mark set meta mark or $TP_MARK_VALUE"
+  _tn_v6scope=$(tproxy_ipv6_scope)
   _tn_local6=""
   if [ "$_ti_v6_ok" = "on" ] && [ -n "$TP_IP" ]; then
     _tn_local6=$($TP_IP -6 addr show 2>/dev/null | awk '
@@ -6461,6 +7395,12 @@ tproxy_nft_write() {
       printf '  meta l4proto tcp ip6 daddr %s counter tproxy ip6 to :%s %s accept\n' "$_tn_f6" "$_ti_port" "$_tn_mark"
       printf '  meta l4proto udp ip6 daddr %s counter tproxy ip6 to :%s %s accept\n' "$_tn_f6" "$_ti_port" "$_tn_mark"
       printf '  ip6 daddr { ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8 } return\n'
+      # 真 GUA（240e:/2408:/2409:…）一并送进 TPROXY：国内域名走真解析拿到的就是
+      # 真 GUA，放行出去会绕过内核直连，免流时计成通用流量。
+      if [ "$_tn_v6scope" = "all" ]; then
+        printf '  meta nfproto ipv6 meta l4proto tcp counter tproxy ip6 to :%s %s accept\n' "$_ti_port" "$_tn_mark"
+        printf '  meta nfproto ipv6 meta l4proto udp counter tproxy ip6 to :%s %s accept\n' "$_ti_port" "$_tn_mark"
+      fi
     fi
     printf '  ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return\n'
     printf '  meta nfproto ipv4 meta l4proto tcp counter tproxy ip to 127.0.0.1:%s %s accept\n' "$_ti_port" "$_tn_mark"
@@ -6492,6 +7432,10 @@ tproxy_nft_write() {
       printf '  meta nfproto ipv4 meta l4proto { tcp, udp } counter %s\n' "$_tn_mark"
       if [ "$_ti_v6_ok" = "on" ]; then
         printf '  meta nfproto ipv6 meta l4proto { tcp, udp } ip6 daddr %s counter %s\n' "$_tn_f6" "$_tn_mark"
+        printf '  ip6 daddr { ::/128, ::1/128, fc00::/7, fe80::/10, ff00::/8 } return\n'
+        if [ "$_tn_v6scope" = "all" ]; then
+          printf '  meta nfproto ipv6 meta l4proto { tcp, udp } counter %s\n' "$_tn_mark"
+        fi
       fi
     fi
     printf ' }\n'
@@ -6730,11 +7674,17 @@ tproxy_install() {
     case "$_ti_f6" in *[!0-9A-Fa-f:/]*|'') _ti_v6=off ;; esac
     if [ "$_ti_v6" = "on" ] && [ "$_tp_cap_v6" = "1" ]; then
       _ti_v6pref=$(tproxy_iprule_add "$TP_IP" "$TP_PREF $TP_PREF_ALT" -6)
-      if [ -n "$_ti_v6pref" ] && $TP_IP -6 route replace local "$_ti_f6" dev lo table "$TP_TABLE" 2>>"$TP_LOG"; then
+      # all = 真 GUA 一并接管（TPROXY 表要能吃下任意目的地址）；fakeip = 只 fake-ip6
+      if [ "$(tproxy_ipv6_scope)" = "all" ]; then
+        _ti_v6route="default"
+      else
+        _ti_v6route="$_ti_f6"
+      fi
+      if [ -n "$_ti_v6pref" ] && $TP_IP -6 route replace local "$_ti_v6route" dev lo table "$TP_TABLE" 2>>"$TP_LOG"; then
         _ti_v6_ok=on
       else
         tproxy_nft_clear_v6_routes
-        tp_log "WARN v6 fake-ip 策略路由不完整，本机 v6 仍走原生"
+        tp_log "WARN v6 策略路由不完整，本机 v6 仍走原生"
       fi
     fi
     _ti_total=$(printf '%s' "$_ti_uids" | wc -w 2>/dev/null)
@@ -6761,6 +7711,7 @@ tproxy_install() {
     _ti_uh=$(printf '%s' "$_ti_uids" | tp_fp_of)
     printf 'port=%s\nv6=%s\nbypass=%s\nmode=%s\nwant=%s\nfp=%s\nfb=%s\napps=%s\nuids=%s\nuh=%s\npref=%s\nver=%s\nbackend=%s\n' \
       "$_ti_port" "$_ti_v6_ok" "$_ti_bp" "$_ti_mode" "$_ti_want" "$_ti_fp" "$_ti_fb" "${_ti_apps:-0}" "${_ti_v4n:-0}" "$_ti_uh" "$_ti_pref" "$TP_STATE_VER" "nft" > "$TP_STATE" 2>/dev/null
+    [ "$_ti_v6_ok" = "on" ] && app_ipv6_state_set tproxy backend=nft scope="$_tn_v6scope" table="$TP_TABLE" pref="${_ti_v6pref:-?}"
     rm -f "$RUNDIR/tproxy.fail" "$TP_MISS" 2>/dev/null
     tp_log "install backend=nft port=$_ti_port v6=$_ti_v6_ok bypass=$_ti_bp mode=$_ti_mode want=$_ti_want fb=$_ti_fb uids=${_ti_v4n:-0} table=$TP_TABLE pref=$_ti_pref"
     ( boot_data_sync ) >/dev/null 2>&1 &
@@ -6831,8 +7782,9 @@ _tproxy_install_ipt() {
   tp_b_jump "$TP_IPT" OUTPUT -p tcp -j "$TP_CHAIN_OUT" || { tp_log "WARN OUTPUT(tcp) 挂载失败"; tproxy_teardown; return 1; }
   tp_b_jump "$TP_IPT" OUTPUT -p udp -j "$TP_CHAIN_OUT" || { tp_log "WARN OUTPUT(udp) 挂载失败"; tproxy_teardown; return 1; }
 
-  # —— v6：真 GUA 原生；只把 DNS fake-ip6 送进 TPROXY（对齐 IPv4 的 198.18.0.0/16）。
-  # 禁止 local default + 全量 OUTPUT mark，否则系统测不到 240e: 地址。
+  # —— v6：默认把真 GUA 与 fake-ip6 一并送进 TPROXY（tproxy_ipv6=all，见
+  # tproxy_ipv6_scope）。真 GUA 放行（旧的 fakeip 行为）会让国内域名真解析出来的
+  # AAAA 直连出物理网卡，绕过内核也到不了国内出口的免流节点 —— 免流时计通用流量。
   if [ "$TP_BULK" = "1" ]; then
     # 批量模式：v6 跳转先探再删（写进同一个 v6 事务），链由随后的声明清空，
     # 不必再来一遍「删到删不动」。没有 v6 记录又这次也不装 v6 时连探测都省掉
@@ -6863,9 +7815,16 @@ _tproxy_install_ipt() {
   if [ "$_ti_v6" = "on" ] && [ "$_tp_cap_v6" = "1" ] && [ -n "$TP_IP6T" ]; then
     _ti_v6ok=1
     _ti_f6=$(tproxy_fakeip6_range)
+    _ti_v6scope=$(tproxy_ipv6_scope)
     _ti_v6pref=$(tproxy_iprule_add "$TP_IP" "$TP_PREF $TP_PREF_ALT" -6)
     [ -n "$_ti_v6pref" ] || _ti_v6ok=0
-    $TP_IP -6 route replace local "$_ti_f6" dev lo table "$TP_TABLE" 2>>"$TP_LOG" || _ti_v6ok=0
+    # all = 真 GUA 一并接管：TPROXY 表要能吃下任意目的地址（local default，与 v4 同款）；
+    # fakeip = 旧行为，表里只放 fake-ip6 那一段，其余 IPv6 放行出物理网卡。
+    if [ "$_ti_v6scope" = "all" ]; then
+      $TP_IP -6 route replace local default dev lo table "$TP_TABLE" 2>>"$TP_LOG" || _ti_v6ok=0
+    else
+      $TP_IP -6 route replace local "$_ti_f6" dev lo table "$TP_TABLE" 2>>"$TP_LOG" || _ti_v6ok=0
+    fi
     tp_b_chain "$TP_IP6T" "$TP_CHAIN_PRE"
     _ti_v6_nd_bypass "$TP_IP6T" "$TP_CHAIN_PRE"
     _ti_v6_local_return "$TP_IP6T" "$TP_CHAIN_PRE"
@@ -6875,17 +7834,38 @@ _tproxy_install_ipt() {
     for _ti_c in ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8; do
       tp_b_add "$TP_IP6T" "$TP_CHAIN_PRE" -d "$_ti_c" -j RETURN
     done
+    # —— 真 GUA（240e:/2408:/2409:…）一并送进 TPROXY ——
+    # 以前这段是放行（native）：国内域名命中 fake-ip-filter 走真解析，拿到的 AAAA
+    # 就是真 GUA，应用建连直接出物理网卡，既绕过了内核的域名分流也到不了国内出口
+    # 的免流节点，免流时计成通用流量。现在一律接管，交给规则决定走国内还是国外。
+    if [ "$_ti_v6scope" = "all" ]; then
+      tp_b_add "$TP_IP6T" "$TP_CHAIN_PRE" -p tcp -j TPROXY --on-ip :: --on-port "$_ti_port" --tproxy-mark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
+      tp_b_add "$TP_IP6T" "$TP_CHAIN_PRE" -p udp -j TPROXY --on-ip :: --on-port "$_ti_port" --tproxy-mark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
+    fi
     tp_b_chain "$TP_IP6T" "$TP_CHAIN_OUT"
     _ti_v6_nd_bypass "$TP_IP6T" "$TP_CHAIN_OUT"
     tp_bypass_rule "$TP_IP6T" "$TP_CHAIN_OUT" "$_ti_bp" || _ti_v6ok=0
     tp_b_add "$TP_IP6T" "$TP_CHAIN_OUT" -d "$_ti_f6" -p tcp -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
     tp_b_add "$TP_IP6T" "$TP_CHAIN_OUT" -d "$_ti_f6" -p udp -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
+    # 本机/链路本地/ULA/组播不打标（顺序同上：fake-ip6 打完标才轮到保留段放行）
+    for _ti_c in ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8; do
+      tp_b_add "$TP_IP6T" "$TP_CHAIN_OUT" -d "$_ti_c" -j RETURN
+    done
+    if [ "$_ti_v6scope" = "all" ]; then
+      tp_b_add "$TP_IP6T" "$TP_CHAIN_OUT" -p tcp -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
+      tp_b_add "$TP_IP6T" "$TP_CHAIN_OUT" -p udp -j MARK --set-xmark "$TP_MARK" 2>>"$TP_LOG" || _ti_v6ok=0
+    fi
     tp_b_jump "$TP_IP6T" PREROUTING -j "$TP_CHAIN_PRE" || _ti_v6ok=0
     tp_b_jump "$TP_IP6T" OUTPUT -p tcp -j "$TP_CHAIN_OUT" || _ti_v6ok=0
     tp_b_jump "$TP_IP6T" OUTPUT -p udp -j "$TP_CHAIN_OUT" || _ti_v6ok=0
     if [ "$_ti_v6ok" = "1" ]; then
       _ti_v6_ok=on
-      tp_log "v6 fake-ip $_ti_f6 → TPROXY，其余 IPv6 原生"
+      app_ipv6_state_set tproxy backend=ipt scope="$_ti_v6scope" table="$TP_TABLE" pref="$_ti_v6pref"
+      if [ "$_ti_v6scope" = "all" ]; then
+        tp_log "v6 全部 → TPROXY（fake-ip $_ti_f6 + 真 GUA），按规则分流"
+      else
+        tp_log "v6 fake-ip $_ti_f6 → TPROXY，其余 IPv6 原生"
+      fi
     else
       if [ "$TP_BULK" = "1" ]; then
         # 事务还没下发：把 v6 待发规则整体丢掉就等于「没装 v6」，只保留 -D 行
@@ -8911,6 +9891,9 @@ MH_STATUS_CFG
   jv "$_sj_hp";   printf '%s\n' "\"hotspot_proxy\": \"$J\","
   jv "$_sj_v6";   printf '%s\n' "\"system_ipv6\": \"$J\","
   printf '%s\n' "\"ipv6_locked_by\": $_sj_v6lock,"
+  # 应用 IPv6 出网方向盘（只读状态文件，零 ip 调用）：
+  # tun/tproxy/ebpf=已送进内核按规则分流；wait=内核 v6 路由未就绪；fail=规则没装上；off=未干预
+  jv "$(app_ipv6_state)"; printf '%s\n' "\"app_ipv6\": \"$J\","
   jv "$_sj_tp";   printf '%s\n' "\"tproxy\": \"$J\","
   jv "$_sj_tps";  printf '%s\n' "\"tproxy_state\": \"$J\","
   printf '%s\n' "\"config_exists\": $_sj_cfg,"
@@ -9029,7 +10012,9 @@ mod_state_json() {
   jv "$_ms_tps"; _ms_b=$J
   jv "$_ms_hp";  _ms_c=$J
   jv "$_ms_tp";  _ms_d=$J
-  printf '{"tun_hotspot":"%s","tproxy_state":"%s","hotspot_proxy":"%s","tproxy":"%s"}\n' "$_ms_a" "$_ms_b" "$_ms_c" "$_ms_d"
+  # 应用 IPv6 出网方向盘（面板「系统 IPv6」下的状态行；只读状态文件，零 fork）
+  jv "$(app_ipv6_state)"; _ms_e=$J
+  printf '{"tun_hotspot":"%s","tproxy_state":"%s","hotspot_proxy":"%s","tproxy":"%s","app_ipv6":"%s"}\n' "$_ms_a" "$_ms_b" "$_ms_c" "$_ms_d" "$_ms_e"
 }
 
 BOOT_DATA_CACHE=$RUNDIR/boot_data.json
@@ -10616,6 +11601,7 @@ case "$cmd" in
     [ "$_its_token" = "$_its_want" ] || _its_stage=pending
     echo "$_its_stage" ;;
   ipv6-status)   ipv6_status ;;
+  ipv6-diag)     ipv6_diag "${1:-}" ;;
   ipv6-guard)    ipv6_proxy_guard ;;
   # APN 协议接管（等效「APN 协议=IPv4」防蜂窝 v6 泄漏，不碰 IMS）：
   apn4-status)   apn4_status ;;
@@ -10643,6 +11629,11 @@ case "$cmd" in
       tun_hotspot_sync >/dev/null 2>&1
       tproxy_sync >/dev/null 2>&1
     fi
+    # 两路都跑完才轮到它：应用 IPv6 到底有没有被接管，要等 TUN 与 TProxy 各自
+    # 落完状态才知道（见 app_ipv6_block_want）。
+    app_ipv6_route_sync >/dev/null 2>&1
+    app_ipv6_dns_sync >/dev/null 2>&1
+    app_ipv6_block_sync >/dev/null 2>&1
     exit 0 ;;
   tproxy-status) tproxy_status ;;
   tproxy-diag)   tproxy_diag ;;
