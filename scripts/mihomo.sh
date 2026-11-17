@@ -5483,6 +5483,18 @@ IPV6_WANT=$RUNDIR/ipv6.want
 # 已经证明「开着 ipv6 就起不来 TUN/eBPF」，见 ipv6_proxy_guard 的注释。
 IPV6_PFAIL=$RUNDIR/ipv6.proxyfail
 IPV6_PLOG=$RUNDIR/ipv6.proxy.log
+# 守卫的观察窗口（秒）与单实例锁：见 ipv6_proxy_guard 的注释。
+# ⚠ 这个窗口不能缩短成「拿到第一个 /configs 响应就下结论」：控制器端口在
+# mihomo 的 ApplyConfig 之前就已监听（hub.applyRoute 先跑，executor.ApplyConfig
+# 后跑），而 TUN 是 ApplyConfig 里靠后的一步才创建。这段空窗里 /configs 报的是
+# LastTunConf 的零值（enable:false），据此判「TUN 起不来」会把好配置改坏。
+IPV6_GUARD_WAIT=12
+IPV6_GUARD_WAIT_EBPF=4
+IPV6_GUARD_LOCK=$RUNDIR/ipv6.guard.lock
+# 回退前的配置备份：守卫改配置是「猜错了就改坏」，留一份原件让人能一键找回。
+IPV6_PBACKUP=$RUNDIR/config.yaml.ipv6bak
+IPV6_PFAIL_VER=v2
+IPV6_HEAL_MARK=$RUNDIR/ipv6.heal.v
 IPV6_NET=$RUNDIR/ipv6.net
 IPV6_LAST=$RUNDIR/ipv6.last
 IPV6_COOL=60
@@ -6113,10 +6125,52 @@ cfg_top_ipv6() {
 # 内核（版本 + 内核路径都相同）在这个配置下起不来 TUN/eBPF 入站，换了内核或
 # 修好后自动失效（key 变了）。此标记只抑制自动重复尝试；用户显式开启系统 IPv6
 # 时会清除标记并重新尝试，失败后仍由 ipv6_proxy_guard 再次保护性回退。
+# 标记带版本后缀（$IPV6_PFAIL_VER）：老版本守卫留下的标记一律视为过期。
+# 20261111-0007 及更早的守卫会因为「控制器端口监听早于 TUN 创建」误判，把好配置
+# 刷成 v4-only 并留下标记；不升级标记格式的话，这些机器会一直卡在仅 IPv4。
 ipv6_proxy_capable() {
   [ -f "$IPV6_PFAIL" ] || return 0
   _ipc_saved=$(cat "$IPV6_PFAIL" 2>/dev/null)
-  [ "$_ipc_saved" = "$(uname -r 2>/dev/null)|$(core_path 2>/dev/null)" ] && return 1
+  [ "$_ipc_saved" = "$(uname -r 2>/dev/null)|$(core_path 2>/dev/null)|$IPV6_PFAIL_VER" ] && return 1
+  return 0
+}
+
+# 升级后的一次性自愈：老版本守卫误判 → 配置里 4 个 v6 开关被刷成 false、系统 IPv6
+# 却是开着的。这时候「没有可信的失败证据」就不该让用户自己去配置页重填 4 个开关。
+# 判据很保守，缺一不可：
+#   · 只跑一次（$IPV6_HEAL_MARK），失败也不重试，绝不进入循环；
+#   · 系统 IPv6 设置是开；配置文件顶层 ipv6 实际是 false；
+#   · 失败标记要么不存在，要么是**老格式**（新版守卫写的标记说明真失败过，不还原）。
+ipv6_cfg_heal() {
+  [ -f "$IPV6_HEAL_MARK" ] && return 0
+  # 门禁先看：这几条只读设置与一个顶层键，成本可忽略，可以每次开机都看一遍。
+  # ⚠ 标记必须放在门禁之后落：升级后第一次开机的 system_ipv6 还是关的（默认关）
+  # 时若先把标记写掉，用户之后才打开系统 IPv6 就永远等不到这次还原了。
+  [ "$(get_setting system_ipv6 false)" = "true" ] || return 0
+  [ "$(cfg_top_ipv6)" = "false" ] || return 0
+  mkdir -p "$RUNDIR" 2>/dev/null
+  printf 'v2\n' > "$IPV6_HEAL_MARK" 2>/dev/null   # 过了门禁就落标记：只跑一次
+  if [ -f "$IPV6_PFAIL" ]; then
+    _ich_saved=$(cat "$IPV6_PFAIL" 2>/dev/null)
+    [ "$_ich_saved" = "$(uname -r 2>/dev/null)|$(core_path 2>/dev/null)|$IPV6_PFAIL_VER" ] && return 0
+    rm -f "$IPV6_PFAIL" 2>/dev/null                 # 老格式标记：误判产物
+  fi
+  _ich_chg=$(cfg_ipv6_set_all true)
+  case "$_ich_chg" in ''|*[!0-9]*) _ich_chg=0 ;; esac
+  [ "$_ich_chg" = "0" ] && return 0
+  printf '%s 检测到旧版守卫误判留下的仅 IPv4 配置（系统 IPv6 为开、无可信失败证据），已把 ipv6 / dns.ipv6 / eBPF 接管 IPv6 改回 true（%s 项）\n' \
+    "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$_ich_chg" >> "$IPV6_PLOG" 2>/dev/null
+  sw_log "IPv6 配置自愈：还原 %s 个 v6 开关（旧版误判）" "$_ich_chg"
+  config_fingerprint > "$TESTED" 2>/dev/null
+  live_invalidate 2>/dev/null
+  if running; then
+    _ich_n=0
+    while [ "$_ich_n" -lt 5 ]; do
+      _ich_out=$(sh "$0" restart-json 2>&1)
+      case "$_ich_out" in *ERR_BUSY*) nap 1; _ich_n=$((_ich_n + 1)); continue ;; esac
+      break
+    done
+  fi
   return 0
 }
 
@@ -6136,60 +6190,168 @@ ipv6_proxy_capable() {
 # （系统协议栈、APN 都不动，系统 IPv6 仍然是开的），记下证据后重启一次。
 # 失败标记阻止后台自动循环重试；用户明确再次开启系统 IPv6 时清除标记并重试，
 # 若仍失败，本守卫会重新回退并记录原因，不把一次历史失败永久变成无提示的配置锁。
+#
+# ⚠⚠ 判据必须等「入站真的建完」——这是本守卫最容易误伤的地方，踩过两次：
+#   ① 控制器端口在 ApplyConfig **之前**就已监听（hub.applyRoute 先跑，
+#      executor.ApplyConfig 后跑），而 TUN 是 ApplyConfig 里靠后的 updateTun
+#      才创建。端口一监听就去读 /configs，拿到的是 LastTunConf 的**零值**
+#      （enable:false），据此判「TUN 没起来」= 把健康配置当失败。
+#   ② 模块开关在管理器里「关→开」走的正是 start_core（开关监听循环的启用分支），
+#      而 start_core 的就绪判据恰好是「控制器端口监听」，于是后台守卫在
+#      ApplyConfig 完成前就 fork 出去 —— 每次关再开模块都必然误判一次，
+#      配置里顶层 ipv6 / dns.ipv6 / eBPF 两个角色的 ipv6 被 cfg_ipv6_set_all
+#      一并刷成 false。用户看到的就是「系统 IPv6 明明开着，配置里的 v6 开关全被关了」。
+#   因此判据改为「观察窗口内一直等不到可信的好信号」才算失败：
+#     · 好信号①：TUN 网卡出现在 /sys/class/net（tunhs_find_iface）；
+#     · 好信号②：内核自报 tun.enable=true（ApplyConfig 已过 updateTun）。
+#   窗口耗尽后，TUN 分支还要再有一条**独立证据**（API 自报 enable:false 或本轮
+#   日志里的相关错误）才动配置 —— 孤证不改用户配置，宁可漏保护也不能改坏。
+ipv6_guard_log_new() {
+  # 只取本次启动之后新写进 core.log 的行（logs-clear 截断过则整篇都算新）
+  _igl_off=$(cat "$LOGFILE.off" 2>/dev/null)
+  case "$_igl_off" in ''|*[!0-9]*) _igl_off=0 ;; esac
+  [ -f "$LOGFILE" ] || return 0
+  _igl_size=$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)
+  case "$_igl_size" in ''|*[!0-9]*) _igl_size=0 ;; esac
+  [ "$_igl_size" -lt "$_igl_off" ] && _igl_off=0
+  if [ "$_igl_off" -gt 0 ]; then
+    tail -c +$((_igl_off + 1)) "$LOGFILE" 2>/dev/null
+  else
+    tail -n 200 "$LOGFILE" 2>/dev/null
+  fi
+}
+
+ipv6_guard_evidence() {
+  # 本轮日志里的「入站起不来」证据，stdout 一行。
+  # TUN 专属错误直接算；`listen err` 是**所有**入站共用的错误格式（mixed-port
+  # 被占、端口不足也会打），只有同时带 v6/权限/路由字样才算代理侧 v6 的问题，
+  # 否则「mixed-port 撞端口」会把好好的 v6 配置判死。
+  _ige_seg=$(ipv6_guard_log_new)
+  [ -n "$_ige_seg" ] || return 0
+  _ige_err=$(printf '%s\n' "$_ige_seg" | grep -aE "Start TUN listening error" | tail -n 1)
+  if [ -z "$_ige_err" ]; then
+    _ige_err=$(printf '%s\n' "$_ige_seg" | grep -aE "listen err" \
+      | grep -aiE "ipv6|ip6|permission denied|not permitted|local route|fd53|address family|cannot assign" \
+      | tail -n 1)
+  fi
+  [ -n "$_ige_err" ] && printf '%s\n' "$_ige_err"
+  return 0
+}
+
 ipv6_proxy_guard() {
   [ "$(get_setting system_ipv6 false)" = "true" ] || return 0
   [ "$(cfg_top_ipv6)" = "true" ] || return 0
   running || return 0
   ipv6_proxy_capable || return 0
-  # 等内核把 /configs 答上来（刚拉起时控制器端口可能还在监听路上）
-  _ipg_cfg=""; _ipg_i=0
-  while [ "$_ipg_i" -lt 30 ]; do
-    _ipg_cfg=$(MH_API_TIMEOUT=2 api GET /configs 2>/dev/null)
-    case "$_ipg_cfg" in *'"tun"'*) break ;; esac
-    _ipg_cfg=""
-    nap 0.2
+  # 单实例：start_core 每次拉起都会 fork 守卫，用户点开系统 IPv6 / 诊断也会，
+  # 并发时各自裁一遍配置、各自重启一次（第二次还会撞 lifecycle 锁）。锁住只让一个干活。
+  _ipg_have_lock=0
+  if mkdir "$IPV6_GUARD_LOCK" 2>/dev/null; then
+    _ipg_have_lock=1
+  else
+    _ipg_owner=$(cat "$IPV6_GUARD_LOCK/pid" 2>/dev/null)
+    case "$_ipg_owner" in ''|*[!0-9]*) _ipg_owner=0 ;; esac
+    if [ "$_ipg_owner" != "0" ] && kill -0 "$_ipg_owner" 2>/dev/null; then
+      return 0                       # 已有守卫在跑：结论相同，不重复判
+    fi
+    rm -rf "$IPV6_GUARD_LOCK" 2>/dev/null
+    mkdir "$IPV6_GUARD_LOCK" 2>/dev/null && _ipg_have_lock=1
+  fi
+  [ "$_ipg_have_lock" = "1" ] || return 0
+  echo "$$" > "$IPV6_GUARD_LOCK/pid" 2>/dev/null
+  _ipv6_proxy_guard_body
+  _ipg_rc=$?
+  [ "$(cat "$IPV6_GUARD_LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$IPV6_GUARD_LOCK" 2>/dev/null
+  return $_ipg_rc
+}
+
+_ipv6_proxy_guard_body() {
+  # 期望以「内核正在用的快照」为准：磁盘配置可能已被用户改过但还没重启生效，
+  # 拿它判「TUN 该不该在」会把旧内核判成失败。
+  _ipg_tun_expect=0
+  runtime_tun_enabled && _ipg_tun_expect=1
+  _ipg_ebpf_expect=0
+  [ "$_ipg_tun_expect" = "1" ] || { ebpf_listener_active && _ipg_ebpf_expect=1; }
+  [ "$_ipg_tun_expect" = "1" ] || [ "$_ipg_ebpf_expect" = "1" ] || return 0
+
+  _ipg_cfg=""; _ipg_ev_tmp=""; _ipg_i=0
+  # 观察窗口：TUN 要等「网卡建出来 / 内核自报 enable:true」这两个好信号，
+  # eBPF 没有可查的实体，只能等日志，给它一个短得多的窗口就够了。
+  if [ "$_ipg_tun_expect" = "1" ]; then _ipg_budget=$IPV6_GUARD_WAIT
+  else _ipg_budget=${IPV6_GUARD_WAIT_EBPF:-4}; fi
+  # 每一轮先看现场（重启场景下 TUN 网卡可能已存在）；拿到好信号立刻收工。
+  # 健康路径通常第一轮就返回：一次 /sys 存在性判断 + 零 API 调用。
+  while [ "$_ipg_i" -lt "$_ipg_budget" ]; do
+    running || return 0                       # 中途被停：不是 v6 的事
+    # 本轮新写的错误日志（每轮都刷新，别抱着第一轮的旧结论不放：内核可能还在重试）
+    _ipg_ev_tmp=$(ipv6_guard_evidence)
+    if [ "$_ipg_tun_expect" = "1" ] && tunhs_find_iface >/dev/null 2>&1; then
+      # 好信号①：TUN 网卡在内。但网卡也可能是上一次会话的残留（旧网卡挡住
+      # 新建时内核会打 TUN 错误），所以「网卡在 + 本轮没报错」才算健康。
+      [ -n "$_ipg_ev_tmp" ] || return 0
+    fi
+    if [ "$_ipg_tun_expect" = "1" ]; then
+      _ipg_r=$(MH_API_TIMEOUT=2 api GET /configs 2>/dev/null)
+      case "$_ipg_r" in
+        *'"tun"'*)
+          _ipg_cfg=$_ipg_r
+          case "$_ipg_r" in
+            *'"tun":{"enable":true'*|*'"tun":{"enable": true'*)
+              [ -n "$_ipg_ev_tmp" ] || return 0 ;;   # 好信号②：内核自报 TUN 已启用
+          esac ;;
+      esac
+    fi
+    ipv6_proxy_capable || return 0             # 别的守卫已经判失败并落了标记
+    nap 1
     _ipg_i=$((_ipg_i + 1))
   done
+
   _ipg_bad=""
-  if tunhs_tun_enabled; then
-    # 配置要 TUN，内核自报的却还是 enable:false → TUN 没起来（core 在跑）
+  if [ "$_ipg_tun_expect" = "1" ]; then
+    # 窗口耗尽仍没有 TUN 网卡：可能是真失败，但必须有第二条独立证据才动配置。
+    if tunhs_find_iface >/dev/null 2>&1; then return 0; fi
     case "$_ipg_cfg" in
       *'"tun":{"enable":false'*|*'"tun":{"enable": false'*)
-        _ipg_bad="TUN 未启动（配置里 tun.enable=true，内核自报 false）" ;;
+        _ipg_bad="TUN 未启动（配置要 TUN，内核自报 enable:false 且 ${IPV6_GUARD_WAIT}s 内没建出 TUN 网卡）" ;;
     esac
   fi
-  if [ -z "$_ipg_bad" ]; then
-    # 兜底证据：内核日志。TUN 与 eBPF 入站起不来时各有一条 error，两者都能命中；
-    # log-level: silent 时看不到（那就只靠上面 TUN 的 API 自报）。
-    # 只扫本次启动之后新写进 core.log 的行（logs-clear 截断过则整篇都算新）
-    _ipg_seg=""
-    _ipg_off=$(cat "$LOGFILE.off" 2>/dev/null)
-    case "$_ipg_off" in ''|*[!0-9]*) _ipg_off=0 ;; esac
-    if [ -f "$LOGFILE" ]; then
-      _ipg_size=$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)
-      case "$_ipg_size" in ''|*[!0-9]*) _ipg_size=0 ;; esac
-      [ "$_ipg_size" -lt "$_ipg_off" ] && _ipg_off=0
-      [ "$_ipg_off" -gt 0 ] && _ipg_seg=$(tail -c +$((_ipg_off + 1)) "$LOGFILE" 2>/dev/null) \
-        || _ipg_seg=$(tail -n 200 "$LOGFILE" 2>/dev/null)
-    fi
-    _ipg_err=$(printf '%s\n' "$_ipg_seg" | grep -aE "listen err|Start TUN listening error" | tail -n 1)
-    [ -n "$_ipg_err" ] && _ipg_bad="入站监听失败：$_ipg_err"
+  if [ -z "$_ipg_bad" ] && [ "$_ipg_ebpf_expect" = "1" ]; then
+    # eBPF 入站没有网卡可查，只能看内核日志里本轮新写的错误。
+    [ -n "$_ipg_ev_tmp" ] && _ipg_bad="eBPF 入站监听失败：$_ipg_ev_tmp"
+  fi
+  if [ -z "$_ipg_bad" ] && [ "$_ipg_tun_expect" = "1" ] && [ -n "$_ipg_ev_tmp" ]; then
+    _ipg_bad="TUN 监听失败：$_ipg_ev_tmp"
   fi
   [ -n "$_ipg_bad" ] || return 0
-  printf '%s|%s\n' "$(uname -r 2>/dev/null)" "$(core_path 2>/dev/null)" > "$IPV6_PFAIL" 2>/dev/null
+
+  printf '%s|%s|%s\n' "$(uname -r 2>/dev/null)" "$(core_path 2>/dev/null)" "$IPV6_PFAIL_VER" > "$IPV6_PFAIL" 2>/dev/null
+  # 动配置前先留底：万一是误判（本守卫曾经就因为窗口太短误判过），用户还能
+  # 用这份文件把原来的 v6 开关找回，不必凭记忆重填 4 处。
+  cp "$CONFIG" "$IPV6_PBACKUP.tmp.$$" 2>/dev/null \
+    && mv -f "$IPV6_PBACKUP.tmp.$$" "$IPV6_PBACKUP" 2>/dev/null
+  rm -f "$IPV6_PBACKUP.tmp.$$" 2>/dev/null
   _ipg_fp0=$(config_fingerprint)
   _ipg_chg=$(cfg_ipv6_set_all false)
   case "$_ipg_chg" in ''|*[!0-9]*) _ipg_chg=0 ;; esac
   if [ "$_ipg_chg" != "0" ] && [ "$_ipg_fp0" = "$(cat "$TESTED" 2>/dev/null)" ]; then
     config_fingerprint > "$TESTED" 2>/dev/null
   fi
-  printf '%s 代理侧 IPv6 初始化失败（%s）；已把 ipv6 / dns.ipv6 / eBPF 接管 IPv6 改回 false（%s 项），系统 IPv6 仍保持开启\n' \
-    "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$_ipg_bad" "$_ipg_chg" >> "$IPV6_PLOG" 2>/dev/null
+  printf '%s 代理侧 IPv6 初始化失败（%s）；已把 ipv6 / dns.ipv6 / eBPF 接管 IPv6 改回 false（%s 项），系统 IPv6 仍保持开启；改动前的配置备份：%s\n' \
+    "$(date '+%m-%d %H:%M:%S' 2>/dev/null)" "$_ipg_bad" "$_ipg_chg" "$IPV6_PBACKUP" >> "$IPV6_PLOG" 2>/dev/null
   sw_log "IPv6 代理不可用，已回退为仅 IPv4 代理（系统 IPv6 仍开启）：$_ipg_bad"
   live_invalidate 2>/dev/null
-  # 只重启一次让 v4-only 配置生效；marker 已落盘，本次不再触发第二轮
-  nap 1
-  sh "$0" restart-json >/dev/null 2>&1
+  # 只重启一次让 v4-only 配置生效；marker 已落盘，本次不再触发第二轮。
+  # ⚠ 守卫是从 _start_core_body 内部 fork 的，那一刻父进程还持有 lifecycle 锁，
+  # 立刻调 restart-json 会吃 ERR_BUSY —— 配置改成了 v4-only 而内核仍在跑 v6 配置，
+  # 两边不一致直到下次重启。这里按锁释放重试几次。
+  _ipg_n=0
+  while [ "$_ipg_n" -lt 15 ]; do
+    _ipg_out=$(sh "$0" restart-json 2>&1)
+    case "$_ipg_out" in
+      *ERR_BUSY*) nap 1; _ipg_n=$((_ipg_n + 1)); continue ;;
+    esac
+    break
+  done
   return 0
 }
 
@@ -11662,6 +11824,9 @@ case "$cmd" in
     [ -f "$MODDIR/disable" ] || web_start >/dev/null 2>&1
     action_mark boot_web_ready
     system_ipv6_sync >/dev/null 2>&1   # 系统 IPv6 开关开机即生效（之后由监听循环维持）
+    # 老版本守卫误判留下的「仅 IPv4 配置」一次性还原（见 ipv6_cfg_heal）：
+    # 必须在起内核之前，否则这一轮开机就按错误配置跑。
+    ipv6_cfg_heal >/dev/null 2>&1
     action_mark boot_ipv6_ready
     setting_v autostart true; _bt_auto=$SV
     _bt_sup=0
