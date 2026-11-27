@@ -2225,8 +2225,11 @@ function renderDashboard(el) {
   const curVer = st.current_ver || st[coreKey + '_ver'] || '';
   const coreInstalled = st[coreKey + '_exists'];
 
-  // 代理模式统计值：按 Zashboard 连接页 metadata.type 汇总当前活跃入站类型。
-  // 不读取模式开关、待应用配置或运行快照；tcp/udp 是 network，不是模式。
+  // 代理模式统计值：只看「流量从哪条透明接管通道进内核」——聚合当前活跃连接的
+  // metadata.type，只保留 Tun / Redir / TProxy / EBPF（见 connection-mode.js；
+  // Redir 是 iptables REDIRECT 型接管，与 TUN 同一套栈，界面上并入 TUN 显示）。
+  // 不读取模式开关、待应用配置或运行快照；tcp/udp 是 network，不是模式；
+  // Inner（内核自身连接）与 Mixed/Socks/HTTP（lo 或局域网回注）都不算接管。
   const modeStatVal = h('div', { class: 'v', text: connectionModeTracker.getLabel(), dataset: { connectionProxyMode: '1' } });
 
   // ------- 状态卡 -------
