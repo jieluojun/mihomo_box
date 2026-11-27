@@ -1,15 +1,47 @@
 // Zashboard clash driver networkType = `${metadata.type} | ${getNetwork(c)}`.
 // The dashboard mode statistic uses ONLY the first field, aggregated across the
 // current /connections snapshot. Never infer a type from switches or config.
+//
+// 主页「代理模式」统计只回答一件事：**现在流量是从哪条透明接管通道进内核的**。
+// 所以只认三类入站类型（mihomo 内核 constant.Type 的字符串值，大小写不敏感）：
+//   Tun    ← TUN 网卡（type: tun）
+//   TProxy ← TPROXY 重定向（tproxy-port / type: tproxy）
+//   EBPF   ← eBPF 入站（type: ebpf，jieluojun/liuran001 分支内核扩展的 EBPF 类型）
+// lo/局域网回注进来的 Mixed / Socks / HTTP 连接、内核自己的 Inner 连接、DNS 内部
+// 请求都不是「接管方式」，混进来只会让这一格读不出结论（出现过 Inner / Socks5
+// 之类的噪音），因此一律不计。
+export const TAKEOVER_TYPES = [
+  { type: 'Tun', label: 'TUN' },
+  { type: 'TPROXY', label: 'Tproxy' },
+  { type: 'EBPF', label: 'eBPF' },
+];
+
+// 有连接、但没有任何一条走透明接管时的文案：把原因说清楚，别让人以为开关没生效。
+const NO_TAKEOVER = '无接管';
+
+function typeKeyOf(connection) {
+  const raw = connection?.metadata?.type;
+  return typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+}
+
 export function summarizeConnectionTypes(data) {
   if (!data || !Array.isArray(data.connections)) throw new Error('连接列表无效');
   if (!data.connections.length) return { label: '暂无连接', types: [], count: 0 };
-  const visible = data.connections.filter(c => String(c?.metadata?.type || '').trim().toLowerCase() !== 'inner');
-  if (!visible.length) return { label: '暂无连接', types: [], count: 0 };
-  const types = [...new Set(visible.map(c => c?.metadata?.type)
-    .filter(type => typeof type === 'string' && type.trim()).map(type => type.trim()))]
-    .sort((a, b) => a.localeCompare(b));
-  return { label: types.length ? types.join(' / ') : '待识别', types, count: visible.length };
+  // 按接管类型归组：先归成小写集合，再按 TAKEOVER_TYPES 的固定顺序输出，
+  // 避免依赖 localeCompare（不同 ROM 的 JS 引擎对大小写/标点的排序不一致）。
+  const seen = new Set();
+  let takeover = 0;
+  for (const c of data.connections) {
+    const key = typeKeyOf(c);
+    const hit = TAKEOVER_TYPES.find(t => t.type.toLowerCase() === key);
+    if (!hit) continue;
+    takeover += 1;
+    seen.add(hit.type);
+  }
+  const types = TAKEOVER_TYPES.filter(t => seen.has(t.type)).map(t => t.type);
+  const labels = TAKEOVER_TYPES.filter(t => seen.has(t.type)).map(t => t.label);
+  if (!types.length) return { label: NO_TAKEOVER, types: [], count: 0 };
+  return { label: labels.join(' / '), types, count: takeover };
 }
 
 // Independent, bounded background sampler. Never await it in a lifecycle ACK
